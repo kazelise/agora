@@ -17,49 +17,62 @@ from server.models import (
     CreateRoomRequest,
     MessageListOut,
     MessageOut,
+    MessageRow,
     ParticipantOut,
     RoomOut,
 )
 from server.scheduler import Scheduler, publish_wake, run_subscriber
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    settings = get_settings()
-    pool = await db.create_pool(settings.database_url)
-    await db.migrate(pool)
-    publisher = redis.from_url(settings.redis_url, decode_responses=True)
-    subscriber = redis.from_url(settings.redis_url, decode_responses=True)
-    await publisher.ping()
+def create_app(*, stub_turns: bool = False) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        settings = get_settings()
+        pool = await db.create_pool(settings.database_url)
+        await db.migrate(pool)
+        publisher = redis.from_url(settings.redis_url, decode_responses=True)
+        subscriber = redis.from_url(settings.redis_url, decode_responses=True)
+        await publisher.ping()
 
-    scheduler = Scheduler(pool)
-    hub = RoomHub()
-    ready = asyncio.Event()
-    stop = asyncio.Event()
-    task = asyncio.create_task(run_subscriber(subscriber, scheduler, ready, stop))
-    await ready.wait()
+        hub = RoomHub()
+        if stub_turns:
+            scheduler = Scheduler(pool)
+        else:
+            from brain.graph import make_turn_fn
 
-    app.state.settings = settings
-    app.state.pool = pool
-    app.state.redis = publisher
-    app.state.scheduler = scheduler
-    app.state.hub = hub
+            async def on_committed(row: MessageRow) -> None:
+                await hub.broadcast(row.room_id, row.as_ws())
+                await publish_wake(publisher, row.room_id, row.author_id, row.seq)
 
-    try:
-        yield
-    finally:
-        stop.set()
-        task.cancel()
+            scheduler = Scheduler(
+                pool,
+                run_turn=make_turn_fn(pool, publisher, on_committed=on_committed),
+            )
+
+        ready = asyncio.Event()
+        stop = asyncio.Event()
+        task = asyncio.create_task(run_subscriber(subscriber, scheduler, ready, stop))
+        await ready.wait()
+
+        app.state.settings = settings
+        app.state.pool = pool
+        app.state.redis = publisher
+        app.state.scheduler = scheduler
+        app.state.hub = hub
+
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        await subscriber.aclose()
-        await publisher.aclose()
-        await pool.close()
+            yield
+        finally:
+            stop.set()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await subscriber.aclose()
+            await publisher.aclose()
+            await pool.close()
 
-
-def create_app() -> FastAPI:
     app = FastAPI(title="agora", lifespan=lifespan)
     register_routes(app)
     return app

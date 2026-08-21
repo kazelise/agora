@@ -41,7 +41,7 @@ async def _wait_turns(
 
 @pytest.fixture
 async def harness(require_services: None) -> AsyncIterator[Harness]:
-    app = create_app()
+    app = create_app(stub_turns=True)
     async with app.router.lifespan_context(app):
         await truncate_all(app.state.pool)
         app.state.scheduler.turns.clear()

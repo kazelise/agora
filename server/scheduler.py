@@ -5,6 +5,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
 import asyncpg
@@ -16,7 +17,7 @@ logger = logging.getLogger("agora.scheduler")
 
 WAKE_CHANNEL = "agora:wake"
 
-TurnFn = Callable[[UUID, UUID], Awaitable[None]]
+TurnFn = Callable[[UUID, UUID], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -75,19 +76,26 @@ class AgentLane:
 
 
 class Scheduler:
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, run_turn: TurnFn | None = None) -> None:
         self._pool = pool
+        self._run_turn = run_turn or self.run_turn_stub
         self._lanes: dict[UUID, AgentLane] = {}
         self.turns: list[TurnRecord] = []
+        self.brain_results: list[Any] = []
         # Demo-only: keep a stub turn in-flight so a burst can hit the dirty bit.
         self.turn_delay_s = 0.0
 
     def lane(self, agent_id: UUID) -> AgentLane:
         lane = self._lanes.get(agent_id)
         if lane is None:
-            lane = AgentLane(self.run_turn_stub)
+            lane = AgentLane(self._tracked_turn)
             self._lanes[agent_id] = lane
         return lane
+
+    async def _tracked_turn(self, agent_id: UUID, room_id: UUID) -> None:
+        result = await self._run_turn(agent_id, room_id)
+        if result is not None:
+            self.brain_results.append(result)
 
     async def dispatch(self, room_id: UUID, author_id: UUID) -> None:
         agents = await db.list_agent_participants(self._pool, room_id)

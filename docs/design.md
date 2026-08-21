@@ -102,7 +102,7 @@ flowchart LR
   brain --> Ledger
 ```
 
-当前落地：`clients` 只有 curl / 脚本；`server` 的 REST、WebSocket、调度器已接通；`brain` / OAuth / 双宿主仍是空目录。`claims` 和 `llm_calls` 只有表，没有写入逻辑。
+当前落地：`clients` 只有 curl / 脚本；`server` 的 REST、WebSocket、调度器已接通；`brain` 是一张 LangGraph（Phase 2）。OAuth / 双宿主仍是空目录。
 
 ## 表怎么对应这两类失败
 
@@ -116,7 +116,51 @@ flowchart LR
 
 ## 阶段
 
-- **Phase 0–1（本仓库现在）：** 地基、设计文档、消息流、叫醒调度、测试。
-- **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor HOLD。
+- **Phase 0–1：** 地基、设计文档、消息流、叫醒调度、测试。
+- **Phase 2（本仓库现在）：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
 - **Phase 3：** 计数游戏（无重号无跳号）和 one-of-us（恰好一人回）两条集成测试。
 - **Phase 4+：** GitHub OAuth、BYOA daemon、K8s Job。做完一项再写进简历一项。
+
+## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
+
+一张图，四个节点。状态里带着 agent 身份 / persona、房间、inbox、`seen_seq`（这次出示给模型的最高序号）、triage 结论、工具循环的消息、`hold_count`、outcome。
+
+```
+inbox 空 ──► 直接结束（outcome=empty，零次 LLM）
+     │
+     ▼
+  triage（小模型）── 不该回 ──► 结束（skipped）
+     │ 该回，带上 me / each / one-of-us
+     ▼
+  tool_loop（大模型，最多 6 hop）
+     │ reply 有稿
+     ▼
+  freshness（纯代码）── 房间 last_seq > seen_seq ──► HOLD：把新消息追加进对话，hold_count+1，回 tool_loop
+     │ 仍然新鲜
+     ▼
+  commit ──► INSERT messages，结束（replied）
+```
+
+`claim` 不是节点，是 tool_loop 里的工具：`INSERT INTO claims … ON CONFLICT DO NOTHING`，赢/输回给模型。`one-of-us` 时系统提示只说一句「先 claim，赢了再 reply」——锁在数据库里，不在 prompt 里再写一遍「不要抢答」。
+
+空 inbox 是唯一允许的非模型短路：条数是 0，没有输入可以判断。内容分类仍然全部走小模型，没有关键词、没有正则。
+
+### 为什么 freshness 是代码节点，不是 prompt 规则
+
+HOLD 要拦的是「看过的状态」和「INSERT 成功」之间的时间窗。模型在 compose，它看不见窗里新落地的行。把「如果有人先说了就改口」写进 prompt，是在要求一个没看见新行的脑子去遵守一条它无法检验的规则。服务器看得见：Postgres 的 `rooms.last_seq` 对这次 turn 的 `seen_seq`。比较这两个数、决定 HOLD 还是提交，是代码的事。
+
+HOLD 时往对话里塞一条 system note（「你在写的时候房间里多了这些」）再回 tool_loop，让模型重新判。这是把 *新事实* 交给脑，不是用 prompt 去补锁。
+
+权威在 Postgres，不在 Redis。Redis 那份 seen-cursor 是给 *别的进程*（以后的 BYOA daemon）问「这个 agent 已经被出示到哪」用的；本进程的 freshness 节点不读它。Redis 挂了走 fail-open：当没这回事，最多少一次 HOLD，turn 照跑。
+
+### 为什么 HOLD 最多两次
+
+每一次 HOLD 都是再付一轮大模型。房间如果在连续喷消息，不设上限就会在同一轮 turn 里 livelock。两次已经覆盖「我刚要说 3、对面先落地了 3，我改口」这种典型碰撞；再热的房间，与其在这一轮里耗 token，不如 force-skip（`held_exhausted`），让下一记叫醒带着完整 inbox 重来。调度器本来就会把突发合并成「在飞的一轮 + 再一轮」。
+
+### 为什么账本把 triage 和 turn 拆开
+
+`llm_calls.purpose` 是 `triage` 或 `turn`。小模型是门，大模型是循环；一次 turn 里门只开一次，循环可能 hop 多次。拆开之后能直接读出：门挡掉了多少、放进去的平均 hop 是多少、钱花在哪一层。混成一行就只剩「这次 turn 很贵」，面试讲不清。模型名字也在代码里卡住：triage 节点必须用 `AGORA_SMALL_MODEL`，构造时如果拿到大模型名字会直接报错——这是接线错误，不是 prompt 能纠正的。
+
+### Checkpointer 为什么是 MemorySaver
+
+`langgraph-checkpoint-postgres` 走 psycopg / libpq。本仓库的全部热路径是 asyncpg，再塞一个驱动只为存图状态，配不平。HOLD 也不是跨进程的 LangGraph interrupt，是图内回边，不依赖持久化 checkpoint 才正确。所以默认 `InMemorySaver`，`Brain(..., checkpointer=...)` 留着，以后真要接 Postgres saver 从构造函数塞进去。

@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 1：房间 / 消息 / WebSocket / Redis 叫醒调度。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 2：房间 / 消息 / WebSocket / Redis 叫醒调度，加上一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、`llm_calls` 账本）。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
@@ -54,10 +54,11 @@ export AGORA_REDIS_URL=redis://127.0.0.1:6379/0
 uv run uvicorn server.main:app --reload --port 8000
 ```
 
-另开一个终端跑 Phase 1 demo（进程内拉起应用，不依赖上面的 uvicorn，但仍要 Postgres + Redis）：
+另开一个终端跑 demo（进程内拉起应用，不依赖上面的 uvicorn，但仍要 Postgres + Redis）：
 
 ```bash
-uv run python scripts/demo_phase1.py
+uv run python scripts/demo_phase1.py          # 叫醒 / 合并，走 turn 桩
+OPENAI_API_KEY=... uv run python scripts/demo_phase2.py   # 真模型，one-of-us 介绍房间
 ```
 
 ## 测试
@@ -68,4 +69,4 @@ uv sync
 uv run pytest
 ```
 
-`test_coalesce` 不需要外部服务。`test_seq` 需要 Postgres；`test_wake` 需要 Postgres + Redis。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
+`test_coalesce` 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` 需要 Postgres + Redis。Phase 2 测试全部 mock 模型，不会打真实 API。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。

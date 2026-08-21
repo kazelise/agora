@@ -119,6 +119,19 @@ async def get_participant(pool: asyncpg.Pool, participant_id: UUID) -> Participa
     return _participant(row)
 
 
+async def list_participants(pool: asyncpg.Pool, room_id: UUID) -> list[ParticipantRow]:
+    rows = await pool.fetch(
+        """
+        SELECT id, room_id, kind, name, persona, created_at
+        FROM participants
+        WHERE room_id = $1
+        ORDER BY created_at
+        """,
+        room_id,
+    )
+    return [_participant(r) for r in rows]
+
+
 async def list_agent_participants(pool: asyncpg.Pool, room_id: UUID) -> list[ParticipantRow]:
     rows = await pool.fetch(
         """
@@ -213,6 +226,60 @@ async def get_last_read(pool: asyncpg.Pool, agent_id: UUID, room_id: UUID) -> in
         room_id,
     )
     return int(value) if value is not None else 0
+
+
+async def get_room_last_seq(pool: asyncpg.Pool, room_id: UUID) -> int:
+    value = await pool.fetchval("SELECT last_seq FROM rooms WHERE id = $1", room_id)
+    if value is None:
+        raise NotFoundError(f"room {room_id} not found")
+    return int(value)
+
+
+async def try_claim(
+    pool: asyncpg.Pool,
+    room_id: UUID,
+    task_key: str,
+    claimed_by: UUID,
+) -> bool:
+    row = await pool.fetchrow(
+        """
+        INSERT INTO claims (id, room_id, task_key, claimed_by)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (room_id, task_key) DO NOTHING
+        RETURNING id
+        """,
+        uuid4(),
+        room_id,
+        task_key,
+        claimed_by,
+    )
+    return row is not None
+
+
+async def insert_llm_call(
+    pool: asyncpg.Pool,
+    agent_id: UUID,
+    room_id: UUID,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    purpose: str,
+) -> None:
+    await pool.execute(
+        """
+        INSERT INTO llm_calls (
+            id, agent_id, room_id, model, prompt_tokens, completion_tokens, purpose
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        uuid4(),
+        agent_id,
+        room_id,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        purpose,
+    )
 
 
 async def set_last_read(

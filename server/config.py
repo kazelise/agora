@@ -8,6 +8,8 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql://agora:agora@127.0.0.1:5433/agora"
     redis_url: str = "redis://127.0.0.1:6379/0"
+    small_model: str = "gpt-5-mini"
+    big_model: str = "gpt-5.2"
 
 
 @lru_cache

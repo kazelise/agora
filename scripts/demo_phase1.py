@@ -45,7 +45,7 @@ async def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-    app = create_app()
+    app = create_app(stub_turns=True)
     try:
         async with app.router.lifespan_context(app):
             app.state.scheduler.turn_delay_s = 0.2
