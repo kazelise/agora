@@ -9,7 +9,7 @@ import pytest
 import redis.asyncio as redis
 
 import brain.graph as graph_mod
-from brain.graph import CLAIM_KEY_ERROR, Brain
+from brain.graph import CLAIM_KEY_ERROR, Brain, claim_obligation_text
 from brain.policy import big_model_name
 from brain.world_direct import DirectWorld
 from server import db
@@ -130,6 +130,7 @@ async def test_freshness_hold_then_different_reply(
         for m in big.calls[1]
     )
     assert "New messages landed while you were composing" in second_prompt
+    assert "a peer's reply does not release you" in second_prompt
     assert "[seq=" in second_prompt and "3" in second_prompt
     stored = await db.list_messages(pool, room_id)
     assert [(m.author_id, m.body) for m in stored] == [
@@ -349,3 +350,65 @@ async def test_big_model_failure_ends_turn_as_llm_error(
     assert [m.body for m in stored] == ["please reply"]
     rows = await _calls(pool, room_id)
     assert [r["purpose"] for r in rows] == ["triage"]
+
+
+@pytest.mark.asyncio
+async def test_won_claim_obligation_nudge_then_reply(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, agent_ids = await _room(pool)
+    await db.insert_message(pool, room_id, human_id, "one of you intro")
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="one-of-us", response_mode="one-of-us")]
+    )
+    big = ScriptedChatModel(
+        [
+            tool_call("claim", {"task_key": "t1:intro"}),
+            text_message("I won, sitting on it"),
+            tool_call("reply", {"body": "this room is agora"}),
+        ]
+    )
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(agent_ids[0], room_id)
+
+    assert result.outcome == "replied"
+    assert result.reply_body == "this room is agora"
+    assert result.claims == (("t1", "won"),)
+    assert len(big.calls) == 3
+    nudged = [getattr(m, "content", "") for m in big.calls[2]]
+    assert any(claim_obligation_text("t1") in str(t) for t in nudged)
+    rows = await pool.fetch("SELECT task_key FROM claims WHERE room_id = $1", room_id)
+    assert [r["task_key"] for r in rows] == ["t1"]
+
+
+@pytest.mark.asyncio
+async def test_won_claim_unfulfilled_releases_row(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, agent_ids = await _room(pool)
+    await db.insert_message(pool, room_id, human_id, "one of you intro")
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="one-of-us", response_mode="one-of-us")]
+    )
+    big = ScriptedChatModel(
+        [
+            tool_call("claim", {"task_key": "t1:intro"}),
+            text_message("I won"),
+            text_message("still not replying"),
+        ]
+    )
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(agent_ids[0], room_id)
+
+    assert result.outcome == "skipped"
+    assert result.reply_body is None
+    assert result.claims == (("t1", "won"),)
+    assert len(big.calls) == 3
+    nudged = [getattr(m, "content", "") for m in big.calls[2]]
+    assert any(claim_obligation_text("t1") in str(t) for t in nudged)
+    leftover = await pool.fetch("SELECT task_key FROM claims WHERE room_id = $1", room_id)
+    assert leftover == []
+    stored = await db.list_messages(pool, room_id)
+    assert [m.body for m in stored] == ["one of you intro"]

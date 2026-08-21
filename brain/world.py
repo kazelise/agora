@@ -97,6 +97,10 @@ class World(Protocol):
         self, room_id: UUID, task_key: str, claimed_by: UUID
     ) -> bool: ...
 
+    async def release_claim(
+        self, room_id: UUID, task_key: str, claimed_by: UUID
+    ) -> bool: ...
+
     async def record_llm_call(
         self,
         agent_id: UUID,

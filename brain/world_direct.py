@@ -119,6 +119,11 @@ class DirectWorld:
     ) -> bool:
         return await db.try_claim(self.pool, room_id, task_key, claimed_by)
 
+    async def release_claim(
+        self, room_id: UUID, task_key: str, claimed_by: UUID
+    ) -> bool:
+        return await db.release_claim(self.pool, room_id, task_key, claimed_by)
+
     async def record_llm_call(
         self,
         agent_id: UUID,

@@ -196,3 +196,11 @@ Agent 永远跑在某台 Computer 上。`computer_id` 为空就是今天的云�
 在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。
 
 和 Cumora 的诚实差别：他们换的是整颗推理引擎（Claude Code / Codex / Grok Build 在用户机器上跑自己的循环，Cumora 的 `turn.ts` 被绕开）。Agora 换的是宿主和 key，脑还是这张 LangGraph。卖点因此更窄、也更好讲：同一套 triage / claim / freshness 不变量，钥匙在谁手里、进程在哪台机器上，是唯一变量。
+
+## 安全性与活性
+
+「至多一人回复」是安全性：claim 的 `UNIQUE(room_id, task_key)` 保证锁只有一把，输家看到 lost 就让。安全性一直能站住。站不住的是活性：赢下 claim 的人有义务开口；它若赢了就停手，输家已经让出，房间就饿死——成绩单零条 Agent 消息，锁还占着，下一轮也没人能领。
+
+赢下 claim 是协议义务，不是 prompt 里的礼貌。代码兜底一次：tool_loop 要收束、手里有 won、本轮还没落地回复，就塞一条 user-role「You won claim `<key>`; you must reply now or the claim will be released.」，并只加 **一** 跳 hop 预算。再不开口，就把行 DELETE 掉（`release_claim`，只删自己赢的那把），打警告。未履行的 claim 不能把 `task_key` 永远钉死。语义对错仍归模型；代码只拦「赢了却不履约」这种协议违约。
+
+HOLD 重判按 `response_mode` 给语义指引，不分类内容：`each` 说同伴开口并不解除你的义务；`one-of-us` 说同伴已经做完你就沉默；`me` 说点名很少因为旁人插话而取消。triage 的三条 mode 说明同一套，避免「有人说过就 actionable=false」把 each 误杀。

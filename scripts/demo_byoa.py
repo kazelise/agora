@@ -210,7 +210,10 @@ async def _demo(client: httpx.AsyncClient, server_url: str) -> None:
             for agent_id in (iris["id"], jules["id"]):
                 if agent_id not in missing:
                     continue
-                _say(f"{names[agent_id]} has not spoken yet — Ada nudges them")
+                _say(
+                    f"NUDGE FIRED: {names[agent_id]} did not answer the each-question; "
+                    "Ada posts a fallback"
+                )
                 nudge = await client.post(
                     f"/rooms/{room_id}/messages",
                     json={"author_id": human["id"], "body": nudges[agent_id]},

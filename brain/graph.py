@@ -30,6 +30,9 @@ logger = logging.getLogger("agora.brain")
 MAX_HOPS = 6
 MAX_HOLDS = 2
 LLM_RETRY_BACKOFF_S = 1.0
+# One extra hop after a won-claim obligation nudge. Bounded and obvious:
+# the winner gets exactly one more chance to reply before we release.
+CLAIM_OBLIGATION_HOPS = 1
 
 # Protocol parse of the model's claim key — not content classification.
 # Free-form names never converge across two models; seq is objective.
@@ -39,6 +42,12 @@ CLAIM_KEY_ERROR = (
     "(e.g. t1 or t1:intro), where <seq> is the seq of the message "
     "you are responding to. Retry with that format."
 )
+
+
+def claim_obligation_text(task_key: str) -> str:
+    return (
+        f"You won claim {task_key}; you must reply now or the claim will be released."
+    )
 
 
 def canonical_task_key(task_key: str) -> str | None:
@@ -88,6 +97,7 @@ class BrainState(TypedDict, total=False):
     pending_reply: str
     outcome: str
     claims: list[ClaimRecord]
+    claim_nudged: bool
 
 
 @tool
@@ -156,6 +166,19 @@ def _parse_triage(text: str) -> TriageVerdict:
             raw = raw[4:]
         raw = raw.strip()
     return TriageVerdict.model_validate_json(raw)
+
+
+def _hold_guidance(response_mode: str) -> str:
+    if response_mode == "each":
+        return (
+            "a peer's reply does not release you; if you have not yet "
+            "done the task yourself, you still must do it.\n"
+        )
+    if response_mode == "one-of-us":
+        return "if a peer already completed the request, stay silent.\n"
+    if response_mode == "me":
+        return "the request was addressed to you; new messages rarely change that.\n"
+    return ""
 
 
 def _format_inbox(items: list[InboxItem]) -> str:
@@ -314,9 +337,11 @@ class Brain:
             f"New messages since you last read:\n{_format_inbox(state.get('inbox') or [])}\n\n"
             "Decide whether you should act. Reply with a single JSON object, no markdown:\n"
             '{"actionable": bool, "reason": str, "response_mode": "me"|"each"|"one-of-us"}\n'
-            "me = addressed to you; each = everyone should respond; "
-            "one-of-us = exactly one agent should respond.\n"
-            "If another participant already completed the request, actionable=false."
+            "me = addressed to you; new messages from others rarely mean you should skip.\n"
+            "each = everyone should respond; a peer already speaking does not "
+            "complete the request for you.\n"
+            "one-of-us = exactly one agent should respond; if a peer already "
+            "completed the request, actionable=false."
         )
         ai = await invoke_model(
             self.small, [SystemMessage(content=prompt)], label="triage"
@@ -359,9 +384,41 @@ class Brain:
             "response_mode": verdict.response_mode,
         }
 
+    def _hop_budget(self, state: BrainState) -> int:
+        extra = CLAIM_OBLIGATION_HOPS if state.get("claim_nudged") else 0
+        return MAX_HOPS + extra
+
+    def _won_keys(self, claims: list[ClaimRecord]) -> list[str]:
+        return [c["task_key"] for c in claims if c.get("result") == "won"]
+
+    def _claim_nudge(
+        self,
+        state: BrainState,
+        after: list[BaseMessage],
+        claims: list[ClaimRecord],
+        hop: int,
+    ) -> dict[str, Any] | None:
+        """One protocol reminder if a winner is about to leave without replying."""
+        if state.get("claim_nudged"):
+            return None
+        won = self._won_keys(claims)
+        if not won:
+            return None
+        key = won[-1]
+        note = HumanMessage(content=claim_obligation_text(key))
+        logger.info("claim obligation %s %s — one more hop", state["agent_name"], key)
+        return {
+            "messages": [*after, note],
+            "hop_count": hop,
+            "claims": claims,
+            "pending_reply": "",
+            "claim_nudged": True,
+        }
+
     async def _tool_loop(self, state: BrainState) -> dict[str, Any]:
         hop = int(state.get("hop_count") or 0)
-        if hop >= MAX_HOPS:
+        budget = self._hop_budget(state)
+        if hop >= budget:
             return {"outcome": "hop_exhausted"}
 
         history = list(state.get("messages") or [])
@@ -420,8 +477,11 @@ class Brain:
         }
         if pending:
             return update
-        if not getattr(ai, "tool_calls", None) or hop >= MAX_HOPS:
-            update["outcome"] = "skipped" if hop < MAX_HOPS else "hop_exhausted"
+        if not getattr(ai, "tool_calls", None) or hop >= budget:
+            nudged = self._claim_nudge(state, after, claims, hop)
+            if nudged is not None:
+                return nudged
+            update["outcome"] = "skipped" if hop < budget else "hop_exhausted"
         return update
 
     async def _hold(
@@ -463,9 +523,13 @@ class Brain:
 
         # User role, not system: some OpenAI-compatible backends reject a
         # system message that is not at position 0 (mid-conversation HOLD).
+        # Mode line is semantic guidance; the code does not classify bodies.
         note = HumanMessage(
-            content="New messages landed while you were composing; re-decide.\n"
-            + "\n".join(lines)
+            content=(
+                "New messages landed while you were composing; re-decide.\n"
+                f"{_hold_guidance(str(state.get('response_mode') or ''))}"
+                + "\n".join(lines)
+            )
         )
         await self.world.record_seen(UUID(state["agent_id"]), room_id, latest)
         logger.info(
@@ -509,6 +573,29 @@ class Brain:
             await self.on_committed(row)
         logger.info("commit %s seq=%s", state["agent_name"], row.seq)
         return {"outcome": "replied"}
+
+    async def _release_unfulfilled(
+        self,
+        agent_id: UUID,
+        room_id: UUID,
+        agent_name: str,
+        claims: list[ClaimRecord],
+    ) -> None:
+        seen: set[str] = set()
+        for item in claims:
+            if item.get("result") != "won":
+                continue
+            key = item["task_key"]
+            if key in seen:
+                continue
+            seen.add(key)
+            released = await self.world.release_claim(room_id, key, agent_id)
+            if released:
+                logger.warning(
+                    "released unfulfilled claim %s by %s — winner did not reply",
+                    key,
+                    agent_name,
+                )
 
     async def run(self, agent_id: UUID, room_id: UUID) -> TurnResult:
         ctx = await self.world.load_turn(agent_id, room_id)
@@ -559,6 +646,7 @@ class Brain:
             "pending_reply": "",
             "outcome": "",
             "claims": [],
+            "claim_nudged": False,
         }
         final = await self.graph.ainvoke(
             initial,
@@ -576,6 +664,9 @@ class Brain:
         reply = final.get("pending_reply") or None
         if outcome != "replied":
             reply = None
+            await self._release_unfulfilled(
+                agent_id, room_id, ctx.agent.name, final.get("claims") or []
+            )
         return TurnResult(
             agent_id=agent_id,
             agent_name=ctx.agent.name,

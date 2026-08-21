@@ -240,6 +240,19 @@ async def claim(
     return {"won": won}
 
 
+@router.post("/release-claim")
+async def release_claim(
+    request: Request,
+    body: RuntimeClaimRequest,
+    computer: ComputerRow = Depends(require_computer),
+) -> dict[str, bool]:
+    await hosted_agent(request, computer, body.agent_id, body.room_id)
+    released = await db.release_claim(
+        request.app.state.pool, body.room_id, body.task_key, body.agent_id
+    )
+    return {"released": released}
+
+
 @router.post("/llm-call")
 async def llm_call(
     request: Request,

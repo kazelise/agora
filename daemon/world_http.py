@@ -214,6 +214,22 @@ class HttpWorld:
         self._raise_for_status(resp)
         return bool(resp.json()["won"])
 
+    async def release_claim(
+        self, room_id: UUID, task_key: str, claimed_by: UUID
+    ) -> bool:
+        self._actor = claimed_by
+        resp = await self._request(
+            "POST",
+            "/runtime/release-claim",
+            json={
+                "agent_id": str(claimed_by),
+                "room_id": str(room_id),
+                "task_key": task_key,
+            },
+        )
+        self._raise_for_status(resp)
+        return bool(resp.json()["released"])
+
     async def record_llm_call(
         self,
         agent_id: UUID,

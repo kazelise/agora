@@ -380,6 +380,30 @@ async def try_claim(
     return row is not None
 
 
+async def release_claim(
+    pool: asyncpg.Pool,
+    room_id: UUID,
+    task_key: str,
+    claimed_by: UUID,
+) -> bool:
+    """Drop a claim only if this agent still holds it.
+
+    An unfulfilled winner must not pin the task_key forever — losers
+    already yielded, and a dead lock starves the room.
+    """
+    row = await pool.fetchrow(
+        """
+        DELETE FROM claims
+        WHERE room_id = $1 AND task_key = $2 AND claimed_by = $3
+        RETURNING id
+        """,
+        room_id,
+        task_key,
+        claimed_by,
+    )
+    return row is not None
+
+
 async def insert_llm_call(
     pool: asyncpg.Pool,
     agent_id: UUID,
