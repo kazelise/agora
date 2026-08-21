@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 from uuid import UUID, uuid4
 
-import asyncpg
-import redis.asyncio as redis
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
@@ -25,9 +23,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from brain import policy
-from brain.seen import record_seen
-from server import db
-from server.models import MessageRow
+from brain.world import StaleWrite, World, WorldMessage
 
 logger = logging.getLogger("agora.brain")
 
@@ -234,15 +230,14 @@ async def invoke_model(model: Any, messages: list[Any], *, label: str) -> Any | 
 class Brain:
     def __init__(
         self,
-        pool: asyncpg.Pool,
-        redis_client: redis.Redis,
+        world: World,
         *,
         small_model: Any | None = None,
         big_model: Any | None = None,
         small_model_name: str | None = None,
         big_model_name: str | None = None,
         checkpointer: Any | None = None,
-        on_committed: Callable[[MessageRow], Awaitable[None]] | None = None,
+        on_committed: Callable[[WorldMessage], Awaitable[None]] | None = None,
     ) -> None:
         self.small_model_name = policy.assert_triage_model(
             policy.small_model_name() if small_model_name is None else small_model_name
@@ -250,8 +245,7 @@ class Brain:
         self.big_model_name = (
             policy.big_model_name() if big_model_name is None else big_model_name
         )
-        self.pool = pool
-        self.redis = redis_client
+        self.world = world
         self.small = small_model or ChatOpenAI(model=self.small_model_name)
         self.big = big_model or ChatOpenAI(model=self.big_model_name)
         # InMemorySaver: langgraph-checkpoint-postgres wants psycopg/libpq;
@@ -305,8 +299,7 @@ class Brain:
     async def _ledger(self, state: BrainState, purpose: str, message: Any) -> None:
         prompt_tokens, completion_tokens = token_usage(message)
         model = self.small_model_name if purpose == "triage" else self.big_model_name
-        await db.insert_llm_call(
-            self.pool,
+        await self.world.record_llm_call(
             UUID(state["agent_id"]),
             UUID(state["room_id"]),
             model,
@@ -400,8 +393,7 @@ class Brain:
                         "claim %s rejected key %r", state["agent_name"], raw_key
                     )
                     continue
-                won = await db.try_claim(
-                    self.pool,
+                won = await self.world.try_claim(
                     UUID(state["room_id"]),
                     task_key,
                     UUID(state["agent_id"]),
@@ -432,7 +424,12 @@ class Brain:
             update["outcome"] = "skipped" if hop < MAX_HOPS else "hop_exhausted"
         return update
 
-    async def _hold(self, state: BrainState, latest: int) -> dict[str, Any]:
+    async def _hold(
+        self,
+        state: BrainState,
+        latest: int,
+        newer: list[WorldMessage] | None = None,
+    ) -> dict[str, Any]:
         seen = int(state["seen_seq"])
         hold_count = int(state.get("hold_count") or 0)
         if hold_count >= MAX_HOLDS:
@@ -445,16 +442,15 @@ class Brain:
             return {"outcome": "held_exhausted", "pending_reply": ""}
 
         room_id = UUID(state["room_id"])
-        newer = await db.list_messages(self.pool, room_id, since_seq=seen)
+        landed = newer if newer is not None else await self.world.list_messages_since(
+            room_id, seen
+        )
         names = dict(state.get("author_names") or {})
         lines: list[str] = []
         extra: list[InboxItem] = []
-        for message in newer:
-            name = names.get(str(message.author_id))
-            if name is None:
-                author = await db.get_participant(self.pool, message.author_id)
-                name = author.name
-                names[str(message.author_id)] = name
+        for message in landed:
+            name = message.author_name or names.get(str(message.author_id), "?")
+            names[str(message.author_id)] = name
             lines.append(f"[seq={message.seq} {name}] {message.body}")
             extra.append(
                 {
@@ -471,7 +467,7 @@ class Brain:
             content="New messages landed while you were composing; re-decide.\n"
             + "\n".join(lines)
         )
-        await record_seen(self.redis, UUID(state["agent_id"]), room_id, latest)
+        await self.world.record_seen(UUID(state["agent_id"]), room_id, latest)
         logger.info(
             "HOLD %s seen=%s latest=%s hold=%s",
             state["agent_name"],
@@ -492,7 +488,7 @@ class Brain:
     async def _freshness(self, state: BrainState) -> dict[str, Any]:
         # Cheap first check. The transactional insert is the invariant.
         room_id = UUID(state["room_id"])
-        latest = await db.get_room_last_seq(self.pool, room_id)
+        latest = await self.world.get_room_last_seq(room_id)
         seen = int(state["seen_seq"])
         if latest <= seen:
             return {}
@@ -501,40 +497,36 @@ class Brain:
     async def _commit(self, state: BrainState) -> dict[str, Any]:
         body = state.get("pending_reply") or ""
         try:
-            row = await db.insert_message(
-                self.pool,
+            row = await self.world.insert_message(
                 UUID(state["room_id"]),
                 UUID(state["agent_id"]),
                 body,
                 not_after_seq=int(state["seen_seq"]),
             )
-        except db.StaleWriteError as exc:
-            return await self._hold(state, exc.last_seq)
+        except StaleWrite as exc:
+            return await self._hold(state, exc.last_seq, newer=exc.newer)
         if self.on_committed is not None:
             await self.on_committed(row)
         logger.info("commit %s seq=%s", state["agent_name"], row.seq)
         return {"outcome": "replied"}
 
     async def run(self, agent_id: UUID, room_id: UUID) -> TurnResult:
-        agent = await db.get_participant(self.pool, agent_id)
-        since = await db.get_last_read(self.pool, agent_id, room_id)
-        rows = await db.list_messages(self.pool, room_id, since_seq=since)
-        participants = await db.list_participants(self.pool, room_id)
-        names = {str(p.id): p.name for p in participants}
+        ctx = await self.world.load_turn(agent_id, room_id)
+        names = {str(p.id): p.name for p in ctx.participants}
         inbox: list[InboxItem] = [
             {
                 "seq": message.seq,
                 "body": message.body,
                 "author_id": str(message.author_id),
-                "author_name": names.get(str(message.author_id), "?"),
+                "author_name": message.author_name or names.get(str(message.author_id), "?"),
             }
-            for message in rows
+            for message in ctx.inbox
         ]
-        seen_seq = max((message.seq for message in rows), default=since)
+        seen_seq = ctx.seen_seq
         if not inbox:
             return TurnResult(
                 agent_id=agent_id,
-                agent_name=agent.name,
+                agent_name=ctx.agent.name,
                 room_id=room_id,
                 outcome="empty",
                 hold_count=0,
@@ -549,11 +541,11 @@ class Brain:
             )
 
         # Inbox is about to be shown to the model — high-water goes to Redis.
-        await record_seen(self.redis, agent_id, room_id, seen_seq)
+        await self.world.record_seen(agent_id, room_id, seen_seq)
         initial: BrainState = {
             "agent_id": str(agent_id),
-            "agent_name": agent.name,
-            "persona": agent.persona or "",
+            "agent_name": ctx.agent.name,
+            "persona": ctx.agent.persona or "",
             "room_id": str(room_id),
             "inbox": inbox,
             "author_names": names,
@@ -576,7 +568,7 @@ class Brain:
             },
         )
         last_read = int(final.get("seen_seq") or seen_seq)
-        await db.set_last_read(self.pool, agent_id, room_id, last_read)
+        await self.world.set_last_read(agent_id, room_id, last_read)
         claims = tuple(
             (item["task_key"], item["result"]) for item in (final.get("claims") or [])
         )
@@ -586,7 +578,7 @@ class Brain:
             reply = None
         return TurnResult(
             agent_id=agent_id,
-            agent_name=agent.name,
+            agent_name=ctx.agent.name,
             room_id=room_id,
             outcome=outcome,
             hold_count=int(final.get("hold_count") or 0),
@@ -601,18 +593,18 @@ class Brain:
         )
 
 
-def build_brain(
-    pool: asyncpg.Pool,
-    redis_client: redis.Redis,
-    **kwargs: Any,
-) -> Brain:
-    return Brain(pool, redis_client, **kwargs)
+def build_brain(world: World, **kwargs: Any) -> Brain:
+    return Brain(world, **kwargs)
 
 
 def make_turn_fn(
-    pool: asyncpg.Pool,
-    redis_client: redis.Redis,
+    pool: Any,
+    redis_client: Any,
     **kwargs: Any,
 ) -> Callable[[UUID, UUID], Awaitable[TurnResult]]:
-    brain = Brain(pool, redis_client, **kwargs)
+    # Lazy import: DirectWorld pulls asyncpg/redis. The daemon constructs
+    # Brain(HttpWorld, ...) and must not load the cloud host's drivers.
+    from brain.world_direct import DirectWorld
+
+    brain = Brain(DirectWorld(pool, redis_client), **kwargs)
     return brain.run

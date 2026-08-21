@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import UUID
@@ -8,20 +9,25 @@ from uuid import UUID
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 
+from brain.world import WorldMessage
 from server import db
+from server.computers import ComputerHub
 from server.config import get_settings
 from server.hub import RoomHub
 from server.models import (
+    ComputerCreatedOut,
+    ComputerOut,
+    CreateComputerRequest,
     CreateMessageRequest,
     CreateParticipantRequest,
     CreateRoomRequest,
     MessageListOut,
     MessageOut,
-    MessageRow,
     ParticipantOut,
     RoomOut,
 )
-from server.scheduler import Scheduler, publish_wake, run_subscriber
+from server.runtime import computer_ws, router as runtime_router
+from server.scheduler import Scheduler, fanout_message, run_subscriber
 
 
 def create_app(*, stub_turns: bool = False) -> FastAPI:
@@ -35,18 +41,19 @@ def create_app(*, stub_turns: bool = False) -> FastAPI:
         await publisher.ping()
 
         hub = RoomHub()
+        computers = ComputerHub()
         if stub_turns:
-            scheduler = Scheduler(pool)
+            scheduler = Scheduler(pool, computers=computers)
         else:
             from brain.graph import make_turn_fn
 
-            async def on_committed(row: MessageRow) -> None:
-                await hub.broadcast(row.room_id, row.as_ws())
-                await publish_wake(publisher, row.room_id, row.author_id, row.seq)
+            async def on_committed(row: WorldMessage) -> None:
+                await fanout_message(hub, publisher, row)
 
             scheduler = Scheduler(
                 pool,
                 run_turn=make_turn_fn(pool, publisher, on_committed=on_committed),
+                computers=computers,
             )
 
         ready = asyncio.Event()
@@ -59,6 +66,7 @@ def create_app(*, stub_turns: bool = False) -> FastAPI:
         app.state.redis = publisher
         app.state.scheduler = scheduler
         app.state.hub = hub
+        app.state.computers = computers
 
         try:
             yield
@@ -79,6 +87,27 @@ def create_app(*, stub_turns: bool = False) -> FastAPI:
 
 
 def register_routes(app: FastAPI) -> None:
+    @app.post("/computers", response_model=ComputerCreatedOut)
+    async def post_computer(body: CreateComputerRequest) -> ComputerCreatedOut:
+        token = secrets.token_urlsafe(32)
+        row = await db.create_computer(app.state.pool, body.name, token)
+        return ComputerCreatedOut(id=row.id, name=row.name, token=token)
+
+    @app.get("/computers", response_model=list[ComputerOut])
+    async def get_computers() -> list[ComputerOut]:
+        hub: ComputerHub = app.state.computers
+        rows = await db.list_computers(app.state.pool)
+        return [
+            ComputerOut(
+                id=row.id,
+                name=row.name,
+                created_at=row.created_at,
+                last_seen_at=row.last_seen_at,
+                online=hub.listed_online(row.id, row.last_seen_at),
+            )
+            for row in rows
+        ]
+
     @app.post("/rooms", response_model=RoomOut)
     async def post_room(body: CreateRoomRequest) -> RoomOut:
         room = await db.create_room(app.state.pool, body.name)
@@ -88,7 +117,12 @@ def register_routes(app: FastAPI) -> None:
     async def post_participant(room_id: UUID, body: CreateParticipantRequest) -> ParticipantOut:
         try:
             row = await db.add_participant(
-                app.state.pool, room_id, body.kind, body.name, body.persona
+                app.state.pool,
+                room_id,
+                body.kind,
+                body.name,
+                body.persona,
+                body.computer_id,
             )
         except db.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=exc.detail) from exc
@@ -98,6 +132,7 @@ def register_routes(app: FastAPI) -> None:
             kind=row.kind,
             name=row.name,
             persona=row.persona,
+            computer_id=row.computer_id,
             created_at=row.created_at,
         )
 
@@ -107,8 +142,7 @@ def register_routes(app: FastAPI) -> None:
             row = await db.insert_message(app.state.pool, room_id, body.author_id, body.body)
         except db.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=exc.detail) from exc
-        await app.state.hub.broadcast(room_id, row.as_ws())
-        await publish_wake(app.state.redis, room_id, body.author_id, row.seq)
+        await fanout_message(app.state.hub, app.state.redis, row)
         return row.as_out()
 
     @app.get("/rooms/{room_id}/messages", response_model=MessageListOut)
@@ -136,6 +170,19 @@ def register_routes(app: FastAPI) -> None:
                 await websocket.receive_text()
         except WebSocketDisconnect:
             hub.disconnect(room_id, websocket)
+
+    @app.websocket("/ws/computers/{computer_id}")
+    async def ws_computer_route(
+        websocket: WebSocket,
+        computer_id: UUID,
+        token: str | None = Query(default=None),
+    ) -> None:
+        if not token:
+            await websocket.close(code=1008)
+            return
+        await computer_ws(websocket, computer_id, token)
+
+    app.include_router(runtime_router)
 
 
 app = create_app()

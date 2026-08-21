@@ -102,7 +102,7 @@ flowchart LR
   brain --> Ledger
 ```
 
-当前落地：`clients` 只有 curl / 脚本；`server` 的 REST、WebSocket、调度器已接通；`brain` 是一张 LangGraph（Phase 2）。OAuth / 双宿主仍是空目录。
+当前落地：`clients` 只有 curl / 脚本；`server` 的 REST、WebSocket、调度器已接通；`brain` 是一张 LangGraph（Phase 2–3）；`daemon` 是 BYOA 宿主（Phase 4b）。OAuth / K8s 仍是空目录。
 
 ## 表怎么对应这两类失败
 
@@ -119,7 +119,8 @@ flowchart LR
 - **Phase 0–1：** 地基、设计文档、消息流、叫醒调度、测试。
 - **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
 - **Phase 3（本仓库现在）：** 提交时事务内新鲜度校验；`task_key` 锚定到触发消息的 seq；计数游戏 / one-of-us 两条真模型协调测试。
-- **Phase 4+：** GitHub OAuth、BYOA daemon、K8s Job。做完一项再写进简历一项。
+- **Phase 4b（本仓库现在）：** Computer 作为一等宿主；同一张图通过 `World` 接口换宿主；BYOA daemon 用自己的 key 跑，服务端零持有密钥。
+- **Phase 4a / 4c：** GitHub OAuth、K8s Job。做完一项再写进简历一项。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
 
@@ -181,3 +182,17 @@ Phase 2 把机制接上了，但只在 mock 里证明「HOLD 会回环、claim �
 mock 套件仍然不打中继。真模型测试标 `@pytest.mark.llm`，没配 `OPENAI_BASE_URL` 或中继探不到 `/v1/models` 就 skip。
 
 LLM 调用失败按 fail-open 处理：`triage` / `tool_loop` 里模型抛错就重试一次（隔 1 秒），再失败则本轮 `outcome=llm_error` 结束，不写账本、不插入消息。少一次回复，不是把调度器车道打崩——和 Redis 叫醒同一类：协调信号可以丢，正确性不变量（seq、claim、事务内新鲜度）不能丢。
+
+## Phase 4b：World 是解耦缝，不是第二张图
+
+云端 turn 和 BYOA turn 必须是同一张 LangGraph。差别只在副作用从哪走、模型 key 谁拿。所以 Phase 4b 的承重重构是 `World`：图不再碰 asyncpg / Redis，只调用协议上的 `load_turn` / `insert_message` / `try_claim` / `record_llm_call` / `record_seen`。云端宿主给 `DirectWorld`（进程内池子，行为与 Phase 3 完全一样）；本地 daemon 给 `HttpWorld`（带着 pairing token 打 `/runtime/*`）。换宿主 = 换运输层，不换脑。
+
+密钥不能过服务端。daemon 在自己的进程里用自己的 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 构造 `ChatOpenAI`。服务端 runtime 只收「用了哪个模型、多少 token、purpose 是 triage 还是 turn」——账本还是那一张 `llm_calls`，但行里没有 key。这是单账本不变量能同时罩住两种宿主的原因：usage 上报，凭据不上报。
+
+Agent 永远跑在某台 Computer 上。`computer_id` 为空就是今天的云端车道；有值就只往那台 Computer 的 WebSocket 推 `{agent_id, room_id}`。Computer 不在线时 **不排队**：inbox 是 `conversation_reads.last_read_seq` 游标，漏一次叫醒只是少一轮 turn，下次连上从游标往后读就能补上。如果给离线 Computer 做无界 wake 队列，队列会在笔记本合盖的时候无限涨，而游标已经让「丢 wake」变成安全的——这是 fail-open 在宿主层的同一句话。
+
+过期回复走 409，而且把 `last_seq` 和更新的消息一并带上。daemon 侧的图接到 `StaleWrite.newer` 就能 HOLD，不必再打一趟 `list_messages`。云端 `DirectWorld` 在事务拒绝之后也填上同一份 `newer`，两条宿主的 HOLD 路径形状一样。
+
+在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。
+
+和 Cumora 的诚实差别：他们换的是整颗推理引擎（Claude Code / Codex / Grok Build 在用户机器上跑自己的循环，Cumora 的 `turn.ts` 被绕开）。Agora 换的是宿主和 key，脑还是这张 LangGraph。卖点因此更窄、也更好讲：同一套 triage / claim / freshness 不变量，钥匙在谁手里、进程在哪台机器上，是唯一变量。

@@ -8,14 +8,27 @@ CREATE TABLE IF NOT EXISTS rooms (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS computers (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ
+);
+
 CREATE TABLE IF NOT EXISTS participants (
     id UUID PRIMARY KEY,
     room_id UUID NOT NULL REFERENCES rooms (id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK (kind IN ('human', 'agent')),
     name TEXT NOT NULL,
     persona TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    computer_id UUID REFERENCES computers (id)
 );
+
+-- Existing Phase 0–3 databases already have participants; add the FK if missing.
+ALTER TABLE participants
+    ADD COLUMN IF NOT EXISTS computer_id UUID REFERENCES computers (id);
 
 CREATE TABLE IF NOT EXISTS messages (
     id UUID PRIMARY KEY,
@@ -58,3 +71,4 @@ CREATE TABLE IF NOT EXISTS conversation_reads (
 
 CREATE INDEX IF NOT EXISTS messages_room_seq_idx ON messages (room_id, seq);
 CREATE INDEX IF NOT EXISTS participants_room_idx ON participants (room_id);
+CREATE INDEX IF NOT EXISTS participants_computer_idx ON participants (computer_id);

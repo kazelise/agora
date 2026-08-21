@@ -6,7 +6,18 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
-from server.models import MessageRow, ParticipantKind, ParticipantRow, RoomRow
+from server.computers import hash_token
+from server.models import (
+    ComputerRow,
+    MessageRow,
+    ParticipantKind,
+    ParticipantRow,
+    RoomRow,
+)
+
+_PARTICIPANT_COLS = (
+    "id, room_id, kind, name, persona, computer_id, created_at"
+)
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
@@ -52,6 +63,16 @@ def _participant(row: asyncpg.Record) -> ParticipantRow:
         name=row["name"],
         persona=row["persona"],
         created_at=row["created_at"],
+        computer_id=row["computer_id"],
+    )
+
+
+def _computer(row: asyncpg.Record) -> ComputerRow:
+    return ComputerRow(
+        id=row["id"],
+        name=row["name"],
+        created_at=row["created_at"],
+        last_seen_at=row["last_seen_at"],
     )
 
 
@@ -96,23 +117,31 @@ async def add_participant(
     kind: ParticipantKind,
     name: str,
     persona: str | None,
+    computer_id: UUID | None = None,
 ) -> ParticipantRow:
     async with pool.acquire() as conn:
         async with conn.transaction():
             exists = await conn.fetchval("SELECT 1 FROM rooms WHERE id = $1", room_id)
             if exists is None:
                 raise NotFoundError(f"room {room_id} not found")
+            if computer_id is not None:
+                hosted = await conn.fetchval(
+                    "SELECT 1 FROM computers WHERE id = $1", computer_id
+                )
+                if hosted is None:
+                    raise NotFoundError(f"computer {computer_id} not found")
             row = await conn.fetchrow(
-                """
-                INSERT INTO participants (id, room_id, kind, name, persona)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, room_id, kind, name, persona, created_at
+                f"""
+                INSERT INTO participants (id, room_id, kind, name, persona, computer_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING {_PARTICIPANT_COLS}
                 """,
                 uuid4(),
                 room_id,
                 kind,
                 name,
                 persona,
+                computer_id,
             )
     assert row is not None
     return _participant(row)
@@ -120,8 +149,8 @@ async def add_participant(
 
 async def get_participant(pool: asyncpg.Pool, participant_id: UUID) -> ParticipantRow:
     row = await pool.fetchrow(
-        """
-        SELECT id, room_id, kind, name, persona, created_at
+        f"""
+        SELECT {_PARTICIPANT_COLS}
         FROM participants
         WHERE id = $1
         """,
@@ -134,8 +163,8 @@ async def get_participant(pool: asyncpg.Pool, participant_id: UUID) -> Participa
 
 async def list_participants(pool: asyncpg.Pool, room_id: UUID) -> list[ParticipantRow]:
     rows = await pool.fetch(
-        """
-        SELECT id, room_id, kind, name, persona, created_at
+        f"""
+        SELECT {_PARTICIPANT_COLS}
         FROM participants
         WHERE room_id = $1
         ORDER BY created_at
@@ -147,8 +176,8 @@ async def list_participants(pool: asyncpg.Pool, room_id: UUID) -> list[Participa
 
 async def list_agent_participants(pool: asyncpg.Pool, room_id: UUID) -> list[ParticipantRow]:
     rows = await pool.fetch(
-        """
-        SELECT id, room_id, kind, name, persona, created_at
+        f"""
+        SELECT {_PARTICIPANT_COLS}
         FROM participants
         WHERE room_id = $1 AND kind = 'agent'
         ORDER BY created_at
@@ -156,6 +185,75 @@ async def list_agent_participants(pool: asyncpg.Pool, room_id: UUID) -> list[Par
         room_id,
     )
     return [_participant(r) for r in rows]
+
+
+async def create_computer(pool: asyncpg.Pool, name: str, token: str) -> ComputerRow:
+    row = await pool.fetchrow(
+        """
+        INSERT INTO computers (id, name, token_hash)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, created_at, last_seen_at
+        """,
+        uuid4(),
+        name,
+        hash_token(token),
+    )
+    assert row is not None
+    return _computer(row)
+
+
+async def get_computer(pool: asyncpg.Pool, computer_id: UUID) -> ComputerRow:
+    row = await pool.fetchrow(
+        """
+        SELECT id, name, created_at, last_seen_at
+        FROM computers
+        WHERE id = $1
+        """,
+        computer_id,
+    )
+    if row is None:
+        raise NotFoundError(f"computer {computer_id} not found")
+    return _computer(row)
+
+
+async def get_computer_by_token(pool: asyncpg.Pool, token: str) -> ComputerRow | None:
+    row = await pool.fetchrow(
+        """
+        SELECT id, name, created_at, last_seen_at
+        FROM computers
+        WHERE token_hash = $1
+        """,
+        hash_token(token),
+    )
+    return None if row is None else _computer(row)
+
+
+async def computer_token_matches(
+    pool: asyncpg.Pool, computer_id: UUID, token: str
+) -> bool:
+    stored = await pool.fetchval(
+        "SELECT token_hash FROM computers WHERE id = $1",
+        computer_id,
+    )
+    return stored is not None and stored == hash_token(token)
+
+
+async def list_computers(pool: asyncpg.Pool) -> list[ComputerRow]:
+    rows = await pool.fetch(
+        """
+        SELECT id, name, created_at, last_seen_at
+        FROM computers
+        ORDER BY created_at
+        """
+    )
+    return [_computer(r) for r in rows]
+
+
+async def touch_computer(pool: asyncpg.Pool, computer_id: UUID) -> None:
+    await pool.execute(
+        "UPDATE computers SET last_seen_at = now() WHERE id = $1",
+        computer_id,
+    )
 
 
 async def insert_message(
@@ -328,4 +426,4 @@ async def set_last_read(
 
 
 async def truncate_all(pool: asyncpg.Pool) -> None:
-    await pool.execute("TRUNCATE rooms CASCADE")
+    await pool.execute("TRUNCATE rooms, computers CASCADE")

@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 3：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验、按 seq 锚定的 `task_key`、`llm_calls` 账本），以及计数游戏 / one-of-us 两条真模型协调测试。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 4b：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验、按 seq 锚定的 `task_key`、`llm_calls` 账本），计数游戏 / one-of-us 两条真模型协调测试，以及 BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
@@ -67,6 +67,44 @@ export OPENAI_API_BASE=$OPENAI_BASE_URL
 export AGORA_SMALL_MODEL=gpt-5.6-luna          # triage，默认即此
 export AGORA_BIG_MODEL=gpt-5.6-terra           # 工具循环，默认即此
 uv run python scripts/demo_phase2.py           # one-of-us 介绍房间
+uv run python scripts/demo_byoa.py             # 云端 + 本地 daemon，然后把 daemon 杀掉
+```
+
+## BYOA 快速开始
+
+Computer 是宿主：`computer_id` 为空的 Agent 走进程内云端车道；有值的走那台机器上的 daemon。daemon 用自己的 `OPENAI_API_KEY` 跑同一张图，只通过 `/runtime/*` 读写世界，服务端看不到 key。
+
+另开一个终端（服务已经在 8000 端口）：
+
+```bash
+# 1. 配对一台 Computer（token 只在这一次响应里出现）
+curl -s http://127.0.0.1:8000/computers \
+  -H 'content-type: application/json' \
+  -d '{"name":"my-laptop"}'
+# → {"id":"...","name":"my-laptop","token":"..."}
+
+# 2. 建房、加人、把 Agent 挂到这台 Computer（把 COMPUTER_ID 换成上一步的 id）
+#    POST /rooms  →  POST /rooms/{id}/participants
+#    人：{"kind":"human","name":"Ada"}
+#    Agent：{"kind":"agent","name":"Jules","computer_id":"<COMPUTER_ID>"}
+
+# 3. 跑 daemon（环境变量里是 *daemon 自己的* key，不是服务端的）
+export AGORA_SERVER_URL=http://127.0.0.1:8000
+export AGORA_COMPUTER_ID=<id>
+export AGORA_COMPUTER_TOKEN=<token>
+export OPENAI_API_KEY=relay-no-key
+export OPENAI_BASE_URL=http://192.168.1.100:8317/v1
+export OPENAI_API_BASE=$OPENAI_BASE_URL
+uv run python -m daemon
+
+# 4. 再往房间 POST 一条人的消息。daemon 日志就是演示：
+#    wake → triage → claim/hold/reply。Computer 断线则 Agent 显示 sleeping。
+```
+
+一条命令看完整故事（进程内拉起服务、配对、拉起 daemon 子进程、人提问、再杀掉 daemon）：
+
+```bash
+uv run python scripts/demo_byoa.py
 ```
 
 ## 测试

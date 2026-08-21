@@ -14,10 +14,15 @@ class CreateRoomRequest(BaseModel):
     name: str = Field(min_length=1)
 
 
+class CreateComputerRequest(BaseModel):
+    name: str = Field(min_length=1)
+
+
 class CreateParticipantRequest(BaseModel):
     kind: ParticipantKind
     name: str = Field(min_length=1)
     persona: str | None = None
+    computer_id: UUID | None = None
 
 
 class CreateMessageRequest(BaseModel):
@@ -31,12 +36,27 @@ class RoomOut(BaseModel):
     created_at: datetime
 
 
+class ComputerCreatedOut(BaseModel):
+    id: UUID
+    name: str
+    token: str
+
+
+class ComputerOut(BaseModel):
+    id: UUID
+    name: str
+    created_at: datetime
+    last_seen_at: datetime | None
+    online: bool
+
+
 class ParticipantOut(BaseModel):
     id: UUID
     room_id: UUID
     kind: ParticipantKind
     name: str
     persona: str | None
+    computer_id: UUID | None
     created_at: datetime
 
 
@@ -61,6 +81,14 @@ class RoomRow:
 
 
 @dataclass(frozen=True)
+class ComputerRow:
+    id: UUID
+    name: str
+    created_at: datetime
+    last_seen_at: datetime | None
+
+
+@dataclass(frozen=True)
 class ParticipantRow:
     id: UUID
     room_id: UUID
@@ -68,6 +96,7 @@ class ParticipantRow:
     name: str
     persona: str | None
     created_at: datetime
+    computer_id: UUID | None = None
 
 
 @dataclass(frozen=True)

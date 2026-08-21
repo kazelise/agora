@@ -12,6 +12,7 @@ import asyncpg
 import redis.asyncio as redis
 
 from server import db
+from server.computers import ComputerHub
 
 logger = logging.getLogger("agora.scheduler")
 
@@ -76,9 +77,15 @@ class AgentLane:
 
 
 class Scheduler:
-    def __init__(self, pool: asyncpg.Pool, run_turn: TurnFn | None = None) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        run_turn: TurnFn | None = None,
+        computers: ComputerHub | None = None,
+    ) -> None:
         self._pool = pool
         self._run_turn = run_turn or self.run_turn_stub
+        self._computers = computers
         self._lanes: dict[UUID, AgentLane] = {}
         self.turns: list[TurnRecord] = []
         self.brain_results: list[Any] = []
@@ -102,7 +109,28 @@ class Scheduler:
         for agent in agents:
             if agent.id == author_id:
                 continue
-            await self.lane(agent.id).notify(room_id, agent.id)
+            if agent.computer_id is None:
+                await self.lane(agent.id).notify(room_id, agent.id)
+                continue
+            hub = self._computers
+            if hub is not None and hub.is_online(agent.computer_id):
+                sent = await hub.send_wake(
+                    agent.computer_id,
+                    {
+                        "type": "wake",
+                        "agent_id": str(agent.id),
+                        "room_id": str(room_id),
+                    },
+                )
+                if sent:
+                    continue
+            # BYOA host is offline. Do not queue: the inbox is cursor-based,
+            # so a missed wake is a missed turn and the agent catches up on
+            # the next one. Unbounded offline queues would just grow.
+            logger.info(
+                "agent %s is sleeping (computer offline)",
+                agent.name,
+            )
 
     async def run_turn_stub(self, agent_id: UUID, room_id: UUID) -> None:
         agent = await db.get_participant(self._pool, agent_id)
@@ -134,6 +162,12 @@ class Scheduler:
 
     async def wait_idle(self) -> None:
         await asyncio.gather(*(lane.wait_idle() for lane in list(self._lanes.values())))
+
+
+async def fanout_message(hub: Any, client: redis.Redis, row: Any) -> None:
+    """Broadcast + wake, the same path human POST and a runtime reply share."""
+    await hub.broadcast(row.room_id, row.as_ws())
+    await publish_wake(client, row.room_id, row.author_id, row.seq)
 
 
 async def publish_wake(

@@ -1,0 +1,235 @@
+"""BYOA daemon: websocket wakes + the same Brain, local ChatOpenAI."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+from typing import Any
+from urllib.parse import urlparse, urlunparse
+from uuid import UUID
+
+import httpx
+from langchain_openai import ChatOpenAI
+
+from brain.graph import Brain, TurnResult
+from brain.policy import big_model_name, small_model_name
+from daemon.lanes import AgentLane
+from daemon.world_http import HttpWorld
+
+logger = logging.getLogger("agora.daemon")
+
+HEARTBEAT_S = 10.0
+BACKOFF_CAP_S = 30.0
+
+
+def _ws_url(server: str, computer_id: str, token: str) -> str:
+    parsed = urlparse(server)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    netloc = parsed.netloc or parsed.path
+    path = f"/ws/computers/{computer_id}"
+    return urlunparse((scheme, netloc, path, "", f"token={token}", ""))
+
+
+def _openai_base() -> str:
+    return (
+        os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_API_BASE")
+        or ""
+    )
+
+
+def build_brain(world: HttpWorld) -> Brain:
+    small = small_model_name()
+    big = big_model_name()
+    # ChatOpenAI reads OPENAI_API_KEY / OPENAI_BASE_URL from this process.
+    # The server never sees them.
+    return Brain(
+        world,
+        small_model=ChatOpenAI(model=small),
+        big_model=ChatOpenAI(model=big),
+        small_model_name=small,
+        big_model_name=big,
+    )
+
+
+def _log_turn(result: TurnResult) -> None:
+    claims = ", ".join(f"{k}={v}" for k, v in result.claims) or "-"
+    logger.info(
+        "turn %s outcome=%s triage=%s %s (%s) holds=%s hops=%s claims=%s reply=%r",
+        result.agent_name,
+        result.outcome,
+        result.triage_actionable,
+        result.response_mode or "-",
+        result.triage_reason or "-",
+        result.hold_count,
+        result.hop_count,
+        claims,
+        result.reply_body,
+    )
+
+
+class Daemon:
+    def __init__(
+        self,
+        server: str,
+        computer_id: str,
+        token: str,
+        *,
+        brain: Brain | None = None,
+        world: HttpWorld | None = None,
+        http: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.server = server.rstrip("/")
+        self.computer_id = computer_id
+        self.token = token
+        self._http = http
+        self._world = world
+        self._brain = brain
+        self._lanes: dict[UUID, AgentLane] = {}
+        self._owns_http = http is None
+
+    def _lane(self, agent_id: UUID) -> AgentLane:
+        lane = self._lanes.get(agent_id)
+        if lane is None:
+            lane = AgentLane(self._run_turn)
+            self._lanes[agent_id] = lane
+        return lane
+
+    async def _run_turn(self, agent_id: UUID, room_id: UUID) -> None:
+        assert self._brain is not None
+        try:
+            result = await self._brain.run(agent_id, room_id)
+        except Exception:
+            logger.exception("turn failed agent=%s room=%s", agent_id, room_id)
+            return
+        _log_turn(result)
+
+    async def handle_frame(self, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("non-json frame: %s", raw[:120])
+            return
+        if data.get("type") == "wake":
+            agent_id = UUID(data["agent_id"])
+            room_id = UUID(data["room_id"])
+            logger.info("wake agent=%s room=%s", agent_id, room_id)
+            await self._lane(agent_id).notify(room_id, agent_id)
+        elif data.get("type") == "pong":
+            logger.debug("pong")
+
+    async def _session(self, connect: Any) -> None:
+        uri = _ws_url(self.server, self.computer_id, self.token)
+        async with connect(uri) as ws:
+            logger.info("connected to %s", uri.split("?", 1)[0])
+            stop = asyncio.Event()
+
+            async def heartbeat() -> None:
+                while not stop.is_set():
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=HEARTBEAT_S)
+                        return
+                    except TimeoutError:
+                        await ws.send(json.dumps({"type": "ping"}))
+
+            beat = asyncio.create_task(heartbeat())
+            try:
+                async for message in ws:
+                    if isinstance(message, bytes):
+                        message = message.decode()
+                    await self.handle_frame(message)
+            finally:
+                stop.set()
+                beat.cancel()
+                try:
+                    await beat
+                except asyncio.CancelledError:
+                    pass
+
+    async def run_forever(self) -> None:
+        try:
+            from websockets.asyncio.client import connect
+        except ImportError:  # pragma: no cover
+            from websockets import connect  # type: ignore[no-redef]
+
+        owns = self._http is None
+        client = self._http or httpx.AsyncClient(base_url=self.server, timeout=60.0)
+        try:
+            world = self._world or HttpWorld(client, self.token)
+            self._world = world
+            self._brain = self._brain or build_brain(world)
+            delay = 1.0
+            while True:
+                try:
+                    await self._session(connect)
+                    delay = 1.0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "ws disconnected (%s: %s); reconnect in %.0fs",
+                        type(exc).__name__,
+                        exc,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, BACKOFF_CAP_S)
+        finally:
+            if owns:
+                await client.aclose()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="daemon", description="Agora BYOA computer")
+    parser.add_argument(
+        "--server",
+        default=os.environ.get("AGORA_SERVER_URL", "http://127.0.0.1:8000"),
+    )
+    parser.add_argument(
+        "--computer-id",
+        default=os.environ.get("AGORA_COMPUTER_ID"),
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("AGORA_COMPUTER_TOKEN"),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    if not args.computer_id or not args.token:
+        raise SystemExit(
+            "need --computer-id and --token "
+            "(or AGORA_COMPUTER_ID / AGORA_COMPUTER_TOKEN)"
+        )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logger.info(
+        "daemon starting server=%s computer=%s base_url=%s small=%s big=%s",
+        args.server,
+        args.computer_id,
+        _openai_base() or "(default)",
+        small_model_name(),
+        big_model_name(),
+    )
+    daemon = Daemon(args.server, args.computer_id, args.token)
+    try:
+        asyncio.run(daemon.run_forever())
+    except KeyboardInterrupt:
+        logger.info("daemon stopped")
+
+
+if __name__ == "__main__":
+    main()

@@ -11,6 +11,7 @@ import redis.asyncio as redis
 import brain.graph as graph_mod
 from brain.graph import CLAIM_KEY_ERROR, Brain
 from brain.policy import big_model_name
+from brain.world_direct import DirectWorld
 from server import db
 from tests.conftest import DSN, REDIS_URL
 from tests.fakes import ScriptedChatModel, text_message, tool_call, triage_message
@@ -70,7 +71,7 @@ async def test_triage_not_actionable_skips_big_model(
         [triage_message(actionable=False, reason="small talk", response_mode="me")]
     )
     big = ScriptedChatModel()
-    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
 
     result = await brain.run(agent_ids[0], room_id)
 
@@ -90,7 +91,7 @@ async def test_empty_inbox_makes_zero_llm_calls(
     room_id, _human_id, agent_ids = await _room(pool)
     small = ScriptedChatModel()
     big = ScriptedChatModel()
-    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
 
     result = await brain.run(agent_ids[0], room_id)
 
@@ -116,7 +117,7 @@ async def test_freshness_hold_then_different_reply(
         [triage_message(actionable=True, reason="counting", response_mode="each")]
     )
     big = ScriptedChatModel([first_reply, tool_call("reply", {"body": "4"})])
-    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
 
     result = await brain.run(iris_id, room_id)
 
@@ -164,8 +165,8 @@ async def test_claim_race_one_winner_loser_is_told(
     )
     big_a = make_big()
     big_b = make_big()
-    brain_a = Brain(pool, redis_client, small_model=small_a, big_model=big_a)
-    brain_b = Brain(pool, redis_client, small_model=small_b, big_model=big_b)
+    brain_a = Brain(DirectWorld(pool, redis_client), small_model=small_a, big_model=big_a)
+    brain_b = Brain(DirectWorld(pool, redis_client), small_model=small_b, big_model=big_b)
 
     results = await asyncio.gather(
         brain_a.run(agent_ids[0], room_id),
@@ -204,7 +205,7 @@ async def test_ledger_records_triage_plus_two_turn_hops(
             tool_call("reply", {"body": "I will intro"}),
         ]
     )
-    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
 
     await brain.run(agent_ids[0], room_id)
 
@@ -218,8 +219,7 @@ async def test_ledger_records_triage_plus_two_turn_hops(
 def test_triage_rejects_big_model_name() -> None:
     with pytest.raises(ValueError, match="triage must not use the big model"):
         Brain(
-            pool=None,  # type: ignore[arg-type]
-            redis_client=None,  # type: ignore[arg-type]
+            world=None,  # type: ignore[arg-type]
             small_model=object(),
             big_model=object(),
             small_model_name=big_model_name(),
@@ -242,7 +242,7 @@ async def test_claim_freeform_key_rejected_then_anchored_wins(
             tool_call("reply", {"body": "this room is agora"}),
         ]
     )
-    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
 
     result = await brain.run(agent_ids[0], room_id)
 
@@ -293,7 +293,7 @@ async def test_commit_race_after_freshness_holds(
             tool_call("reply", {"body": "4"}),
         ]
     )
-    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
 
     result = await brain.run(iris_id, room_id)
 
@@ -338,7 +338,7 @@ async def test_big_model_failure_ends_turn_as_llm_error(
         [triage_message(actionable=True, reason="me", response_mode="me")]
     )
     big = _BoomModel()
-    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
 
     result = await brain.run(agent_ids[0], room_id)
 
