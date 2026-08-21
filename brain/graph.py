@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -11,7 +12,12 @@ from uuid import UUID, uuid4
 
 import asyncpg
 import redis.asyncio as redis
-from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
@@ -27,6 +33,7 @@ logger = logging.getLogger("agora.brain")
 
 MAX_HOPS = 6
 MAX_HOLDS = 2
+LLM_RETRY_BACKOFF_S = 1.0
 
 # Protocol parse of the model's claim key — not content classification.
 # Free-form names never converge across two models; seq is objective.
@@ -182,6 +189,48 @@ def _tc_get(tc: Any, key: str, default: Any = None) -> Any:
     return getattr(tc, key, default)
 
 
+def _payload_shape(messages: list[Any]) -> str:
+    """Compact role/length dump so a 400 can be diagnosed without dumping bodies."""
+    bits: list[str] = []
+    for i, message in enumerate(messages):
+        role = getattr(message, "type", None) or type(message).__name__
+        content = _text(getattr(message, "content", ""))
+        calls = getattr(message, "tool_calls", None) or []
+        names = ",".join(str(_tc_get(tc, "name") or "?") for tc in calls)
+        bits.append(f"{i}:{role}:chars={len(content)}:tools={names or '-'}")
+    return "[" + " ".join(bits) + "]"
+
+
+async def invoke_model(model: Any, messages: list[Any], *, label: str) -> Any | None:
+    """Call the model; retry once after a short backoff; None if both fail.
+
+    Fail-open: a dead relay is a missed reply, not a crashed turn. No
+    caller should write a ledger row unless this returns a message.
+    """
+    try:
+        return await model.ainvoke(messages)
+    except Exception as first:
+        logger.warning(
+            "LLM %s failed (%s: %s); retrying once; payload=%s",
+            label,
+            type(first).__name__,
+            first,
+            _payload_shape(messages),
+        )
+        await asyncio.sleep(LLM_RETRY_BACKOFF_S)
+        try:
+            return await model.ainvoke(messages)
+        except Exception as second:
+            logger.warning(
+                "LLM %s retry failed (%s: %s) — ending turn llm_error; payload=%s",
+                label,
+                type(second).__name__,
+                second,
+                _payload_shape(messages),
+            )
+            return None
+
+
 class Brain:
     def __init__(
         self,
@@ -226,11 +275,15 @@ class Brain:
         return graph.compile(checkpointer=self.checkpointer)
 
     def _after_triage(self, state: BrainState) -> str:
-        if state.get("outcome") == "skipped" or not state.get("triage_actionable"):
+        if state.get("outcome") in {"skipped", "llm_error"}:
+            return END
+        if not state.get("triage_actionable"):
             return END
         return "tool_loop"
 
     def _after_tools(self, state: BrainState) -> str:
+        if state.get("outcome") == "llm_error":
+            return END
         if state.get("pending_reply"):
             return "freshness"
         if state.get("outcome"):
@@ -272,7 +325,16 @@ class Brain:
             "one-of-us = exactly one agent should respond.\n"
             "If another participant already completed the request, actionable=false."
         )
-        ai = await self.small.ainvoke([SystemMessage(content=prompt)])
+        ai = await invoke_model(
+            self.small, [SystemMessage(content=prompt)], label="triage"
+        )
+        if ai is None:
+            return {
+                "outcome": "llm_error",
+                "triage_actionable": False,
+                "triage_reason": "llm_error",
+                "response_mode": "",
+            }
         await self._ledger(state, "triage", ai)
         try:
             verdict = _parse_triage(_text(getattr(ai, "content", "")))
@@ -314,7 +376,9 @@ class Brain:
             history = [SystemMessage(content=_tool_prompt(state))]
 
         bound = self.big.bind_tools(TOOLS) if hasattr(self.big, "bind_tools") else self.big
-        ai = await bound.ainvoke(history)
+        ai = await invoke_model(bound, history, label="tool_loop")
+        if ai is None:
+            return {"outcome": "llm_error"}
         await self._ledger(state, "turn", ai)
         hop += 1
 
@@ -401,7 +465,9 @@ class Brain:
                 }
             )
 
-        note = SystemMessage(
+        # User role, not system: some OpenAI-compatible backends reject a
+        # system message that is not at position 0 (mid-conversation HOLD).
+        note = HumanMessage(
             content="New messages landed while you were composing; re-decide.\n"
             + "\n".join(lines)
         )

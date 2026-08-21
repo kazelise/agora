@@ -50,7 +50,7 @@ def _require_relay() -> str:
     os.environ.setdefault("OPENAI_API_KEY", key)
     os.environ.setdefault("OPENAI_API_BASE", base)
     try:
-        with httpx.Client(timeout=3.0) as client:
+        with httpx.Client(timeout=10.0) as client:
             client.get(
                 url,
                 headers={"Authorization": f"Bearer {key}"},

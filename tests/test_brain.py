@@ -8,6 +8,7 @@ import asyncpg
 import pytest
 import redis.asyncio as redis
 
+import brain.graph as graph_mod
 from brain.graph import CLAIM_KEY_ERROR, Brain
 from brain.policy import big_model_name
 from server import db
@@ -308,3 +309,43 @@ async def test_commit_race_after_freshness_holds(
     ]
     iris_bodies = [m.body for m in stored if m.author_id == iris_id]
     assert iris_bodies == ["4"]
+
+
+class _BoomModel:
+    """Raises on every ainvoke. bind_tools returns self so the graph stays here."""
+
+    def __init__(self) -> None:
+        self.calls: list[list] = []
+
+    def bind_tools(self, _tools: object, **_kwargs: object) -> _BoomModel:
+        return self
+
+    async def ainvoke(self, messages: list, **_kwargs: object) -> object:
+        self.calls.append(list(messages))
+        raise RuntimeError("relay 400: Bad Request")
+
+
+@pytest.mark.asyncio
+async def test_big_model_failure_ends_turn_as_llm_error(
+    pool: asyncpg.Pool,
+    redis_client: redis.Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(graph_mod, "LLM_RETRY_BACKOFF_S", 0)
+    room_id, human_id, agent_ids = await _room(pool)
+    await db.insert_message(pool, room_id, human_id, "please reply")
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="me", response_mode="me")]
+    )
+    big = _BoomModel()
+    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+
+    result = await brain.run(agent_ids[0], room_id)
+
+    assert result.outcome == "llm_error"
+    assert result.reply_body is None
+    assert len(big.calls) == 2
+    stored = await db.list_messages(pool, room_id)
+    assert [m.body for m in stored] == ["please reply"]
+    rows = await _calls(pool, room_id)
+    assert [r["purpose"] for r in rows] == ["triage"]
