@@ -37,6 +37,8 @@ flowchart LR
   brain --> Ledger
 ```
 
+图中 OAuth 与 K8s Job 为规划中的宿主/准入层，尚未实现；当前已落地的是 REST/WebSocket 接入、云端进程内宿主与 BYOA daemon 宿主。
+
 Inspired by Cumora (github.com/yetone/cumora); independently designed and implemented from scratch.
 
 设计说明见 [docs/design.md](docs/design.md)。
