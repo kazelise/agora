@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
@@ -26,6 +27,27 @@ logger = logging.getLogger("agora.brain")
 
 MAX_HOPS = 6
 MAX_HOLDS = 2
+
+# Protocol parse of the model's claim key — not content classification.
+# Free-form names never converge across two models; seq is objective.
+_TASK_KEY = re.compile(r"^t(\d+)(?::[A-Za-z0-9_-]+)?$")
+CLAIM_KEY_ERROR = (
+    "claim rejected: task_key must be t<seq> or t<seq>:<slug> "
+    "(e.g. t1 or t1:intro), where <seq> is the seq of the message "
+    "you are responding to. Retry with that format."
+)
+
+
+def canonical_task_key(task_key: str) -> str | None:
+    """Return `t<seq>` if `task_key` is `t<seq>` or `t<seq>:<slug>`, else None.
+
+    The slug is for the model; the lock is the seq prefix. Two agents
+    writing t1 and t1:intro must contend on the same claims row.
+    """
+    match = _TASK_KEY.fullmatch(task_key.strip())
+    if match is None:
+        return None
+    return f"t{match.group(1)}"
 
 
 class TriageVerdict(BaseModel):
@@ -73,7 +95,7 @@ def reply(body: str) -> str:
 
 @tool
 def claim(task_key: str) -> str:
-    """Atomically claim a task in this room. Returns won or lost."""
+    """Atomically claim a task. task_key must be t<seq> or t<seq>:<slug>."""
     return task_key
 
 
@@ -147,7 +169,10 @@ def _tool_prompt(state: BrainState) -> str:
         f"Room:\n{_format_inbox(state.get('inbox') or [])}\n\n"
         "Tools: reply(body) posts to the room; claim(task_key) atomically "
         "claims a task and returns won or lost.\n"
-        "If response_mode is one-of-us: claim first, reply only if you won."
+        "If response_mode is one-of-us: claim first, reply only if you won.\n"
+        "If response_mode is me or each: do not claim; reply.\n"
+        "claim task_key must be t<seq> or t<seq>:<slug> "
+        "(seq = the message you are responding to)."
     )
 
 
@@ -197,7 +222,7 @@ class Brain:
         graph.add_conditional_edges("triage", self._after_triage)
         graph.add_conditional_edges("tool_loop", self._after_tools)
         graph.add_conditional_edges("freshness", self._after_fresh)
-        graph.add_edge("commit", END)
+        graph.add_conditional_edges("commit", self._after_commit)
         return graph.compile(checkpointer=self.checkpointer)
 
     def _after_triage(self, state: BrainState) -> str:
@@ -217,6 +242,11 @@ class Brain:
             return END
         if state.get("pending_reply"):
             return "commit"
+        return "tool_loop"
+
+    def _after_commit(self, state: BrainState) -> str:
+        if state.get("outcome") in {"held_exhausted", "replied"}:
+            return END
         return "tool_loop"
 
     async def _ledger(self, state: BrainState, purpose: str, message: Any) -> None:
@@ -239,7 +269,8 @@ class Brain:
             "Decide whether you should act. Reply with a single JSON object, no markdown:\n"
             '{"actionable": bool, "reason": str, "response_mode": "me"|"each"|"one-of-us"}\n'
             "me = addressed to you; each = everyone should respond; "
-            "one-of-us = exactly one agent should respond."
+            "one-of-us = exactly one agent should respond.\n"
+            "If another participant already completed the request, actionable=false."
         )
         ai = await self.small.ainvoke([SystemMessage(content=prompt)])
         await self._ledger(state, "triage", ai)
@@ -295,7 +326,16 @@ class Brain:
             args = _tc_get(tc, "args") or {}
             call_id = str(_tc_get(tc, "id") or "call")
             if name == "claim":
-                task_key = str(args.get("task_key") or "")
+                raw_key = str(args.get("task_key") or "")
+                task_key = canonical_task_key(raw_key)
+                if task_key is None:
+                    after.append(
+                        ToolMessage(content=CLAIM_KEY_ERROR, tool_call_id=call_id)
+                    )
+                    logger.info(
+                        "claim %s rejected key %r", state["agent_name"], raw_key
+                    )
+                    continue
                 won = await db.try_claim(
                     self.pool,
                     UUID(state["room_id"]),
@@ -328,24 +368,19 @@ class Brain:
             update["outcome"] = "skipped" if hop < MAX_HOPS else "hop_exhausted"
         return update
 
-    async def _freshness(self, state: BrainState) -> dict[str, Any]:
-        # Postgres last_seq vs the seq this turn showed the model — not Redis.
-        room_id = UUID(state["room_id"])
-        latest = await db.get_room_last_seq(self.pool, room_id)
+    async def _hold(self, state: BrainState, latest: int) -> dict[str, Any]:
         seen = int(state["seen_seq"])
-        if latest <= seen:
-            return {}
-
         hold_count = int(state.get("hold_count") or 0)
         if hold_count >= MAX_HOLDS:
             logger.info(
-                "freshness HOLD exhausted for %s (seen=%s latest=%s)",
+                "HOLD exhausted for %s (seen=%s latest=%s)",
                 state["agent_name"],
                 seen,
                 latest,
             )
             return {"outcome": "held_exhausted", "pending_reply": ""}
 
+        room_id = UUID(state["room_id"])
         newer = await db.list_messages(self.pool, room_id, since_seq=seen)
         names = dict(state.get("author_names") or {})
         lines: list[str] = []
@@ -372,7 +407,7 @@ class Brain:
         )
         await record_seen(self.redis, UUID(state["agent_id"]), room_id, latest)
         logger.info(
-            "freshness HOLD %s seen=%s latest=%s hold=%s",
+            "HOLD %s seen=%s latest=%s hold=%s",
             state["agent_name"],
             seen,
             latest,
@@ -388,14 +423,27 @@ class Brain:
             "messages": [*(state.get("messages") or []), note],
         }
 
+    async def _freshness(self, state: BrainState) -> dict[str, Any]:
+        # Cheap first check. The transactional insert is the invariant.
+        room_id = UUID(state["room_id"])
+        latest = await db.get_room_last_seq(self.pool, room_id)
+        seen = int(state["seen_seq"])
+        if latest <= seen:
+            return {}
+        return await self._hold(state, latest)
+
     async def _commit(self, state: BrainState) -> dict[str, Any]:
         body = state.get("pending_reply") or ""
-        row = await db.insert_message(
-            self.pool,
-            UUID(state["room_id"]),
-            UUID(state["agent_id"]),
-            body,
-        )
+        try:
+            row = await db.insert_message(
+                self.pool,
+                UUID(state["room_id"]),
+                UUID(state["agent_id"]),
+                body,
+                not_after_seq=int(state["seen_seq"]),
+            )
+        except db.StaleWriteError as exc:
+            return await self._hold(state, exc.last_seq)
         if self.on_committed is not None:
             await self.on_committed(row)
         logger.info("commit %s seq=%s", state["agent_name"], row.seq)

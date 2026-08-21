@@ -8,7 +8,7 @@ import asyncpg
 import pytest
 import redis.asyncio as redis
 
-from brain.graph import Brain
+from brain.graph import CLAIM_KEY_ERROR, Brain
 from brain.policy import big_model_name
 from server import db
 from tests.conftest import DSN, REDIS_URL
@@ -152,7 +152,7 @@ async def test_claim_race_one_winner_loser_is_told(
 
     def make_big() -> ScriptedChatModel:
         return ScriptedChatModel(
-            [tool_call("claim", {"task_key": "answer-q1"}), after_claim]
+            [tool_call("claim", {"task_key": "t1:answer-q1"}), after_claim]
         )
 
     small_a = ScriptedChatModel(
@@ -174,14 +174,14 @@ async def test_claim_race_one_winner_loser_is_told(
     claims = await pool.fetch(
         "SELECT claimed_by FROM claims WHERE room_id = $1 AND task_key = $2",
         room_id,
-        "answer-q1",
+        "t1",
     )
     assert len(claims) == 1
     winner_id = claims[0]["claimed_by"]
     winner = next(r for r in results if r.agent_id == winner_id)
     loser = next(r for r in results if r.agent_id != winner_id)
-    assert winner.claims == (("answer-q1", "won"),)
-    assert loser.claims == (("answer-q1", "lost"),)
+    assert winner.claims == (("t1", "won"),)
+    assert loser.claims == (("t1", "lost"),)
     loser_big = big_a if loser.agent_id == agent_ids[0] else big_b
     assert len(loser_big.calls) == 2
     told = [getattr(m, "content", "") for m in loser_big.calls[1]]
@@ -199,7 +199,7 @@ async def test_ledger_records_triage_plus_two_turn_hops(
     )
     big = ScriptedChatModel(
         [
-            tool_call("claim", {"task_key": "intro"}),
+            tool_call("claim", {"task_key": "t1:intro"}),
             tool_call("reply", {"body": "I will intro"}),
         ]
     )
@@ -223,3 +223,88 @@ def test_triage_rejects_big_model_name() -> None:
             big_model=object(),
             small_model_name=big_model_name(),
         )
+
+
+@pytest.mark.asyncio
+async def test_claim_freeform_key_rejected_then_anchored_wins(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, agent_ids = await _room(pool)
+    await db.insert_message(pool, room_id, human_id, "one of you intro")
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="one-of-us", response_mode="one-of-us")]
+    )
+    big = ScriptedChatModel(
+        [
+            tool_call("claim", {"task_key": "room-purpose-intro"}),
+            tool_call("claim", {"task_key": "t1:intro"}),
+            tool_call("reply", {"body": "this room is agora"}),
+        ]
+    )
+    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+
+    result = await brain.run(agent_ids[0], room_id)
+
+    assert result.outcome == "replied"
+    assert result.claims == (("t1", "won"),)
+    rows = await pool.fetch("SELECT task_key FROM claims WHERE room_id = $1", room_id)
+    assert [r["task_key"] for r in rows] == ["t1"]
+    told = [getattr(m, "content", "") for m in big.calls[1]]
+    assert any(CLAIM_KEY_ERROR in str(t) for t in told)
+
+
+@pytest.mark.asyncio
+async def test_commit_race_after_freshness_holds(
+    pool: asyncpg.Pool,
+    redis_client: redis.Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Peer's row lands after freshness passed but before commit.
+
+    The cheap freshness node is shown a stale last_seq; the transactional
+    insert is the one that must HOLD.
+    """
+    room_id, human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    real_last_seq = db.get_room_last_seq
+    freshness_reads = {"n": 0}
+
+    async def stale_then_real(
+        pool_arg: asyncpg.Pool, rid: UUID
+    ) -> int:
+        freshness_reads["n"] += 1
+        if freshness_reads["n"] == 1:
+            seen = await real_last_seq(pool_arg, rid)
+            await db.insert_message(pool_arg, rid, marcus_id, "3")
+            return seen
+        return await real_last_seq(pool_arg, rid)
+
+    monkeypatch.setattr(db, "get_room_last_seq", stale_then_real)
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="counting", response_mode="each")]
+    )
+    big = ScriptedChatModel(
+        [
+            tool_call("reply", {"body": "3"}),
+            tool_call("reply", {"body": "4"}),
+        ]
+    )
+    brain = Brain(pool, redis_client, small_model=small, big_model=big)
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "replied"
+    assert result.hold_count == 1
+    assert result.reply_body == "4"
+    assert freshness_reads["n"] >= 1
+    stored = await db.list_messages(pool, room_id)
+    assert [(m.author_id, m.body) for m in stored] == [
+        (human_id, "next number after 2"),
+        (marcus_id, "3"),
+        (iris_id, "4"),
+    ]
+    iris_bodies = [m.body for m in stored if m.author_id == iris_id]
+    assert iris_bodies == ["4"]

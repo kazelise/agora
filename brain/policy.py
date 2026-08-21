@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 
-DEFAULT_SMALL_MODEL = "gpt-5-mini"
-DEFAULT_BIG_MODEL = "gpt-5.2"
+DEFAULT_SMALL_MODEL = "gpt-5.6-luna"
+DEFAULT_BIG_MODEL = "gpt-5.6-terra"
 
 
 def small_model_name() -> str:

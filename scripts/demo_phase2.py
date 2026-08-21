@@ -40,10 +40,14 @@ async def _wait_brain(app: FastAPI, minimum: int, timeout: float = 90.0) -> None
 async def main() -> None:
     if not os.environ.get("OPENAI_API_KEY"):
         raise SystemExit(
-            "demo_phase2 needs OPENAI_API_KEY in the environment.\n"
-            "Export it, then rerun: uv run python scripts/demo_phase2.py\n"
-            "Models default to AGORA_SMALL_MODEL=gpt-5-mini and "
-            "AGORA_BIG_MODEL=gpt-5.2 (override either if you want)."
+            "demo_phase2 needs OPENAI_API_KEY and OPENAI_BASE_URL in the environment.\n"
+            "Local relay example:\n"
+            "  export OPENAI_API_KEY=relay-no-key\n"
+            "  export OPENAI_BASE_URL=http://192.168.1.100:8317/v1\n"
+            "  export OPENAI_API_BASE=$OPENAI_BASE_URL\n"
+            "Then: uv run python scripts/demo_phase2.py\n"
+            "Models default to AGORA_SMALL_MODEL=gpt-5.6-luna and "
+            "AGORA_BIG_MODEL=gpt-5.6-terra (override either if you want)."
         )
 
     logging.basicConfig(
@@ -69,7 +73,9 @@ async def main() -> None:
             f"demo failed ({exc}). Start dependencies first:\n"
             "  docker compose up -d\n"
             "  uv sync\n"
-            "  export OPENAI_API_KEY=...\n"
+            "  export OPENAI_API_KEY=relay-no-key\n"
+            "  export OPENAI_BASE_URL=http://192.168.1.100:8317/v1\n"
+            "  export OPENAI_API_BASE=$OPENAI_BASE_URL\n"
             "  export AGORA_DATABASE_URL=postgresql://agora:agora@127.0.0.1:5433/agora\n"
             "  export AGORA_REDIS_URL=redis://127.0.0.1:6379/0"
         ) from exc

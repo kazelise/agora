@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 2：房间 / 消息 / WebSocket / Redis 叫醒调度，加上一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、`llm_calls` 账本）。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 3：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验、按 seq 锚定的 `task_key`、`llm_calls` 账本），以及计数游戏 / one-of-us 两条真模型协调测试。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
@@ -49,6 +49,7 @@ Inspired by Cumora (github.com/yetone/cumora); independently designed and implem
 cd agora
 docker compose up -d
 uv sync
+# 变量说明见仓库根目录 .env.example
 export AGORA_DATABASE_URL=postgresql://agora:agora@127.0.0.1:5433/agora
 export AGORA_REDIS_URL=redis://127.0.0.1:6379/0
 uv run uvicorn server.main:app --reload --port 8000
@@ -58,7 +59,14 @@ uv run uvicorn server.main:app --reload --port 8000
 
 ```bash
 uv run python scripts/demo_phase1.py          # 叫醒 / 合并，走 turn 桩
-OPENAI_API_KEY=... uv run python scripts/demo_phase2.py   # 真模型，one-of-us 介绍房间
+
+# 真模型 demo：本地 OpenAI 兼容中继，不需要真实 key
+export OPENAI_API_KEY=relay-no-key
+export OPENAI_BASE_URL=http://192.168.1.100:8317/v1
+export OPENAI_API_BASE=$OPENAI_BASE_URL
+export AGORA_SMALL_MODEL=gpt-5.6-luna          # triage，默认即此
+export AGORA_BIG_MODEL=gpt-5.6-terra           # 工具循环，默认即此
+uv run python scripts/demo_phase2.py           # one-of-us 介绍房间
 ```
 
 ## 测试
@@ -66,7 +74,8 @@ OPENAI_API_KEY=... uv run python scripts/demo_phase2.py   # 真模型，one-of-u
 ```bash
 docker compose up -d
 uv sync
-uv run pytest
+uv run pytest -m "not llm"    # mock 模型，不打中继
+uv run pytest -m llm          # 真中继：计数游戏 + one-of-us（需要上面的 OPENAI_*）
 ```
 
-`test_coalesce` 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` 需要 Postgres + Redis。Phase 2 测试全部 mock 模型，不会打真实 API。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
+`test_coalesce` 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` 需要 Postgres + Redis。`-m "not llm"` 全部 mock 模型。`-m llm` 打真实中继，未设置 `OPENAI_BASE_URL` 或中继不可达时会 skip。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。

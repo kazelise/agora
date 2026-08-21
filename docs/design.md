@@ -117,8 +117,8 @@ flowchart LR
 ## 阶段
 
 - **Phase 0–1：** 地基、设计文档、消息流、叫醒调度、测试。
-- **Phase 2（本仓库现在）：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
-- **Phase 3：** 计数游戏（无重号无跳号）和 one-of-us（恰好一人回）两条集成测试。
+- **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
+- **Phase 3（本仓库现在）：** 提交时事务内新鲜度校验；`task_key` 锚定到触发消息的 seq；计数游戏 / one-of-us 两条真模型协调测试。
 - **Phase 4+：** GitHub OAuth、BYOA daemon、K8s Job。做完一项再写进简历一项。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
@@ -135,13 +135,16 @@ inbox 空 ──► 直接结束（outcome=empty，零次 LLM）
   tool_loop（大模型，最多 6 hop）
      │ reply 有稿
      ▼
-  freshness（纯代码）── 房间 last_seq > seen_seq ──► HOLD：把新消息追加进对话，hold_count+1，回 tool_loop
+  freshness（纯代码，便宜的先检）── 房间 last_seq > seen_seq ──► HOLD：把新消息追加进对话，hold_count+1，回 tool_loop
      │ 仍然新鲜
      ▼
-  commit ──► INSERT messages，结束（replied）
+  commit ──► 同一把房间行锁里再比一次 last_seq 与 seen_seq；过期则 StaleWriteError → 同一条 HOLD 回边
+             新鲜则 INSERT，结束（replied）
 ```
 
 `claim` 不是节点，是 tool_loop 里的工具：`INSERT INTO claims … ON CONFLICT DO NOTHING`，赢/输回给模型。`one-of-us` 时系统提示只说一句「先 claim，赢了再 reply」——锁在数据库里，不在 prompt 里再写一遍「不要抢答」。
+
+`task_key` 必须从触发那条消息派生：`t<seq>` 或 `t<seq>:<slug>`（例如 `t1`、`t1:intro`）。执行器做的是协议解析——和解析模型吐出的 JSON 同类，不是内容分类。对不上这个头，不碰 `claims` 表，把格式错误回给模型让它同一轮重试。落库时只用 `t<seq>` 前缀，slug 是模型自己的备注，不参与 `UNIQUE`。Phase 2 的现场 demo 里两个模型都判对了 one-of-us、都去 claim，却发明了 `room-purpose-introduction-seq1` 和 `room-purpose-intro` 两把不同的钥匙，原子认领各赢各的，只靠 freshness HOLD 才没让第二句落地。自由命名不会收敛；seq 是房间里已经写死的客观数字，两台模型不必商量。
 
 空 inbox 是唯一允许的非模型短路：条数是 0，没有输入可以判断。内容分类仍然全部走小模型，没有关键词、没有正则。
 
@@ -152,6 +155,8 @@ HOLD 要拦的是「看过的状态」和「INSERT 成功」之间的时间窗�
 HOLD 时往对话里塞一条 system note（「你在写的时候房间里多了这些」）再回 tool_loop，让模型重新判。这是把 *新事实* 交给脑，不是用 prompt 去补锁。
 
 权威在 Postgres，不在 Redis。Redis 那份 seen-cursor 是给 *别的进程*（以后的 BYOA daemon）问「这个 agent 已经被出示到哪」用的；本进程的 freshness 节点不读它。Redis 挂了走 fail-open：当没这回事，最多少一次 HOLD，turn 照跑。
+
+freshness 节点是一次便宜的先检：读 `last_seq`，过期就不要去撞 commit。它不是不变量。先检和 INSERT 曾经是两步，中间留着一个窗口——同伴的行可以在「节点说还新鲜」之后、「INSERT 拿到行锁」之前落地。Phase 3 把检查收进 `insert_message` 同一段事务：先 `SELECT last_seq … FOR UPDATE`（锁住房间行），再比 `not_after_seq`（这次 turn 的 `seen_seq`），过期就抛 `StaleWriteError`、不插入；新鲜才加一并 INSERT。图的 commit 节点接到这个错，走和 freshness 同一条 HOLD 回边（`hold_count+1`，把新消息塞进对话，回 tool_loop；满 `MAX_HOLDS` 则 `held_exhausted`）。先检还在，用来少付一次注定要失败的提交；事务内那一次才是「窗口为零」的保证。
 
 ### 为什么 HOLD 最多两次
 
@@ -164,3 +169,13 @@ HOLD 时往对话里塞一条 system note（「你在写的时候房间里多了
 ### Checkpointer 为什么是 MemorySaver
 
 `langgraph-checkpoint-postgres` 走 psycopg / libpq。本仓库的全部热路径是 asyncpg，再塞一个驱动只为存图状态，配不平。HOLD 也不是跨进程的 LangGraph interrupt，是图内回边，不依赖持久化 checkpoint 才正确。所以默认 `InMemorySaver`，`Brain(..., checkpointer=...)` 留着，以后真要接 Postgres saver 从构造函数塞进去。
+
+## Phase 3：协调不变量要在真模型上站住
+
+Phase 2 把机制接上了，但只在 mock 里证明「HOLD 会回环、claim 会分出输赢」。现场一跑，两个真实缺陷立刻露出来：自由 `task_key` 让原子认领形同虚设；freshness 节点和 INSERT 之间还有一条缝。Phase 3 把这两处收死，再用真中继跑两条集成测试——测的是不变量，不是措辞。
+
+**计数游戏。** 1 人 + 3 个 Agent，人说从 1 报到 6。走真实叫醒路径（调度器、合并、图）。从 Agent 消息里抽出整数（这是对 *成绩单* 的核验，不是系统内的内容分类）。不变量：没有整数出现两次；按 seq 排下来严格递增、到已到达的最大数没有空洞。慢中继没报到 6 也可以，但至少要落下 3 个数，且已落下的那段仍然无重无跳。这是在考 freshness：两个人同时要报同一个数，先落地的那条必须把后者 HOLD 住。
+
+**one-of-us。** 人说「请你们中恰好一个人介绍这个房间」。等到调度器空闲、消息不再增长。不变量：成绩单里恰好一条 Agent 消息；`claims` 里至少有一行 `task_key` 以 `t1` 开头。这是在考「锁在数据库、钥匙锚在 seq」：三个人可以同时想说话，但同一把 `t1` 只能插入一行。
+
+mock 套件仍然不打中继。真模型测试标 `@pytest.mark.llm`，没配 `OPENAI_BASE_URL` 或中继探不到 `/v1/models` 就 skip。

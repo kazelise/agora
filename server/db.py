@@ -17,6 +17,19 @@ class NotFoundError(Exception):
         self.detail = detail
 
 
+class StaleWriteError(Exception):
+    """INSERT refused: room last_seq moved past the writer's seen cursor.
+
+    Raised inside the same transaction that holds the room row lock, so
+    the check and the would-be insert are one critical section. `last_seq`
+    is the pre-increment value that failed the freshness test.
+    """
+
+    def __init__(self, last_seq: int) -> None:
+        super().__init__(f"room last_seq {last_seq} is after the write's seen cursor")
+        self.last_seq = last_seq
+
+
 async def create_pool(dsn: str) -> asyncpg.Pool:
     return await asyncpg.create_pool(dsn, min_size=2, max_size=20)
 
@@ -150,11 +163,16 @@ async def insert_message(
     room_id: UUID,
     author_id: UUID,
     body: str,
+    *,
+    not_after_seq: int | None = None,
 ) -> MessageRow:
     # Per-room counter, not a Postgres SEQUENCE: SEQUENCE is table-global
-    # (or needs one sequence object per room). UPDATE ... RETURNING takes
-    # a row lock on the room, so concurrent inserts serialize and rollback
-    # of a failed insert also undoes the increment — seq stays gapless.
+    # (or needs one sequence object per room). SELECT ... FOR UPDATE takes
+    # the room row lock first; the later increment + INSERT share that
+    # critical section. Rollback undoes the increment — seq stays gapless.
+    # not_after_seq is the transactional freshness invariant: if another
+    # writer already advanced last_seq past the caller's seen cursor,
+    # raise StaleWriteError instead of inserting.
     async with pool.acquire() as conn:
         async with conn.transaction():
             belongs = await conn.fetchval(
@@ -167,6 +185,14 @@ async def insert_message(
                 if exists is None:
                     raise NotFoundError(f"room {room_id} not found")
                 raise NotFoundError(f"author {author_id} is not in room {room_id}")
+            current = await conn.fetchval(
+                "SELECT last_seq FROM rooms WHERE id = $1 FOR UPDATE",
+                room_id,
+            )
+            if current is None:
+                raise NotFoundError(f"room {room_id} not found")
+            if not_after_seq is not None and int(current) > not_after_seq:
+                raise StaleWriteError(int(current))
             seq = await conn.fetchval(
                 """
                 UPDATE rooms
