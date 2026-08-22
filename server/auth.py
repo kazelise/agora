@@ -32,10 +32,6 @@ def bearer_token(authorization: str | None) -> str:
     return token
 
 
-def is_cluster(host: Host) -> bool:
-    return isinstance(host, ClusterHost)
-
-
 async def require_host(request: Request) -> Host:
     token = bearer_token(request.headers.get("authorization"))
     settings = getattr(request.app.state, "settings", None)
