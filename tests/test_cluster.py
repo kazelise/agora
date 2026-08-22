@@ -170,8 +170,10 @@ async def test_byoa_wake_reaches_socket_on_the_other_worker(pair: Pair) -> None:
         )
         assert posted.status_code == 200
         frame = await ws.receive_json(timeout=4.0)
-        assert frame["type"] == "wake"
-        assert frame["agent_id"] == byoa["id"]
-        assert frame["room_id"] == room["id"]
+        assert frame == {
+            "type": "wake",
+            "agent_id": byoa["id"],
+            "room_id": room["id"],
+        }
     finally:
         await ws.close()

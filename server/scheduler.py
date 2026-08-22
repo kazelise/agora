@@ -333,7 +333,14 @@ async def run_subscriber(
                 elif channel == MESSAGE_CHANNEL and hub is not None:
                     await hub.broadcast(UUID(data["room_id"]), data)
                 elif channel == HOST_WAKE_CHANNEL and computers is not None:
-                    await computers.send_wake(UUID(data["computer_id"]), data)
+                    await computers.send_wake(
+                        UUID(data["computer_id"]),
+                        {
+                            "type": data.get("type") or "wake",
+                            "agent_id": data["agent_id"],
+                            "room_id": data["room_id"],
+                        },
+                    )
             except Exception:
                 logger.warning(
                     "bus handler failed on %s — fail-open skip",
