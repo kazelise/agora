@@ -30,10 +30,26 @@ class CreateMessageRequest(BaseModel):
     body: str = Field(min_length=1)
 
 
+class UserOut(BaseModel):
+    id: UUID
+    github_id: int
+    login: str
+    name: str | None
+    avatar_url: str | None
+    created_at: datetime
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
 class RoomOut(BaseModel):
     id: UUID
     name: str
     created_at: datetime
+    created_by: UUID | None = None
 
 
 class ComputerCreatedOut(BaseModel):
@@ -48,6 +64,7 @@ class ComputerOut(BaseModel):
     created_at: datetime
     last_seen_at: datetime | None
     online: bool
+    created_by: UUID | None = None
 
 
 class ParticipantOut(BaseModel):
@@ -74,10 +91,31 @@ class MessageListOut(BaseModel):
 
 
 @dataclass(frozen=True)
+class UserRow:
+    id: UUID
+    github_id: int
+    login: str
+    name: str | None
+    avatar_url: str | None
+    created_at: datetime
+
+    def as_out(self) -> UserOut:
+        return UserOut(
+            id=self.id,
+            github_id=self.github_id,
+            login=self.login,
+            name=self.name,
+            avatar_url=self.avatar_url,
+            created_at=self.created_at,
+        )
+
+
+@dataclass(frozen=True)
 class RoomRow:
     id: UUID
     name: str
     created_at: datetime
+    created_by: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +124,7 @@ class ComputerRow:
     name: str
     created_at: datetime
     last_seen_at: datetime | None
+    created_by: UUID | None = None
 
 
 @dataclass(frozen=True)

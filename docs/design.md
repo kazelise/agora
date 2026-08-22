@@ -102,7 +102,7 @@ flowchart LR
   brain --> Ledger
 ```
 
-当前落地：`clients` 只有 curl / 脚本；`server` 的 REST、WebSocket、调度器已接通；`brain` 是一张 LangGraph（Phase 2–3）；`daemon` 是 BYOA 宿主（Phase 4b）；`k8s` 是云端 Job 宿主（Phase 4c，默认关闭）。OAuth 仍未做。
+当前落地：`clients` 是 curl / 脚本，加上可选的 GitHub OAuth + JWT（Phase 4a）；`server` 的 REST、WebSocket、调度器已接通；`brain` 是一张 LangGraph（Phase 2–3）；`daemon` 是 BYOA 宿主（Phase 4b）；`k8s` 是云端 Job 宿主（Phase 4c，默认关闭）。
 
 ## 表怎么对应这两类失败
 
@@ -120,8 +120,8 @@ flowchart LR
 - **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
 - **Phase 3（本仓库现在）：** 提交时事务内新鲜度校验；`task_key` 锚定到触发消息的 seq；计数游戏 / one-of-us 两条真模型协调测试。
 - **Phase 4b：** Computer 作为一等宿主；同一张图通过 `World` 接口换宿主；BYOA daemon 用自己的 key 跑，服务端零持有密钥。
-- **Phase 4c（本仓库现在）：** `computer_id` 为空的云端 turn 可以交给 Kubernetes Job；同一张图、HttpWorld、cluster token；车道仍在服务端合并叫醒。未开 k8s 时行为与 Phase 4b 完全一样。
-- **Phase 4a：** GitHub OAuth。做完再写进简历一项。
+- **Phase 4c：** `computer_id` 为空的云端 turn 可以交给 Kubernetes Job；同一张图、HttpWorld、cluster token；车道仍在服务端合并叫醒。未开 k8s 时行为与 Phase 4b 完全一样。
+- **Phase 4a（本仓库现在）：** GitHub OAuth 换成 JWT；房间 / Computer 归登录用户；两套凭据（人的 JWT vs 宿主 token）互不顶替。未配置 client id 时准入关闭。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
 
@@ -209,6 +209,21 @@ cluster token 不是 `computers` 表里的一行。配对 token 绑的是某台�
 叫醒合并仍在服务端车道里。`run_turn` 变成「创建 Job + 等到 succeeded/failed/timeout」。五条连发还是「在飞的一个 Job + 合并后再来一个」。`backoffLimit: 0`：kubelet 重试会再付一轮大模型，而且看不见房间是否已经变了；脏标记才是 turn 重试。超时或创建失败 fail-open——少一轮，不回退进程内，避免「集群没配好却悄悄在 API 里跑 LLM」。
 
 未开 `AGORA_K8S_ENABLED` 时，`computer_id` 为空仍走 `DirectWorld`。测试、demo、本机 uvicorn 不用 kind。
+
+## Phase 4a：准入是人的门，不是宿主的门
+
+OAuth 要拦的是「谁能建房、谁能配对 Computer」，不是「谁能跑 turn」。turn 已经有两把宿主钥匙：配对 token 和 cluster token。再把 JWT 塞进 `/runtime/*`，等于让浏览器里的人冒充 Job。反过来，把 Computer token 当登录态，等于任何拿到 pairing 响应的进程都能列你的房间。
+
+所以是两套凭据，故意不能互换：
+
+- GitHub → JWT：管理面。`sub` 是 `users.id`。房间和 Computer 带 `created_by`。别人的房 403。
+- Computer / cluster token：宿主面。只打 `/runtime/*` 和 `/ws/computers/*`。
+
+登录 fail-closed。state 是签名时间戳，不进 Redis——Redis 挂了可以少一次叫醒，不能少一次 CSRF 校验。token 交换失败就是 401，没有匿名降级。这和 wake 的 fail-open 是同一条分层：协调信号可丢，准入不可猜。
+
+JWT 自己用 HMAC-SHA256 签，不引入第三方面包。过期看 `exp`。房间 WebSocket 不能带头，所以 token 走 `access_token` 查询参数；那是传输限制，不是第二套身份。
+
+未设 `AGORA_GITHUB_CLIENT_ID` 时整层关掉。`created_by` 为 NULL，现有测试和 `demo_*.py` 不用改。这是显式的开发模式，不是漏网。
 
 ## 安全性与活性
 

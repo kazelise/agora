@@ -27,6 +27,22 @@ class Settings(BaseSettings):
     k8s_ttl_s: int = 120
     k8s_secret_name: str = ""
 
+    # Phase 4a: GitHub OAuth + JWT. Empty client_id keeps admission off
+    # so tests and local demos stay curl-friendly.
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_authorize_url: str = "https://github.com/login/oauth/authorize"
+    github_token_url: str = "https://github.com/login/oauth/access_token"
+    github_user_url: str = "https://api.github.com/user"
+    oauth_redirect_uri: str = "http://127.0.0.1:8000/auth/github/callback"
+    oauth_success_url: str = ""
+    jwt_secret: str = ""
+    jwt_ttl_s: int = 86400
+
+    @property
+    def auth_enabled(self) -> bool:
+        return bool(self.github_client_id)
+
 
 @lru_cache
 def get_settings() -> Settings:
