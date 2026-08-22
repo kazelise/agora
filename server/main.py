@@ -139,7 +139,7 @@ def register_routes(app: FastAPI) -> None:
         state = make_oauth_state(cfg.jwt_secret)
         return RedirectResponse(authorize_url(cfg, state), status_code=302)
 
-    @app.get("/auth/github/callback")
+    @app.get("/auth/github/callback", response_model=None)
     async def auth_github_callback(
         code: str | None = None,
         state: str | None = None,
