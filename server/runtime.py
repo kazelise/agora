@@ -1,9 +1,9 @@
-"""Token-authed runtime API for a paired computer.
+"""Token-authed runtime API for a host (paired computer or cluster Job).
 
-The daemon holds the model key and talks to these endpoints. The server
-verifies the acting agent is hosted on the token's computer; it never
-sees a provider key. Usage lands in the same llm_calls ledger as cloud
-turns (purpose + tokens + model name only).
+The host holds the model key and talks to these endpoints. A computer
+token may only act for agents on that computer; the cluster token may
+only act for unhosted (cloud) agents. The server never sees a provider
+key. Usage lands in the same llm_calls ledger (purpose + tokens + model).
 """
 
 from __future__ import annotations
@@ -15,8 +15,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from pydantic import BaseModel, Field
 
 from server import db
+from server.auth import hosted_agent, require_host
 from server.computers import ComputerHub
-from server.models import ComputerRow, MessageOut, ParticipantRow
+from server.models import MessageOut
+from server.runtime_types import Host
 from server.scheduler import fanout_message
 
 router = APIRouter(prefix="/runtime", tags=["runtime"])
@@ -83,42 +85,6 @@ class TurnContextOut(BaseModel):
     inbox: list[RuntimeMessageOut]
 
 
-def _bearer_token(authorization: str | None) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing computer token")
-    token = authorization.removeprefix("Bearer ").strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="missing computer token")
-    return token
-
-
-async def require_computer(request: Request) -> ComputerRow:
-    token = _bearer_token(request.headers.get("authorization"))
-    computer = await db.get_computer_by_token(request.app.state.pool, token)
-    if computer is None:
-        raise HTTPException(status_code=401, detail="invalid computer token")
-    return computer
-
-
-async def hosted_agent(
-    request: Request,
-    computer: ComputerRow,
-    agent_id: UUID,
-    room_id: UUID | None = None,
-) -> ParticipantRow:
-    try:
-        agent = await db.get_participant(request.app.state.pool, agent_id)
-    except db.NotFoundError as exc:
-        raise HTTPException(status_code=404, detail=exc.detail) from exc
-    if agent.computer_id != computer.id:
-        raise HTTPException(
-            status_code=403, detail="agent is not hosted on this computer"
-        )
-    if room_id is not None and agent.room_id != room_id:
-        raise HTTPException(status_code=403, detail="agent is not in this room")
-    return agent
-
-
 async def named_since(
     request: Request, room_id: UUID, since_seq: int
 ) -> list[RuntimeMessageOut]:
@@ -145,9 +111,9 @@ async def turn_context(
     request: Request,
     agent_id: UUID,
     room_id: UUID,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> TurnContextOut:
-    agent = await hosted_agent(request, computer, agent_id, room_id)
+    agent = await hosted_agent(request, host, agent_id, room_id)
     last_read = await db.get_last_read(request.app.state.pool, agent_id, room_id)
     people = await db.list_participants(request.app.state.pool, room_id)
     inbox = await named_since(request, room_id, last_read)
@@ -171,9 +137,9 @@ async def room_seq(
     request: Request,
     agent_id: UUID,
     room_id: UUID,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> dict[str, int]:
-    await hosted_agent(request, computer, agent_id, room_id)
+    await hosted_agent(request, host, agent_id, room_id)
     try:
         last_seq = await db.get_room_last_seq(request.app.state.pool, room_id)
     except db.NotFoundError as exc:
@@ -186,10 +152,10 @@ async def messages_since(
     request: Request,
     agent_id: UUID,
     room_id: UUID,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
     since_seq: int = Query(default=0, ge=0),
 ) -> list[RuntimeMessageOut]:
-    await hosted_agent(request, computer, agent_id, room_id)
+    await hosted_agent(request, host, agent_id, room_id)
     try:
         return await named_since(request, room_id, since_seq)
     except db.NotFoundError as exc:
@@ -200,9 +166,9 @@ async def messages_since(
 async def reply(
     request: Request,
     body: RuntimeReplyRequest,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> MessageOut:
-    await hosted_agent(request, computer, body.agent_id, body.room_id)
+    await hosted_agent(request, host, body.agent_id, body.room_id)
     try:
         row = await db.insert_message(
             request.app.state.pool,
@@ -231,9 +197,9 @@ async def reply(
 async def claim(
     request: Request,
     body: RuntimeClaimRequest,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> dict[str, bool]:
-    await hosted_agent(request, computer, body.agent_id, body.room_id)
+    await hosted_agent(request, host, body.agent_id, body.room_id)
     won = await db.try_claim(
         request.app.state.pool, body.room_id, body.task_key, body.agent_id
     )
@@ -244,9 +210,9 @@ async def claim(
 async def release_claim(
     request: Request,
     body: RuntimeClaimRequest,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> dict[str, bool]:
-    await hosted_agent(request, computer, body.agent_id, body.room_id)
+    await hosted_agent(request, host, body.agent_id, body.room_id)
     released = await db.release_claim(
         request.app.state.pool, body.room_id, body.task_key, body.agent_id
     )
@@ -257,9 +223,9 @@ async def release_claim(
 async def llm_call(
     request: Request,
     body: RuntimeLlmCallRequest,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> dict[str, str]:
-    await hosted_agent(request, computer, body.agent_id, body.room_id)
+    await hosted_agent(request, host, body.agent_id, body.room_id)
     await db.insert_llm_call(
         request.app.state.pool,
         body.agent_id,
@@ -277,9 +243,9 @@ async def get_last_read(
     request: Request,
     agent_id: UUID,
     room_id: UUID,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> dict[str, int]:
-    await hosted_agent(request, computer, agent_id, room_id)
+    await hosted_agent(request, host, agent_id, room_id)
     value = await db.get_last_read(request.app.state.pool, agent_id, room_id)
     return {"last_read_seq": value}
 
@@ -288,9 +254,9 @@ async def get_last_read(
 async def put_last_read(
     request: Request,
     body: RuntimeLastReadRequest,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> dict[str, str]:
-    await hosted_agent(request, computer, body.agent_id, body.room_id)
+    await hosted_agent(request, host, body.agent_id, body.room_id)
     await db.set_last_read(
         request.app.state.pool, body.agent_id, body.room_id, body.last_read_seq
     )
@@ -301,9 +267,9 @@ async def put_last_read(
 async def seen(
     request: Request,
     body: RuntimeSeenRequest,
-    computer: ComputerRow = Depends(require_computer),
+    host: Host = Depends(require_host),
 ) -> dict[str, str]:
-    await hosted_agent(request, computer, body.agent_id, body.room_id)
+    await hosted_agent(request, host, body.agent_id, body.room_id)
     from brain.seen import record_seen
 
     await record_seen(request.app.state.redis, body.agent_id, body.room_id, body.seq)

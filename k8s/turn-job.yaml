@@ -1,0 +1,48 @@
+# Example of the Job the server creates. Source of truth is
+# server.k8s.turn_job_manifest — this file is for reading, not applying
+# by hand. backoffLimit is 0: a k8s retry is not a turn retry.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agora-turn-example
+  namespace: agora
+  labels:
+    app: agora
+    agora.role: turn
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 120
+  template:
+    metadata:
+      labels:
+        app: agora
+        agora.role: turn
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: turn
+          image: agora:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "brain.job"]
+          env:
+            - name: AGORA_SERVER_URL
+              value: http://host.docker.internal:8000
+            - name: AGORA_AGENT_ID
+              value: "00000000-0000-0000-0000-000000000000"
+            - name: AGORA_ROOM_ID
+              value: "00000000-0000-0000-0000-000000000000"
+            - name: AGORA_CLUSTER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agora-cloud
+                  key: cluster-token
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agora-cloud
+                  key: openai-api-key
+            - name: OPENAI_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agora-cloud
+                  key: openai-base-url

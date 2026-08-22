@@ -102,7 +102,7 @@ flowchart LR
   brain --> Ledger
 ```
 
-当前落地：`clients` 只有 curl / 脚本；`server` 的 REST、WebSocket、调度器已接通；`brain` 是一张 LangGraph（Phase 2–3）；`daemon` 是 BYOA 宿主（Phase 4b）。OAuth / K8s 仍是空目录。
+当前落地：`clients` 只有 curl / 脚本；`server` 的 REST、WebSocket、调度器已接通；`brain` 是一张 LangGraph（Phase 2–3）；`daemon` 是 BYOA 宿主（Phase 4b）；`k8s` 是云端 Job 宿主（Phase 4c，默认关闭）。OAuth 仍未做。
 
 ## 表怎么对应这两类失败
 
@@ -119,8 +119,9 @@ flowchart LR
 - **Phase 0–1：** 地基、设计文档、消息流、叫醒调度、测试。
 - **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
 - **Phase 3（本仓库现在）：** 提交时事务内新鲜度校验；`task_key` 锚定到触发消息的 seq；计数游戏 / one-of-us 两条真模型协调测试。
-- **Phase 4b（本仓库现在）：** Computer 作为一等宿主；同一张图通过 `World` 接口换宿主；BYOA daemon 用自己的 key 跑，服务端零持有密钥。
-- **Phase 4a / 4c：** GitHub OAuth、K8s Job。做完一项再写进简历一项。
+- **Phase 4b：** Computer 作为一等宿主；同一张图通过 `World` 接口换宿主；BYOA daemon 用自己的 key 跑，服务端零持有密钥。
+- **Phase 4c（本仓库现在）：** `computer_id` 为空的云端 turn 可以交给 Kubernetes Job；同一张图、HttpWorld、cluster token；车道仍在服务端合并叫醒。未开 k8s 时行为与 Phase 4b 完全一样。
+- **Phase 4a：** GitHub OAuth。做完再写进简历一项。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
 
@@ -196,6 +197,18 @@ Agent 永远跑在某台 Computer 上。`computer_id` 为空就是今天的云�
 在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。
 
 和 Cumora 的诚实差别：他们换的是整颗推理引擎（Claude Code / Codex / Grok Build 在用户机器上跑自己的循环，Cumora 的 `turn.ts` 被绕开）。Agora 换的是宿主和 key，脑还是这张 LangGraph。卖点因此更窄、也更好讲：同一套 triage / claim / freshness 不变量，钥匙在谁手里、进程在哪台机器上，是唯一变量。
+
+## Phase 4c：Job 是云端 Computer，不是第二张图
+
+Phase 4b 把云端 turn 留在 API 进程里（`DirectWorld`）。那是开发默认，不是架构终点。进程内宿主和 API 同生死：一次卡住的模型调用堵住一条车道还好，堵的是 uvicorn 的 event loop 就糟了。K8s Job 把云端 turn 挪出那个进程，同时保持「换宿主 = 换运输层」。
+
+Job 用 `HttpWorld`，不用 `DirectWorld`。Job 里直接写库会跳过 `RoomHub` 的 WebSocket 广播——presence 还是进程内字典。走 `/runtime/reply`，fan-out 仍在服务端，和 BYOA 同一条路径。Job 因此也不需要 Postgres / Redis 凭据。
+
+cluster token 不是 `computers` 表里的一行。配对 token 绑的是某台笔记本；cluster token 是服务端签发的服务凭据，只允许 `computer_id IS NULL` 的 Agent。它不能冒充 BYOA Agent，BYOA token 也不能冒充云端 Agent。两条宿主的授权是对称的。
+
+叫醒合并仍在服务端车道里。`run_turn` 变成「创建 Job + 等到 succeeded/failed/timeout」。五条连发还是「在飞的一个 Job + 合并后再来一个」。`backoffLimit: 0`：kubelet 重试会再付一轮大模型，而且看不见房间是否已经变了；脏标记才是 turn 重试。超时或创建失败 fail-open——少一轮，不回退进程内，避免「集群没配好却悄悄在 API 里跑 LLM」。
+
+未开 `AGORA_K8S_ENABLED` 时，`computer_id` 为空仍走 `DirectWorld`。测试、demo、本机 uvicorn 不用 kind。
 
 ## 安全性与活性
 

@@ -12,8 +12,9 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from brain.world import WorldMessage
 from server import db
 from server.computers import ComputerHub
-from server.config import get_settings
+from server.config import Settings, get_settings
 from server.hub import RoomHub
+from server.k8s import JobLauncher, K8sJobLauncher
 from server.models import (
     ComputerCreatedOut,
     ComputerOut,
@@ -27,23 +28,40 @@ from server.models import (
     RoomOut,
 )
 from server.runtime import computer_ws, router as runtime_router
-from server.scheduler import Scheduler, fanout_message, run_subscriber
+from server.scheduler import Scheduler, TurnFn, fanout_message, run_subscriber
 
 
-def create_app(*, stub_turns: bool = False) -> FastAPI:
+def create_app(
+    *,
+    stub_turns: bool = False,
+    settings: Settings | None = None,
+    job_launcher: JobLauncher | None = None,
+    run_turn: TurnFn | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        settings = get_settings()
-        pool = await db.create_pool(settings.database_url)
+        cfg = settings or get_settings()
+        if cfg.k8s_enabled and not cfg.cluster_token and job_launcher is None and run_turn is None:
+            raise RuntimeError("AGORA_K8S_ENABLED requires AGORA_CLUSTER_TOKEN")
+        pool = await db.create_pool(cfg.database_url)
         await db.migrate(pool)
-        publisher = redis.from_url(settings.redis_url, decode_responses=True)
-        subscriber = redis.from_url(settings.redis_url, decode_responses=True)
+        publisher = redis.from_url(cfg.redis_url, decode_responses=True)
+        subscriber = redis.from_url(cfg.redis_url, decode_responses=True)
         await publisher.ping()
 
         hub = RoomHub()
         computers = ComputerHub()
+        launcher = job_launcher
         if stub_turns:
             scheduler = Scheduler(pool, computers=computers)
+        elif run_turn is not None:
+            scheduler = Scheduler(pool, run_turn=run_turn, computers=computers)
+        elif launcher is not None or cfg.k8s_enabled:
+            if launcher is None:
+                launcher = K8sJobLauncher.from_settings(cfg)
+            scheduler = Scheduler(
+                pool, run_turn=launcher.run_turn, computers=computers
+            )
         else:
             from brain.graph import make_turn_fn
 
@@ -61,12 +79,13 @@ def create_app(*, stub_turns: bool = False) -> FastAPI:
         task = asyncio.create_task(run_subscriber(subscriber, scheduler, ready, stop))
         await ready.wait()
 
-        app.state.settings = settings
+        app.state.settings = cfg
         app.state.pool = pool
         app.state.redis = publisher
         app.state.scheduler = scheduler
         app.state.hub = hub
         app.state.computers = computers
+        app.state.job_launcher = launcher
 
         try:
             yield
@@ -77,6 +96,10 @@ def create_app(*, stub_turns: bool = False) -> FastAPI:
                 await task
             except asyncio.CancelledError:
                 pass
+            if launcher is not None:
+                close = getattr(launcher, "aclose", None)
+                if close is not None:
+                    await close()
             await subscriber.aclose()
             await publisher.aclose()
             await pool.close()
