@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 4c：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验、按 seq 锚定的 `task_key`、`llm_calls` 账本），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——以及可选的云端 K8s Job 宿主（未开 k8s 时回退进程内）。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 4a + 4c：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验、按 seq 锚定的 `task_key`、`llm_calls` 账本），计数游戏 / one-of-us 两条真模型协调测试，BYOA，可选的云端 K8s Job 宿主，以及 GitHub OAuth + JWT 准入（未配置 `AGORA_GITHUB_CLIENT_ID` 时仍是匿名 curl）。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
@@ -37,7 +37,7 @@ flowchart LR
   brain --> Ledger
 ```
 
-图中 OAuth 为规划中的准入层，尚未实现。云端宿主默认仍是进程内 `DirectWorld`；打开 `AGORA_K8S_ENABLED` 后，同一条 per-agent 车道会为 `computer_id` 为空的 Agent 创建一个 Job（`python -m brain.job`，cluster token + `HttpWorld`）。BYOA daemon 不变。
+人的准入和宿主的钥匙是两套凭据：GitHub OAuth 换成 JWT，管房间 / Computer / 房间 WebSocket；Computer token 和 cluster token 只管 `/runtime/*` 和 Computer WebSocket。JWT 打不进 runtime，配对 token 当不了登录用户。未配置 GitHub client id 时准入关闭，本机 demo 和现有测试不用改。云端宿主默认仍是进程内 `DirectWorld`；打开 `AGORA_K8S_ENABLED` 后走 Job。
 
 Inspired by Cumora (github.com/yetone/cumora); independently designed and implemented from scratch.
 
@@ -118,6 +118,8 @@ uv run pytest -m "not llm"    # mock 模型，不打中继
 uv run pytest -m llm          # 真中继：计数游戏 + one-of-us（需要上面的 OPENAI_*）
 ```
 
-`test_coalesce`、Job manifest / launcher 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` / `test_k8s` 的 runtime 用例需要 Postgres + Redis。`-m "not llm"` 全部 mock 模型。`-m llm` 打真实中继，未设置 `OPENAI_BASE_URL` 或中继不可达时会 skip。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
+开 GitHub 准入：设 `AGORA_GITHUB_CLIENT_ID` / `AGORA_GITHUB_CLIENT_SECRET` / `AGORA_JWT_SECRET`，浏览器走 `GET /auth/github`。回来的 JWT 放 `Authorization: Bearer`，房间 WebSocket 用 `?access_token=`。房间和 Computer 归创建者所有。
+
+`test_coalesce`、Job manifest / launcher、JWT 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` / `test_k8s` / `test_oauth` 的 HTTP 用例需要 Postgres + Redis。`-m "not llm"` 全部 mock 模型。`-m llm` 打真实中继，未设置 `OPENAI_BASE_URL` 或中继不可达时会 skip。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
 
 开 K8s Job 宿主见 [k8s/README.md](k8s/README.md)。

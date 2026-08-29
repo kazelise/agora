@@ -13,6 +13,7 @@ from server.models import (
     ParticipantKind,
     ParticipantRow,
     RoomRow,
+    UserRow,
 )
 
 _PARTICIPANT_COLS = (
@@ -51,8 +52,24 @@ async def migrate(pool: asyncpg.Pool) -> None:
         await conn.execute(sql)
 
 
+def _user(row: asyncpg.Record) -> UserRow:
+    return UserRow(
+        id=row["id"],
+        github_id=int(row["github_id"]),
+        login=row["login"],
+        name=row["name"],
+        avatar_url=row["avatar_url"],
+        created_at=row["created_at"],
+    )
+
+
 def _room(row: asyncpg.Record) -> RoomRow:
-    return RoomRow(id=row["id"], name=row["name"], created_at=row["created_at"])
+    return RoomRow(
+        id=row["id"],
+        name=row["name"],
+        created_at=row["created_at"],
+        created_by=row["created_by"],
+    )
 
 
 def _participant(row: asyncpg.Record) -> ParticipantRow:
@@ -73,6 +90,7 @@ def _computer(row: asyncpg.Record) -> ComputerRow:
         name=row["name"],
         created_at=row["created_at"],
         last_seen_at=row["last_seen_at"],
+        created_by=row["created_by"],
     )
 
 
@@ -87,23 +105,92 @@ def _message(row: asyncpg.Record) -> MessageRow:
     )
 
 
-async def create_room(pool: asyncpg.Pool, name: str) -> RoomRow:
+async def upsert_user(
+    pool: asyncpg.Pool,
+    github_id: int,
+    login: str,
+    name: str | None,
+    avatar_url: str | None,
+) -> UserRow:
     row = await pool.fetchrow(
         """
-        INSERT INTO rooms (id, name)
-        VALUES ($1, $2)
-        RETURNING id, name, created_at
+        INSERT INTO users (id, github_id, login, name, avatar_url)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (github_id) DO UPDATE SET
+            login = EXCLUDED.login,
+            name = EXCLUDED.name,
+            avatar_url = EXCLUDED.avatar_url,
+            last_login_at = now()
+        RETURNING id, github_id, login, name, avatar_url, created_at
+        """,
+        uuid4(),
+        github_id,
+        login,
+        name,
+        avatar_url,
+    )
+    assert row is not None
+    return _user(row)
+
+
+async def get_user(pool: asyncpg.Pool, user_id: UUID) -> UserRow:
+    row = await pool.fetchrow(
+        """
+        SELECT id, github_id, login, name, avatar_url, created_at
+        FROM users
+        WHERE id = $1
+        """,
+        user_id,
+    )
+    if row is None:
+        raise NotFoundError(f"user {user_id} not found")
+    return _user(row)
+
+
+async def create_room(
+    pool: asyncpg.Pool, name: str, created_by: UUID | None = None
+) -> RoomRow:
+    row = await pool.fetchrow(
+        """
+        INSERT INTO rooms (id, name, created_by)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, created_at, created_by
         """,
         uuid4(),
         name,
+        created_by,
     )
     assert row is not None
     return _room(row)
 
 
+async def list_rooms(
+    pool: asyncpg.Pool, created_by: UUID | None = None
+) -> list[RoomRow]:
+    if created_by is None:
+        rows = await pool.fetch(
+            """
+            SELECT id, name, created_at, created_by
+            FROM rooms
+            ORDER BY created_at
+            """
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT id, name, created_at, created_by
+            FROM rooms
+            WHERE created_by = $1
+            ORDER BY created_at
+            """,
+            created_by,
+        )
+    return [_room(r) for r in rows]
+
+
 async def get_room(pool: asyncpg.Pool, room_id: UUID) -> RoomRow:
     row = await pool.fetchrow(
-        "SELECT id, name, created_at FROM rooms WHERE id = $1",
+        "SELECT id, name, created_at, created_by FROM rooms WHERE id = $1",
         room_id,
     )
     if row is None:
@@ -187,16 +274,22 @@ async def list_agent_participants(pool: asyncpg.Pool, room_id: UUID) -> list[Par
     return [_participant(r) for r in rows]
 
 
-async def create_computer(pool: asyncpg.Pool, name: str, token: str) -> ComputerRow:
+async def create_computer(
+    pool: asyncpg.Pool,
+    name: str,
+    token: str,
+    created_by: UUID | None = None,
+) -> ComputerRow:
     row = await pool.fetchrow(
         """
-        INSERT INTO computers (id, name, token_hash)
-        VALUES ($1, $2, $3)
-        RETURNING id, name, created_at, last_seen_at
+        INSERT INTO computers (id, name, token_hash, created_by)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, name, created_at, last_seen_at, created_by
         """,
         uuid4(),
         name,
         hash_token(token),
+        created_by,
     )
     assert row is not None
     return _computer(row)
@@ -205,7 +298,7 @@ async def create_computer(pool: asyncpg.Pool, name: str, token: str) -> Computer
 async def get_computer(pool: asyncpg.Pool, computer_id: UUID) -> ComputerRow:
     row = await pool.fetchrow(
         """
-        SELECT id, name, created_at, last_seen_at
+        SELECT id, name, created_at, last_seen_at, created_by
         FROM computers
         WHERE id = $1
         """,
@@ -219,7 +312,7 @@ async def get_computer(pool: asyncpg.Pool, computer_id: UUID) -> ComputerRow:
 async def get_computer_by_token(pool: asyncpg.Pool, token: str) -> ComputerRow | None:
     row = await pool.fetchrow(
         """
-        SELECT id, name, created_at, last_seen_at
+        SELECT id, name, created_at, last_seen_at, created_by
         FROM computers
         WHERE token_hash = $1
         """,
@@ -238,14 +331,27 @@ async def computer_token_matches(
     return stored is not None and stored == hash_token(token)
 
 
-async def list_computers(pool: asyncpg.Pool) -> list[ComputerRow]:
-    rows = await pool.fetch(
-        """
-        SELECT id, name, created_at, last_seen_at
-        FROM computers
-        ORDER BY created_at
-        """
-    )
+async def list_computers(
+    pool: asyncpg.Pool, created_by: UUID | None = None
+) -> list[ComputerRow]:
+    if created_by is None:
+        rows = await pool.fetch(
+            """
+            SELECT id, name, created_at, last_seen_at, created_by
+            FROM computers
+            ORDER BY created_at
+            """
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT id, name, created_at, last_seen_at, created_by
+            FROM computers
+            WHERE created_by = $1
+            ORDER BY created_at
+            """,
+            created_by,
+        )
     return [_computer(r) for r in rows]
 
 
@@ -450,4 +556,4 @@ async def set_last_read(
 
 
 async def truncate_all(pool: asyncpg.Pool) -> None:
-    await pool.execute("TRUNCATE rooms, computers CASCADE")
+    await pool.execute("TRUNCATE rooms, computers, users CASCADE")

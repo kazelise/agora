@@ -72,3 +72,24 @@ CREATE TABLE IF NOT EXISTS conversation_reads (
 CREATE INDEX IF NOT EXISTS messages_room_seq_idx ON messages (room_id, seq);
 CREATE INDEX IF NOT EXISTS participants_room_idx ON participants (room_id);
 CREATE INDEX IF NOT EXISTS participants_computer_idx ON participants (computer_id);
+
+-- Phase 4a: GitHub users. created_by on rooms/computers is NULL when
+-- admission is off (dev/tests) or for rows from before this phase.
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY,
+    github_id BIGINT NOT NULL UNIQUE,
+    login TEXT NOT NULL,
+    name TEXT,
+    avatar_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE rooms
+    ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users (id);
+
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users (id);
+
+CREATE INDEX IF NOT EXISTS rooms_created_by_idx ON rooms (created_by);
+CREATE INDEX IF NOT EXISTS computers_created_by_idx ON computers (created_by);
