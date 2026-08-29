@@ -921,13 +921,27 @@ class Brain:
             "claim_nudged": False,
             "send_anyway": False,
         }
-        final = await self.graph.ainvoke(
-            initial,
-            {
-                "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 40,
-            },
-        )
+        final: dict[str, Any]
+        try:
+            final = await self.graph.ainvoke(
+                initial,
+                {
+                    "configurable": {"thread_id": str(uuid4())},
+                    "recursion_limit": 40,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # An in-graph crash (GraphRecursionError, a world transport
+            # error outside the LLM retry path) must not skip cleanup:
+            # a HOLD minted this turn would otherwise survive until its
+            # TTL and get spent by a future turn's send_anyway. Claims
+            # have their own TTL steal, so only the token is reaped here;
+            # the turn surfaces as a raised error, same as before.
+            if self._hold_redis is not None:
+                await clear_hold(self._hold_redis, agent_id, room_id)
+            raise
         last_read = int(final.get("seen_seq") or seen_seq)
         await self.world.set_last_read(agent_id, room_id, last_read)
         claims = tuple(

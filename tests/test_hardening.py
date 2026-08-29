@@ -17,6 +17,8 @@ import httpx
 import pytest
 import redis.asyncio as redis
 
+import brain.graph as graph_mod
+import brain.holds as holds_mod
 from brain.holds import consume_hold, record_hold
 from brain.world import DuplicateReply, StaleWrite
 from brain.world_direct import DirectWorld
@@ -490,6 +492,54 @@ async def test_turn_end_clears_token_when_turn_ends_without_commit(
 
     assert result.outcome == "skipped"
     assert result.hold_count == 1
+    assert await consume_hold(redis_client, iris_id, room_id) is None
+
+
+@pytest.mark.asyncio
+async def test_turn_crash_mid_graph_still_reaps_hold_token(
+    pool: asyncpg.Pool,
+    redis_client: redis.Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-graph crash (GraphRecursionError, a world transport error
+    outside the LLM retry path) must not leave a HOLD-minted token
+    armed: the next turn's send_anyway could spend an acknowledgement
+    earned in a different turn. run() reaps the token before re-raising."""
+    room_id, human_id, agent_ids = await _room(pool)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    async def peer_first(_messages: list) -> object:
+        await db.insert_message(pool, room_id, marcus_id, "3")
+        return tool_call("reply", {"body": "3"})
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="each", response_mode="each")]
+    )
+    big = ScriptedChatModel([peer_first])
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=small,
+        big_model=big,
+        hold_redis=redis_client,
+    )
+
+    # LLM failures are folded into llm_error by invoke_model, so the crash
+    # must come from outside that path: blow up right after the HOLD mints
+    # its token — the token exists, the turn never ends normally.
+    real_record_hold = holds_mod.record_hold
+
+    async def mint_then_explode(*args: object, **kwargs: object) -> None:
+        await real_record_hold(*args, **kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("transport exploded right after minting")
+
+    # graph.py imports record_hold by name; patch both sides.
+    monkeypatch.setattr(graph_mod, "record_hold", mint_then_explode)
+
+    with pytest.raises(RuntimeError, match="transport exploded"):
+        await brain.run(iris_id, room_id)
+
+    # The token minted by the crashed turn is reaped.
     assert await consume_hold(redis_client, iris_id, room_id) is None
 
 
