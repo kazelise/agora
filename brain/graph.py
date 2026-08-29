@@ -239,15 +239,53 @@ def _payload_shape(messages: list[Any]) -> str:
     return "[" + " ".join(bits) + "]"
 
 
-async def invoke_model(model: Any, messages: list[Any], *, label: str) -> Any | None:
+def _is_rate_limited(exc: BaseException) -> bool:
+    """Best-effort detection of provider throttling across SDK shapes.
+
+    OpenAI SDK: RateLimitError (subclass of APIStatusError, status 429);
+    httpx-style payloads put "rate limit" in the message. Unrecognized
+    errors are treated as ordinary failures — pacing degrades to nothing.
+    """
+    cls = type(exc)
+    if cls.__name__ == "RateLimitError":
+        return True
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    text = str(exc).lower()
+    return "rate limit" in text or "429" in text
+
+
+async def invoke_model(
+    model: Any,
+    messages: list[Any],
+    *,
+    label: str,
+    pacer: Any | None = None,
+) -> Any | None:
     """Call the model; retry once after a short backoff; None if both fail.
 
-    Fail-open: a dead relay is a missed reply, not a crashed turn. No
+    When a pacer is given, every call start first waits for its slot; a
+    rate-limited response doubles the global interval, clean calls restore
+    it. Fail-open: a dead relay is a missed reply, not a crashed turn. No
     caller should write a ledger row unless this returns a message.
     """
+    if pacer is not None:
+        waited = await pacer.wait_turn()
+        if waited:
+            logger.info("pacer %s waited %.1fs", label, waited)
     try:
-        return await model.ainvoke(messages)
+        result = await model.ainvoke(messages)
+        if pacer is not None:
+            pacer.on_ok()
+        return result
     except Exception as first:
+        if pacer is not None and _is_rate_limited(first):
+            logger.warning(
+                "LLM %s rate-limited — pacer interval now %.1fs",
+                label,
+                pacer.on_rate_limited(),
+            )
         logger.warning(
             "LLM %s failed (%s: %s); retrying once; payload=%s",
             label,
@@ -256,9 +294,20 @@ async def invoke_model(model: Any, messages: list[Any], *, label: str) -> Any | 
             _payload_shape(messages),
         )
         await asyncio.sleep(LLM_RETRY_BACKOFF_S)
+        if pacer is not None:
+            await pacer.wait_turn()
         try:
-            return await model.ainvoke(messages)
+            result = await model.ainvoke(messages)
+            if pacer is not None:
+                pacer.on_ok()
+            return result
         except Exception as second:
+            if pacer is not None and _is_rate_limited(second):
+                logger.warning(
+                    "LLM %s rate-limited on retry — pacer interval now %.1fs",
+                    label,
+                    pacer.on_rate_limited(),
+                )
             logger.warning(
                 "LLM %s retry failed (%s: %s) — ending turn llm_error; payload=%s",
                 label,
@@ -281,6 +330,7 @@ class Brain:
         checkpointer: Any | None = None,
         on_committed: Callable[[WorldMessage], Awaitable[None]] | None = None,
         hold_redis: Any | None = None,
+        pacer: Any | None = None,
     ) -> None:
         self.small_model_name = policy.assert_triage_model(
             policy.small_model_name() if small_model_name is None else small_model_name
@@ -294,6 +344,9 @@ class Brain:
         # Hold tokens live in Redis (server-side). The daemon constructs its
         # Brain without one; its freshness gate is the runtime 409 path.
         self._hold_redis = hold_redis
+        # Optional AdaptivePacer (daemon-side): deterministic spacing between
+        # LLM call starts plus exponential backoff on provider rate limits.
+        self._pacer = pacer
         # InMemorySaver: langgraph-checkpoint-postgres wants psycopg/libpq;
         # this repo is asyncpg-only. HOLD is an in-graph loop, so a durable
         # saver is not required for correctness. Swap via this arg later.
@@ -398,7 +451,10 @@ class Brain:
             "completed the request, actionable=false."
         )
         ai = await invoke_model(
-            self.small, [SystemMessage(content=prompt)], label="triage"
+            self.small,
+            [SystemMessage(content=prompt)],
+            label="triage",
+            pacer=self._pacer,
         )
         if ai is None:
             return {
@@ -480,7 +536,7 @@ class Brain:
             history = [SystemMessage(content=_tool_prompt(state))]
 
         bound = self.big.bind_tools(TOOLS) if hasattr(self.big, "bind_tools") else self.big
-        ai = await invoke_model(bound, history, label="tool_loop")
+        ai = await invoke_model(bound, history, label="tool_loop", pacer=self._pacer)
         if ai is None:
             return {"outcome": "llm_error"}
         await self._ledger(state, "turn", ai)

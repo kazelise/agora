@@ -18,6 +18,7 @@ from langchain_openai import ChatOpenAI
 from brain.graph import Brain, TurnResult
 from brain.policy import big_model_name, small_model_name
 from daemon.lanes import AgentLane
+from daemon.pacer import BASE_INTERVAL_S, MAX_INTERVAL_S, AdaptivePacer
 from daemon.world_http import HttpWorld
 
 logger = logging.getLogger("agora.daemon")
@@ -42,7 +43,7 @@ def _openai_base() -> str:
     )
 
 
-def build_brain(world: HttpWorld) -> Brain:
+def build_brain(world: HttpWorld, *, pacer: AdaptivePacer | None = None) -> Brain:
     small = small_model_name()
     big = big_model_name()
     # ChatOpenAI reads OPENAI_API_KEY / OPENAI_BASE_URL from this process.
@@ -53,6 +54,7 @@ def build_brain(world: HttpWorld) -> Brain:
         big_model=ChatOpenAI(model=big),
         small_model_name=small,
         big_model_name=big,
+        pacer=pacer,
     )
 
 
@@ -82,6 +84,7 @@ class Daemon:
         brain: Brain | None = None,
         world: HttpWorld | None = None,
         http: httpx.AsyncClient | None = None,
+        pacer: AdaptivePacer | None = None,
     ) -> None:
         self.server = server.rstrip("/")
         self.computer_id = computer_id
@@ -89,6 +92,7 @@ class Daemon:
         self._http = http
         self._world = world
         self._brain = brain
+        self._pacer = pacer
         self._lanes: dict[UUID, AgentLane] = {}
         self._owns_http = http is None
 
@@ -161,7 +165,13 @@ class Daemon:
         try:
             world = self._world or HttpWorld(client, self.token)
             self._world = world
-            self._brain = self._brain or build_brain(world)
+            # One pacer per computer: triage (small) and turn (big) models
+            # share the same provider account, so both classes must flow
+            # through the same rate budget (Cumora §3/§3a: capping one
+            # layer without the other just moves the thundering herd up).
+            pacer = self._pacer or AdaptivePacer()
+            self._pacer = pacer
+            self._brain = self._brain or build_brain(world, pacer=pacer)
             delay = 1.0
             while True:
                 try:
@@ -197,6 +207,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--token",
         default=os.environ.get("AGORA_COMPUTER_TOKEN"),
     )
+    parser.add_argument(
+        "--pacer-base-s",
+        type=float,
+        default=float(os.environ.get("AGORA_PACER_BASE_S", BASE_INTERVAL_S)),
+        help="minimum spacing between LLM call starts (default 0.5)",
+    )
+    parser.add_argument(
+        "--pacer-max-s",
+        type=float,
+        default=float(os.environ.get("AGORA_PACER_MAX_S", MAX_INTERVAL_S)),
+        help="cap for the adaptive interval after rate limits (default 8.0)",
+    )
     return parser.parse_args(argv)
 
 
@@ -224,7 +246,14 @@ def main(argv: list[str] | None = None) -> None:
         small_model_name(),
         big_model_name(),
     )
-    daemon = Daemon(args.server, args.computer_id, args.token)
+    daemon = Daemon(
+        args.server,
+        args.computer_id,
+        args.token,
+        pacer=AdaptivePacer(
+            base_interval_s=args.pacer_base_s, max_interval_s=args.pacer_max_s
+        ),
+    )
     try:
         asyncio.run(daemon.run_forever())
     except KeyboardInterrupt:

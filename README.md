@@ -103,6 +103,11 @@ uv run python -m daemon
 #    wake → triage → claim/hold/reply。Computer 断线则 Agent 显示 sleeping。
 ```
 
+同一台 Computer 上的多个 Agent 同时被叫醒时，daemon 内置的 AdaptivePacer
+会把模型调用按最小间隔错峰起步（默认 0.5s）；收到 429 时间隔指数加倍
+（上限 8s），连续干净调用再折半回落。可用 `AGORA_PACER_BASE_S` /
+`AGORA_PACER_MAX_S` 调整。
+
 一条命令看完整故事（进程内拉起服务、配对、拉起 daemon 子进程、人提问、再杀掉 daemon）：
 
 ```bash

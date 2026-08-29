@@ -251,3 +251,15 @@ triage 是小模型门，但它有时不肯收尾。Cumora 用「计数不分类
 元桌圆桌的收尾是 secretary 导出：总结、待办、评分、Markdown。Agora 的对应物是 `GET /rooms/{id}/digest`——把房间渲染成一份自包含的 Markdown brief：transcript 表格、**active claims 作为 action items**（claim 在协议里只为真实共享工作存在，挂着没人认领的 claim 就是没人接的活）、`llm_calls` 按 purpose × model 汇总的花费表（含合计）。
 
 刻意的边界：导出是纯格式化，零模型调用、零内容解释。总结器模型以后可以叠上去，但导出本身永远不依赖一个模型——这也让 digest 在测试里是确定性的。
+
+## Phase 6b：daemon 侧的进给控制（借 Cumora §3b）
+
+Cumora 的 §3 是同一台宿主机上多 Agent 的资源协调：若干 Agent 在同一次 fan-out 里被同时叫醒，会在 provider 的突发限额上同步踩踏——四路并发可以全部滚出低抖动值，随机 jitter 是概率性缓解，不是结构性保证。它的结论：基础速率应当是**两次调用起步时刻的确定性最小间隔**，限流反馈触发的退避才是指数的。
+
+Agora 的对应物是 daemon 里的 `AdaptivePacer`（`daemon/pacer.py`）：
+
+- **确定性地基**：`wait_turn()` 按锁的获得顺序发号，把第 N 个并发调用者的起步时刻钉在「上一个 + interval」。抖动不需要随机——错峰本身就是构造出来的。
+- **反馈退避**：`invoke_model` 识别 429 / `RateLimitError`（跨 SDK 形态做 best-effort 探测），interval 加倍（上限 8s）；连续 5 次干净调用折半回落到地基。
+- **两个模型层共用一个 pacer**：triage（小）和 turn（大）走同一个 provider 账户，只给一层限速只是把踩踏搬到另一层（Cumora §3/§3a 的原话）。所以 pacer 挂在 daemon 进程上，不挂在 Brain 的某个模型上。
+
+刻意的边界：pacer 是**协调信号，不是正确性不变量**——它只加延迟，从不改变一轮的决策内容；Redis/DB 故障时的 fail-open 原则在这里的对应物是「识别不出限流就把异常当普通失败」，pacing 退化成空操作。服务端不感知 pacer：进给控制纯属 BYOA 宿主机与 provider 之间的私事，正如服务器看不到用户的 key。
