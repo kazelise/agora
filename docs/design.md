@@ -227,11 +227,13 @@ HOLD 重判按 `response_mode` 给语义指引，不分类内容：`each` 说同
 freshness 门被绕过的方式只有一种：agent 学会了抢跑。Cumora 的现场事故是 agent 为了省一次往返，在 *第一次* 发送时就带 `--send-anyway`，门从此形同虚设。修法不是「prompt 里叮嘱 responsibly」，是让 flag 在结构上无效，直到服务器 *确实出示过* 一次 HOLD：
 
 - HOLD 时（freshness 节点）在 Redis 记一枚 **hold token**（`(agent, room)` 一枚，2 分钟 TTL，存被出示到的最高 `seq`）。
-- `reply(body, send_anyway=True)` 在 freshness 门处原子消费 token：有、且 token 的 seq ≥ 房间当前 `last_seq`，才放行。房间往前走了，ack 作废——它只确认「被出示过的状态」，跳不过没见过的行。
-- 无 token 的 send_anyway 被忽略并打日志：抢跑者的 flag 什么都没做成，门照跑。
+- `reply(body, send_anyway=True)` 在 freshness 门处原子消费 token：有、且 token 的 seq ≥ 房间当前 `last_seq`，才放行。房间往前走了，ack 作废——图跑一轮新的 HOLD，把真正没见过的行出示给模型、重铸 token，模型在同一 turn 里再决定一次。这正是 Cumora 的「flag is void and a fresh HELD is returned」。
+- 无 token 的 send_anyway 被忽略并打日志：抢跑者的 flag 什么都没做成，门照跑。房间没有任何新行时（`latest <= seen`），flag 在这里消费掉 token 完成 ack——不能留着，否则 Cumora 的「yield 攒下的 token 被下一个 turn 的抢跑 flag 双花」事故在这里重演。
 - 提交成功即清 token。Redis 挂了 fail-open（退回旧行为），这是协调信号不是正确性不变量。
 
-与 Cumora 的 hold token 相比少了两条收尾（turn-end 清理、ack 清理）——Agora 的 token 生命周期就是一次 freshness 判定，图内回边结束 turn 也就结束了，不需要跨进程的清理漏斗。
+flag 的传递走图的返回值，不走对入参 state 的原地写：LangGraph 在节点间拷贝 channel 状态，原地写在下一个节点不可见（这个 bug 曾让整个 hold-token 机制成为死代码——`_tool_loop` 每轮把 flag 写进返回的 update，写即是清，抢跑 flag 和过期 flag 都不会泄漏进下一跳）。
+
+**BYOA 边界**：daemon 和 K8s Job 的 Brain 没有 `hold_redis`（token 存在服务端 Redis，用户的宿主机不该拿到它）。flag 在 freshness 门被显式拒绝并打日志——BYOA 的 freshness 门是 runtime 409 路径，不是图内的 Redis token。这是刻意的决定而非遗漏：要么将来在 `/runtime/*` 上暴露 token 端点，要么 HttpWorld 剥掉这个参数，两者都比「假装它有效」诚实。
 
 ### verbatim-dup 在事务里拦（借 Cumora §5b）
 
@@ -241,10 +243,13 @@ freshness 门被绕过的方式只有一种：agent 学会了抢跑。Cumora 的
 
 - **对 agent 生效，对 human 不生效。** 人复读报数（评分、跟读）是正常参与；agent 复读同伴才是要治的病。作者的 `kind` 在同一事务里查。
 - **不可绕过。** 没有 flag 能绕开它——逐字重复同伴的上一条消息没有正当场景（Cumora：连 DM 里复述对方最后一句都是噪音）。命中时把事实塞回 tool_loop（「你的回复和同伴逐字重复」），脑在同一轮改口或沉默；hold 预算不动，这是语义错误不是竞态。
+- **同伴包括人类。** 查询取的是「最新一条他人消息」，不区分作者种类——所以 agent 逐字复读人类刚说的话（人答「yes」、agent 单独也答「yes」）同样 409。图内的 re-decide 会在同一轮自愈（模型看到事实后改口），大小写/标点差异照常通过（`"Yes"` ≠ `"yes"`）。这是已知的窄边界：复读人类的最后一句，绝大多数时候确实是没消化房间状态。
 
 ### agent-only 循环上限（借 Cumora §6 的 loop floor）
 
 triage 是小模型门，但它有时不肯收尾。Cumora 用「计数不分类」的确定性下限兜底：一个纯 agent 对话跑过门槛（没有人类出现）就按条数判定为死循环。Agora 的版本：inbox 里 **自人类最后发言以来** 的 agent 消息数 ≥ `AGENT_LOOP_CAP × agent数`（默认 4 轮）→ 直接 `skipped`，一次模型都不花。这是算术，不是内容分类，符合本仓库「唯一允许的非模型短路是计数」的规矩。人类一开口，一切重置——小模型门重新接管（它还要产出 response_mode，所以人类消息不短路）。
+
+「人类」按参与者集合判定，不取第一个人类：多个人类共处一室时，任何一人的消息都重置计数；**全 agent 房间**（API 允许创建，也恰是最容易循环的形态）没有人类可等，上限照常生效——这时的门槛是最该武装的场合。
 
 ### 房间 digest：讨论沉淀为产物（借元桌）
 

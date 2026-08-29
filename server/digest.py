@@ -20,6 +20,11 @@ def _esc(text: str) -> str:
     return text.replace("\r\n", "\n").strip()
 
 
+def _cell(text: str) -> str:
+    """Make a string safe inside a Markdown table cell."""
+    return _esc(text).replace("|", "\\|").replace("\n", " ")
+
+
 def render_digest(data: dict[str, Any]) -> str:
     room = data["room"]
     people = data["participants"]
@@ -32,7 +37,7 @@ def render_digest(data: dict[str, Any]) -> str:
     names = {p["id"]: p["name"] for p in people}
 
     lines: list[str] = []
-    lines.append(f"# {room['name']}")
+    lines.append(f"# {_esc(room['name'])}")
     lines.append("")
     lines.append(f"- Room id: `{room['id']}`")
     lines.append(f"- Started: {room['created_at'].isoformat(timespec='seconds')}")
@@ -41,7 +46,7 @@ def render_digest(data: dict[str, Any]) -> str:
     )
     if agents:
         lines.append(
-            "- Agents: " + ", ".join(f"**{p['name']}**" for p in agents)
+            "- Agents: " + ", ".join(f"**{_esc(p['name'])}**" for p in agents)
         )
     lines.append("")
 
@@ -53,8 +58,9 @@ def render_digest(data: dict[str, Any]) -> str:
         lines.append("| seq | author | message |")
         lines.append("|---|---|---|")
         for m in messages:
-            body = _esc(m["body"]).replace("|", "\\|").replace("\n", " ")
-            lines.append(f"| {m['seq']} | {m['author_name']} | {body} |")
+            lines.append(
+                f"| {m['seq']} | {_cell(m['author_name'])} | {_cell(m['body'])} |"
+            )
     lines.append("")
 
     lines.append("## Action items (claims)")
@@ -64,7 +70,7 @@ def render_digest(data: dict[str, Any]) -> str:
     else:
         for c in claims:
             owner = c["claimed_by_name"] or names.get(c["claimed_by"], "?")
-            lines.append(f"- `{c['task_key']}` — held by **{owner}**")
+            lines.append(f"- `{c['task_key']}` — held by **{_esc(owner)}**")
     lines.append("")
 
     lines.append("## Model spend")
@@ -82,7 +88,7 @@ def render_digest(data: dict[str, Any]) -> str:
             total_prompt += prompt
             total_completion += completion
             lines.append(
-                f"| {u['purpose']} | {u['model']} | {u['calls']} | {prompt} | {completion} |"
+                f"| {u['purpose']} | {_cell(str(u['model']))} | {u['calls']} | {prompt} | {completion} |"
             )
         lines.append(f"| **total** | — | — | **{total_prompt}** | **{total_completion}** |")
     lines.append("")

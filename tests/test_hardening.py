@@ -219,7 +219,8 @@ async def test_send_anyway_with_token_bypasses_hold(
     pool: asyncpg.Pool, redis_client: redis.Redis
 ) -> None:
     """HELD once → token armed; the retry with send_anyway ships without
-    a second HOLD (the legitimate flow)."""
+    a second HOLD — the legitimate flow, and one that only works while
+    the room is exactly at the acknowledged state (seq binding)."""
     room_id, human_id, agent_ids = await _room(pool)
     iris_id, marcus_id = agent_ids
     await db.insert_message(pool, room_id, human_id, "next number after 2")
@@ -229,15 +230,22 @@ async def test_send_anyway_with_token_bypasses_hold(
         return tool_call("reply", {"body": "3"})
 
     async def retry_with_flag(_messages: list) -> object:
-        # The HELD envelope armed a token bound to seq 2; acknowledging it
-        # is legitimate — the agent has seen everything up to that point.
-        # (The body differs from the peer's, so the dup gate stays clear.)
+        # The HELD envelope armed a token bound to seq 2 (marcus's "3"),
+        # and no new message has landed since — the ack covers exactly the
+        # shown state. (The body differs from the peer's, so the dup gate
+        # stays clear.) Post-commit the graph re-enters tool_loop; the
+        # third scripted response keeps that hop silent.
         return tool_call("reply", {"body": "3, going with 4", "send_anyway": True})
 
     small = ScriptedChatModel(
         [triage_message(actionable=True, reason="each", response_mode="each")]
     )
-    big = ScriptedChatModel([peer_first, retry_with_flag])
+    # 1) peer_first (reply without flag) → HOLD; 2) retry_with_flag → token
+    # acked, ships; 3) post-commit re-decide (loop continues after commit)
+    # → silent.
+    big = ScriptedChatModel(
+        [peer_first, retry_with_flag, text_message("peer raced ahead; silence")]
+    )
     brain = Brain(
         DirectWorld(pool, redis_client),
         small_model=small,
@@ -255,6 +263,62 @@ async def test_send_anyway_with_token_bypasses_hold(
         iris_id,
         "3, going with 4",
     )
+
+
+@pytest.mark.asyncio
+async def test_send_anyway_with_stale_token_re_holds(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """Cumora §5d seq binding: the room moved past the acknowledged state,
+    so the ack is void — the gate runs a fresh HOLD (showing the truly-new
+    rows and re-arming the token) instead of letting the flag skip them."""
+    room_id, human_id, agent_ids = await _room(pool)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    async def peer_first(_messages: list) -> object:
+        await db.insert_message(pool, room_id, marcus_id, "3")
+        return tool_call("reply", {"body": "3"})
+
+    async def retry_with_flag(_messages: list) -> object:
+        # New message AFTER the HOLD armed the token at seq 2: latest is
+        # now 3, token acks 2 < 3 → void. A fresh HOLD must follow.
+        await db.insert_message(pool, room_id, marcus_id, "wait, 4 is mine")
+        return tool_call("reply", {"body": "3, going with 4", "send_anyway": True})
+
+    async def after_rehold(_messages: list) -> object:
+        # Second HELD showed seq 3 and re-armed the token at 3; the room
+        # has not moved since, so this ack is honored.
+        return tool_call("reply", {"body": "4 then", "send_anyway": True})
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="each", response_mode="each")]
+    )
+    # 1) peer_first → HOLD#1 (token@2); 2) flagged retry → void, HOLD#2
+    # (token@3, shows the new row); 3) flagged again → acked, ships;
+    # 4) post-commit re-decide → silent.
+    big = ScriptedChatModel(
+        [
+            peer_first,
+            retry_with_flag,
+            after_rehold,
+            text_message("peer raced ahead; silence"),
+        ]
+    )
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=small,
+        big_model=big,
+        hold_redis=redis_client,
+    )
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "replied"
+    assert result.reply_body == "4 then"
+    assert result.hold_count == 2
+    stored = await db.list_messages(pool, room_id)
+    assert [(m.author_id, m.body) for m in stored][-1] == (iris_id, "4 then")
 
 
 @pytest.mark.asyncio
@@ -335,6 +399,65 @@ async def test_human_message_resets_loop_cap(
     assert len(small.calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_loop_cap_arms_in_human_free_room(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """No human participant at all: the cap still arms (this is the MOST
+    loop-prone shape — nobody will ever reset the counter)."""
+    room = await db.create_room(pool, "no-human-room")
+    iris = await db.add_participant(pool, room.id, "agent", "Iris", None)
+    marcus = await db.add_participant(pool, room.id, "agent", "Marcus", None)
+    for i in range(4):
+        await db.insert_message(pool, room.id, str(marcus.id), f"agent chatter {i}")
+    for i in range(4):
+        await db.insert_message(pool, room.id, str(iris.id), f"agent chatter {i + 4}")
+
+    small = ScriptedChatModel()
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris.id, room.id)
+
+    assert result.outcome == "skipped"
+    assert small.calls == []
+    assert "loop cap" in (result.triage_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_second_human_message_resets_loop_cap(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """Every human resets the counter, not just the first one found."""
+    room = await db.create_room(pool, "two-humans")
+    ada = await db.add_participant(pool, room.id, "human", "Ada", None)
+    bob = await db.add_participant(pool, room.id, "human", "Bob", None)
+    iris = await db.add_participant(pool, room.id, "agent", "Iris", None)
+    marcus = await db.add_participant(pool, room.id, "agent", "Marcus", None)
+    for i in range(4):
+        await db.insert_message(pool, room.id, marcus.id, f"chatter {i}")
+    # Bob (the SECOND human) speaks: counter resets even though the
+    # first-human-only heuristic would have kept counting.
+    await db.insert_message(pool, room.id, str(bob.id), "keep going")
+    for i in range(3):
+        await db.insert_message(pool, room.id, marcus.id, f"more {i}")
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=False, reason="calm", response_mode="me")]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris.id, room.id)
+
+    assert result.outcome == "skipped"
+    assert len(small.calls) == 1
+    assert "loop cap" not in (result.triage_reason or "")
+
+    # And with Ada silent the whole time, her id never gates anything.
+    assert str(ada) != str(bob)
+
+
 # ── digest ───────────────────────────────────────────────────────────────
 
 
@@ -390,6 +513,31 @@ async def test_digest_endpoint_renders_transcript_claims_and_spend(
     assert "`t1:review` — held by **Jules**" in body
     assert "| triage | m-small | 1 | 10 | 2 |" in body
     assert "**110**" in body
+
+
+@pytest.mark.asyncio
+async def test_digest_escapes_pipe_and_newline_in_names(app_client: tuple) -> None:
+    """A name containing a pipe or newline must not corrupt the table."""
+    app, client = app_client
+    room = (await client.post("/rooms", json={"name": "pipe | room"})).json()
+    agent = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "agent", "name": "a | b"},
+        )
+    ).json()
+    await client.post(
+        f"/rooms/{room['id']}/messages",
+        json={"author_id": agent["id"], "body": "hello"},
+    )
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    # Exactly one table row for the message, with the pipe escaped.
+    assert "| 1 | a \\| b | hello |" in body
+    # The H1 title is not inside a table; the pipe stays literal there.
+    assert "# pipe | room" in body
 
 
 @pytest.mark.asyncio

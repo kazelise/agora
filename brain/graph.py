@@ -98,7 +98,7 @@ class BrainState(TypedDict, total=False):
     room_id: str
     inbox: list[InboxItem]
     author_names: dict[str, str]
-    human_id: str
+    human_ids: list[str]
     agent_count: int
     seen_seq: int
     triage_actionable: bool
@@ -118,9 +118,11 @@ class BrainState(TypedDict, total=False):
 def reply(body: str, send_anyway: bool = False) -> str:
     """Post your message to the room.
 
-    send_anyway bypasses a freshness HOLD — but only one the server has
-    actually shown you this turn (a HELD reply armed a token). Without a
-    token the flag does nothing and the gate still runs.
+    send_anyway acknowledges a freshness HOLD the server has actually
+    shown you this turn (a HELD reply armed a token). If the room moved
+    past the acknowledged state the ack is void — a fresh HOLD shows you
+    the truly-new rows, and you re-decide. Without a token the flag does
+    nothing and the gate still runs.
     """
     return body
 
@@ -409,18 +411,21 @@ class Brain:
 
     async def _triage(self, state: BrainState) -> dict[str, Any]:
         inbox = state.get("inbox") or []
-        human_id = state.get("human_id") or ""
         # Agent↔agent loop cap (deterministic backstop under the model
         # gate): an agent-only stretch past the cap is stale by COUNT, not
         # by wording — the one class of triage that is arithmetic, not
         # classification (Cumora §6 loop floors; this repo's rule that a
         # non-model short-circuit must be counting, never content). A
-        # human in the inbox resets everything: the model gate always runs
-        # there, because it also produces the response_mode the graph and
-        # HOLD guidance depend on.
+        # human message in the inbox resets everything: the model gate
+        # always runs there, because it also produces the response_mode
+        # the graph and HOLD guidance depend on. No humans at all is the
+        # MOST loop-prone shape, so the cap arms hardest there.
         agent_count = int(state.get("agent_count") or 0)
-        if agent_count > 0 and human_id:
-            since_human = sum(1 for m in inbox if str(m["author_id"]) != human_id)
+        human_ids = set(state.get("human_ids") or [])
+        if agent_count > 0:
+            since_human = sum(
+                1 for m in inbox if str(m["author_id"]) not in human_ids
+            )
             cap = AGENT_LOOP_CAP * agent_count
             if since_human >= cap:
                 logger.info(
@@ -545,6 +550,7 @@ class Brain:
         after: list[BaseMessage] = [*history, ai]
         claims = list(state.get("claims") or [])
         pending = ""
+        send_anyway = False
         for tc in getattr(ai, "tool_calls", None) or []:
             name = _tc_get(tc, "name")
             args = _tc_get(tc, "args") or {}
@@ -573,19 +579,24 @@ class Brain:
                 body = str(args.get("body") or "")
                 if body:
                     pending = body
-                    if _tc_get(args, "send_anyway"):
-                        state["send_anyway"] = True
+                    send_anyway = send_anyway or bool(_tc_get(args, "send_anyway"))
                     after.append(ToolMessage(content="queued", tool_call_id=call_id))
                 else:
                     after.append(ToolMessage(content="empty body ignored", tool_call_id=call_id))
             else:
                 after.append(ToolMessage(content=f"unknown tool {name}", tool_call_id=call_id))
 
+        # send_anyway must travel in the returned update: LangGraph copies
+        # channel state between nodes, so an in-place write to `state`
+        # never reaches `_freshness` (verified by a minimal two-node repro).
+        # Writing it every round both sets it on a flagged call and clears
+        # it afterwards, so a stale flag cannot leak into the next hop.
         update: dict[str, Any] = {
             "messages": after,
             "hop_count": hop,
             "claims": claims,
             "pending_reply": pending,
+            "send_anyway": send_anyway,
         }
         if pending:
             return update
@@ -668,20 +679,45 @@ class Brain:
     async def _freshness(self, state: BrainState) -> dict[str, Any]:
         # Cheap first check. The transactional insert is the invariant.
         room_id = UUID(state["room_id"])
+        agent_id = UUID(state["agent_id"])
         latest = await self.world.get_room_last_seq(room_id)
         seen = int(state["seen_seq"])
         if latest <= seen:
+            if state.get("send_anyway"):
+                # Nothing new since the HELD envelope: the ack spends here.
+                # Consuming (rather than leaving the token armed) closes
+                # Cumora's double-spend hole — a yielded token must not be
+                # reusable by a later turn's preemptive flag.
+                acked = await consume_hold(self._hold_redis, agent_id, room_id)
+                if acked is not None:
+                    logger.info(
+                        "send_anyway %s acked held state (token seq=%s, room unchanged)",
+                        state["agent_name"],
+                        acked,
+                    )
+                else:
+                    logger.info(
+                        "send_anyway %s no-op (room unchanged since last read)",
+                        state["agent_name"],
+                    )
+                return {"send_anyway": False}
             return {}
+        if state.get("send_anyway") and self._hold_redis is None:
+            # This process has no hold-token store (BYOA daemon / K8s job).
+            # Deliberate: the runtime 409 freshness path is their gate, and
+            # a flag with nothing to ack must never look like a pass.
+            logger.info(
+                "send_anyway %s ignored (no hold-token store in this process)",
+                state["agent_name"],
+            )
+            return {"send_anyway": False, **await self._hold(state, latest)}
         # send_anyway is an ACKNOWLEDGEMENT, not a free pass (Cumora §5d):
         # it works only if a prior HOLD this turn armed a token, and the
         # token is seq-bound — it acknowledges exactly the state that was
         # shown, so if the room has moved past it the ack is void and the
         # gate still runs (the fresh HOLD re-arms with the newer state).
         if state.get("send_anyway"):
-            acked = await consume_hold(
-                self._hold_redis, UUID(state["agent_id"]), room_id
-            )
-            state["send_anyway"] = False
+            acked = await consume_hold(self._hold_redis, agent_id, room_id)
             if acked is not None and acked >= latest:
                 logger.info(
                     "send_anyway %s accepted (hold token acked seq=%s, latest=%s)",
@@ -689,12 +725,13 @@ class Brain:
                     acked,
                     latest,
                 )
-                return {}
+                return {"send_anyway": False}
             logger.info(
                 "send_anyway %s ignored (%s) — gate still runs",
                 state["agent_name"],
                 "no hold token" if acked is None else f"token acked {acked} < latest {latest}",
             )
+            return {"send_anyway": False, **await self._hold(state, latest)}
         return await self._hold(state, latest)
 
     async def _commit(self, state: BrainState) -> dict[str, Any]:
@@ -787,9 +824,6 @@ class Brain:
 
         # Inbox is about to be shown to the model — high-water goes to Redis.
         await self.world.record_seen(agent_id, room_id, seen_seq)
-        human_id = next(
-            (str(p.id) for p in ctx.participants if p.kind == "human"), ""
-        )
         agent_count = sum(1 for p in ctx.participants if p.kind == "agent")
         initial: BrainState = {
             "agent_id": str(agent_id),
@@ -798,7 +832,9 @@ class Brain:
             "room_id": str(room_id),
             "inbox": inbox,
             "author_names": names,
-            "human_id": human_id,
+            "human_ids": sorted(
+                str(p.id) for p in ctx.participants if p.kind == "human"
+            ),
             "agent_count": agent_count,
             "seen_seq": seen_seq,
             "triage_actionable": False,
