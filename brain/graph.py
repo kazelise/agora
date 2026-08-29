@@ -264,14 +264,32 @@ async def invoke_model(
     *,
     label: str,
     pacer: Any | None = None,
+    limiter: Any | None = None,
 ) -> Any | None:
     """Call the model; retry once after a short backoff; None if both fail.
 
     When a pacer is given, every call start first waits for its slot; a
     rate-limited response doubles the global interval, clean calls restore
-    it. Fail-open: a dead relay is a missed reply, not a crashed turn. No
+    it. When a limiter is given, the call runs inside a concurrency slot —
+    a per-computer cap shared by BOTH model classes (Cumora §2/§3a: the
+    pacer spaces call starts, the semaphore bounds calls in flight; the
+    retry stays inside the same slot, it is the same logical call).
+    Fail-open: a dead relay is a missed reply, not a crashed turn. No
     caller should write a ledger row unless this returns a message.
     """
+    if limiter is not None:
+        async with limiter.slot():
+            return await _invoke_with_pacer(model, messages, label=label, pacer=pacer)
+    return await _invoke_with_pacer(model, messages, label=label, pacer=pacer)
+
+
+async def _invoke_with_pacer(
+    model: Any,
+    messages: list[Any],
+    *,
+    label: str,
+    pacer: Any | None,
+) -> Any | None:
     if pacer is not None:
         waited = await pacer.wait_turn()
         if waited:
@@ -333,6 +351,7 @@ class Brain:
         on_committed: Callable[[WorldMessage], Awaitable[None]] | None = None,
         hold_redis: Any | None = None,
         pacer: Any | None = None,
+        limiter: Any | None = None,
     ) -> None:
         self.small_model_name = policy.assert_triage_model(
             policy.small_model_name() if small_model_name is None else small_model_name
@@ -349,6 +368,9 @@ class Brain:
         # Optional AdaptivePacer (daemon-side): deterministic spacing between
         # LLM call starts plus exponential backoff on provider rate limits.
         self._pacer = pacer
+        # Optional ConcurrencyLimiter (daemon-side): per-computer cap on
+        # model calls in flight, shared by both model classes.
+        self._limiter = limiter
         # InMemorySaver: langgraph-checkpoint-postgres wants psycopg/libpq;
         # this repo is asyncpg-only. HOLD is an in-graph loop, so a durable
         # saver is not required for correctness. Swap via this arg later.
@@ -460,6 +482,7 @@ class Brain:
             [SystemMessage(content=prompt)],
             label="triage",
             pacer=self._pacer,
+            limiter=self._limiter,
         )
         if ai is None:
             return {
@@ -541,7 +564,9 @@ class Brain:
             history = [SystemMessage(content=_tool_prompt(state))]
 
         bound = self.big.bind_tools(TOOLS) if hasattr(self.big, "bind_tools") else self.big
-        ai = await invoke_model(bound, history, label="tool_loop", pacer=self._pacer)
+        ai = await invoke_model(
+            bound, history, label="tool_loop", pacer=self._pacer, limiter=self._limiter
+        )
         if ai is None:
             return {"outcome": "llm_error"}
         await self._ledger(state, "turn", ai)

@@ -108,6 +108,10 @@ uv run python -m daemon
 （上限 8s），连续干净调用再折半回落。可用 `AGORA_PACER_BASE_S` /
 `AGORA_PACER_MAX_S` 调整。
 
+pacer 错开的是起步时刻，不限制同时在飞的调用数——同一进程还有
+ConcurrencyLimiter 把在飞的模型调用封顶（默认 6，两层模型共用一个预算；
+配额紧张可降到 2–4）。可用 `AGORA_MAX_CONCURRENT` / `--max-concurrent` 调整。
+
 一条命令看完整故事（进程内拉起服务、配对、拉起 daemon 子进程、人提问、再杀掉 daemon）：
 
 ```bash

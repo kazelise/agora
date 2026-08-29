@@ -269,6 +269,16 @@ Agora 的对应物是 daemon 里的 `AdaptivePacer`（`daemon/pacer.py`）：
 
 刻意的边界：pacer 是**协调信号，不是正确性不变量**——它只加延迟，从不改变一轮的决策内容；Redis/DB 故障时的 fail-open 原则在这里的对应物是「识别不出限流就把异常当普通失败」，pacing 退化成空操作。服务端不感知 pacer：进给控制纯属 BYOA 宿主机与 provider 之间的私事，正如服务器看不到用户的 key。
 
+## Phase 6d：并发上限与 stall pipeline（借 Cumora §2/§3a、§5c）
+
+pacer 错开的是**起步时刻**，不限制**同时在飞的调用数**。七人广播房被同一次 fan-out 叫醒时，七个模型调用可以同时挂着，照样同步撞上 provider 的短窗突发限额（Cumora 现场观测：17 分钟 130 次限流）。Cumora 的 §2/§3a 补的是信号量：同一宿主机上最多 N 个模型调用在飞，且 **两层模型共用一个预算**——小模型 triage 和大模型 turn 从同一个 provider 账户扣费，只封一层只是把踩踏搬到另一层。
+
+Agora 的对应物是 `daemon/limiter.py` 的 `ConcurrencyLimiter`（默认 6，`AGORA_MAX_CONCURRENT` / `--max-concurrent` 可调），挂在 `invoke_model` 这个唯一咽喉上，triage 和 tool_loop 都过它；**重试持有同一个 slot**——重试是同一次逻辑调用，中途放号会让排队者插到别人两次尝试的中间。
+
+与 pacer 的分工：pacer 管时间（两次起步的最小间隔），limiter 管并发（同时在飞的调用数）。两个预算互不替代——Cumora 两个都跑，我们也一样。
+
+另一条腿是**活性**：Agora 的 turn 全是反应式的（有消息才有叫醒），claim 赢家认栽释放后房间一旦沉默就永久饿死。`server/stall.py` 的 `StallSweeper`（借 Cumora §5c 的 stall pipeline + decline cap）补上这条腿，详见其 docstring 与 README；核心约束与 verbatim-dup、loop cap 一致：资格判定是算术（年龄 / 作者 / 读位），不是内容分类，nudge 之后的去留由 brain 在 turn 里自己决定。
+
 ## Phase 6c：stall pipeline——被动叫醒之外的活性腿（借 Cumora §5c）
 
 Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生。这留下一个活性缺口——claim 赢家被 nudge 一次、认栽并 `release_claim` 之后，房间陷入沉默，**没有任何机制会再叫醒任何人**：欠着的回复没人补，房间饿死。Cumora 的 §5c 补的就是这条腿：房间安静下来但「有人欠话」时，一个周期 sweep 主动叫醒恰好的那一个人。
