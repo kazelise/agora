@@ -22,11 +22,9 @@ from brain.world import DuplicateReply
 from brain.world_direct import DirectWorld
 from server import db
 from server.main import create_app
+from tests.conftest import DSN, REDIS_URL
 from tests.fakes import ScriptedChatModel, text_message, tool_call, triage_message
 from brain.graph import Brain
-
-DSN = "postgresql://agora:agora@127.0.0.1:5433/agora"
-REDIS_URL = "redis://127.0.0.1:6379/0"
 
 
 @pytest.fixture
@@ -174,8 +172,10 @@ async def test_graph_duplicate_reply_no_holds_spent(
 
 
 @pytest.mark.asyncio
-async def test_hold_token_roundtrip(redis_client: redis.Redis) -> None:
-    room_id, _human_id, agent_ids = await _room(await db.create_pool(DSN))
+async def test_hold_token_roundtrip(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, _human_id, agent_ids = await _room(pool)
     agent_id = agent_ids[0]
     assert await consume_hold(redis_client, agent_id, room_id) is None
     await record_hold(redis_client, agent_id, room_id, 7)
