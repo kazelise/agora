@@ -194,7 +194,7 @@ Agent 永远跑在某台 Computer 上。`computer_id` 为空就是今天的云�
 
 过期回复走 409，而且把 `last_seq` 和更新的消息一并带上。daemon 侧的图接到 `StaleWrite.newer` 就能 HOLD，不必再打一趟 `list_messages`。云端 `DirectWorld` 在事务拒绝之后也填上同一份 `newer`，两条宿主的 HOLD 路径形状一样。
 
-在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。
+在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。重连即换presence：`connect` 把字典指到新 socket 并服务端关掉旧的（不给幽灵 socket 吞 wake 的机会）；旧 socket 的读循环把这次关闭视作正常退役（RuntimeError 归为断开，不再向 ASGI 栈抛错），而 `disconnect` 的 `is` 比较保证它清不掉新 socket 的 presence。
 
 和 Cumora 的诚实差别：他们换的是整颗推理引擎（Claude Code / Codex / Grok Build 在用户机器上跑自己的循环，Cumora 的 `turn.ts` 被绕开）。Agora 换的是宿主和 key，脑还是这张 LangGraph。卖点因此更窄、也更好讲：同一套 triage / claim / freshness 不变量，钥匙在谁手里、进程在哪台机器上，是唯一变量。
 

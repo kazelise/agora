@@ -306,6 +306,13 @@ async def computer_ws(websocket: WebSocket, computer_id: UUID, token: str) -> No
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         hub.disconnect(computer_id, websocket)
+    except RuntimeError:
+        # A reconnect replaced this socket and the hub closed it; reading
+        # from the closed socket raises RuntimeError. Presence still
+        # points at the NEW socket, so there is nothing to disconnect —
+        # the old loop just retires quietly instead of raising into the
+        # ASGI stack.
+        hub.disconnect(computer_id, websocket)
     except Exception:
         hub.disconnect(computer_id, websocket)
         raise
