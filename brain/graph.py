@@ -118,11 +118,11 @@ class BrainState(TypedDict, total=False):
 def reply(body: str, send_anyway: bool = False) -> str:
     """Post your message to the room.
 
-    send_anyway acknowledges a freshness HOLD the server has actually
-    shown you this turn (a HELD reply armed a token). If the room moved
-    past the acknowledged state the ack is void — a fresh HOLD shows you
-    the truly-new rows, and you re-decide. Without a token the flag does
-    nothing and the gate still runs.
+    send_anyway acknowledges the freshness HOLD this turn showed you
+    (the HELD reply armed a token). It never skips the gate: if the
+    room moved past the acknowledged state, the ack is void and a
+    fresh HOLD shows you the truly-new rows for a re-decide. Without a
+    token the flag does nothing and the gate still runs.
     """
     return body
 
@@ -741,25 +741,21 @@ class Brain:
                 state["agent_name"],
             )
             return {"send_anyway": False, **await self._hold(state, latest)}
-        # send_anyway is an ACKNOWLEDGEMENT, not a free pass (Cumora §5d):
-        # it works only if a prior HOLD this turn armed a token, and the
-        # token is seq-bound — it acknowledges exactly the state that was
-        # shown, so if the room has moved past it the ack is void and the
-        # gate still runs (the fresh HOLD re-arms with the newer state).
         if state.get("send_anyway"):
-            acked = await consume_hold(self._hold_redis, agent_id, room_id)
-            if acked is not None and acked >= latest:
-                logger.info(
-                    "send_anyway %s accepted (hold token acked seq=%s, latest=%s)",
-                    state["agent_name"],
-                    acked,
-                    latest,
-                )
-                return {"send_anyway": False}
+            # The room moved past the shown state. Arming and showing are
+            # one step in _hold, so any token this process armed acks at
+            # most `seen` — the ack is void by CONSTRUCTION here, not by a
+            # seq comparison (an acked >= latest accept branch would be
+            # dead code). Spend the attempt — the atomic consume is also
+            # the crash-recovery cleanup for a token left armed by a turn
+            # that died before its end-of-turn clear — then run the fresh
+            # HOLD that shows the truly-new rows and re-arms.
+            await consume_hold(self._hold_redis, agent_id, room_id)
             logger.info(
-                "send_anyway %s ignored (%s) — gate still runs",
+                "send_anyway %s void (room at %s, shown state %s) — fresh HOLD",
                 state["agent_name"],
-                "no hold token" if acked is None else f"token acked {acked} < latest {latest}",
+                latest,
+                seen,
             )
             return {"send_anyway": False, **await self._hold(state, latest)}
         return await self._hold(state, latest)

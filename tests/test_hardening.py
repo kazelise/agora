@@ -203,12 +203,23 @@ async def test_consume_hold_fail_closed_when_redis_down(
 
 @pytest.mark.asyncio
 async def test_send_anyway_without_token_does_not_bypass(
-    pool: asyncpg.Pool, redis_client: redis.Redis
+    pool: asyncpg.Pool, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pre-emptive send_anyway is ignored: the gate still HOLDs."""
+    """Pre-emptive send_anyway is ignored: the gate still HOLDs, and the
+    preemptive flag never touches the token store (no consume, no skip)."""
     room_id, human_id, agent_ids = await _room(pool)
     iris_id, marcus_id = agent_ids
     await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    consumed: list[int | None] = []
+    _real_consume = consume_hold
+
+    async def spy_consume(client: object, agent_id: UUID, room_id: UUID) -> int | None:
+        result = await _real_consume(client, agent_id, room_id)
+        consumed.append(result)
+        return result
+
+    monkeypatch.setattr("brain.graph.consume_hold", spy_consume)
 
     async def peer_first(_messages: list) -> object:
         await db.insert_message(pool, room_id, marcus_id, "3")
@@ -229,11 +240,14 @@ async def test_send_anyway_without_token_does_not_bypass(
 
     assert result.hold_count == 1
     assert result.reply_body == "4"
+    # The preemptive flag consumed NOTHING: the void path found no token
+    # (None — nothing to spend, ack refused) and armed no authority.
+    assert consumed == [None]
 
 
 @pytest.mark.asyncio
 async def test_send_anyway_with_token_bypasses_hold(
-    pool: asyncpg.Pool, redis_client: redis.Redis
+    pool: asyncpg.Pool, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """HELD once → token armed; the retry with send_anyway ships without
     a second HOLD — the legitimate flow, and one that only works while
@@ -241,6 +255,16 @@ async def test_send_anyway_with_token_bypasses_hold(
     room_id, human_id, agent_ids = await _room(pool)
     iris_id, marcus_id = agent_ids
     await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    consumed: list[int | None] = []
+    _real_consume = consume_hold
+
+    async def spy_consume(client: object, agent_id: UUID, room_id: UUID) -> int | None:
+        result = await _real_consume(client, agent_id, room_id)
+        consumed.append(result)
+        return result
+
+    monkeypatch.setattr("brain.graph.consume_hold", spy_consume)
 
     async def peer_first(_messages: list) -> object:
         await db.insert_message(pool, room_id, marcus_id, "3")
@@ -280,11 +304,16 @@ async def test_send_anyway_with_token_bypasses_hold(
         iris_id,
         "3, going with 4",
     )
+    # The ack was REAL: the flagged reply spent the token the HOLD armed.
+    # (The mutation "flag never reaches the gate" kills this — consume
+    # never fires — and the mutation "token never armed" kills the
+    # roundtrip assertion upstream.)
+    assert consumed == [2]
 
 
 @pytest.mark.asyncio
 async def test_send_anyway_with_stale_token_re_holds(
-    pool: asyncpg.Pool, redis_client: redis.Redis
+    pool: asyncpg.Pool, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Cumora §5d seq binding: the room moved past the acknowledged state,
     so the ack is void — the gate runs a fresh HOLD (showing the truly-new
@@ -292,6 +321,16 @@ async def test_send_anyway_with_stale_token_re_holds(
     room_id, human_id, agent_ids = await _room(pool)
     iris_id, marcus_id = agent_ids
     await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    consumed: list[int | None] = []
+    _real_consume = consume_hold
+
+    async def spy_consume(client: object, agent_id: UUID, room_id: UUID) -> int | None:
+        result = await _real_consume(client, agent_id, room_id)
+        consumed.append(result)
+        return result
+
+    monkeypatch.setattr("brain.graph.consume_hold", spy_consume)
 
     async def peer_first(_messages: list) -> object:
         await db.insert_message(pool, room_id, marcus_id, "3")
@@ -336,6 +375,10 @@ async def test_send_anyway_with_stale_token_re_holds(
     assert result.hold_count == 2
     stored = await db.list_messages(pool, room_id)
     assert [(m.author_id, m.body) for m in stored][-1] == (iris_id, "4 then")
+    # The flagged retry SPENT the stale token@2 before the fresh HOLD
+    # re-armed at 3 — the ack was consumed, not silently ignored, and the
+    # second flagged reply spent the re-armed token@3.
+    assert consumed == [2, 3]
 
 
 @pytest.mark.asyncio
