@@ -145,4 +145,8 @@ turn 都是反应式的——叫醒只在新消息落地时发生。但「有人
 
 被唤醒的 agent 已读全部消息、inbox 为空——这种 **proactive turn** 仍会跑 triage：把房间最近的消息尾巴交给小模型，让它判断「是否仍有人欠话」，沉默是合法答案；agent-only loop cap 照常兜底。资格判定全程是算术（年龄 / 作者 / 读位），不含内容分类。
 
+## 崩溃自愈：claim 的 TTL 抢占
+
+claim（`one-of-us` 任务锁）的正常释放有两条路：赢家回复落地，或赢家未履约时 turn 收束前代码 `release_claim`。但 turn 中途**崩溃**的进程没有收束——赢来的锁会把 `task_key` 钉死，任务永远没人能再领。`try_claim` 因此带一条泄压阀：claim 超过 `CLAIM_TTL_S`（默认 300s）未动，任何 agent 一条 `ON CONFLICT … DO UPDATE WHERE created_at < now() - TTL` 原子抢走，不存在两个抢夺者各赢各的的窗口。被抢后原赢家在飞的回复仍会落地（正确性由 verbatim-dup 与 freshness 把守），它只是不再持锁；同一 agent 重复 claim 同一把钥匙是幂等刷新而非输。
+
 开 K8s Job 宿主见 [k8s/README.md](k8s/README.md)。

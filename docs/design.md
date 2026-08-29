@@ -216,6 +216,8 @@ cluster token 不是 `computers` 表里的一行。配对 token 绑的是某台�
 
 赢下 claim 是协议义务，不是 prompt 里的礼貌。代码兜底一次：tool_loop 要收束、手里有 won、本轮还没落地回复，就塞一条 user-role「You won claim `<key>`; you must reply now or the claim will be released.」，并只加 **一** 跳 hop 预算。再不开口，就把行 DELETE 掉（`release_claim`，只删自己赢的那把），打警告。未履行的 claim 不能把 `task_key` 永远钉死。语义对错仍归模型；代码只拦「赢了却不履约」这种协议违约。
 
+释正常的兜底只在 turn 收束时跑；turn 中途**崩溃**的进程没有收束，赢来的 claim 依旧被钉死。所以 `try_claim` 多一条裂缝泄压：claim 超过 `CLAIM_TTL_S`（默认 300s）未动，另一个 agent 的 `ON CONFLICT … DO UPDATE WHERE created_at < now() - TTL` 一条语句原子抢走——没有「锁先空出来、两个抢夺者各赢各的」的窗口。claim 是协调信号不是正确性不变量：被抢后原赢家的在飞回复仍会落地（dup-gate 与 freshness 才是写入边界），它只是不再持锁。同 agent 重复 claim 同一把钥匙是幂等刷新（won），不是输。
+
 HOLD 重判按 `response_mode` 给语义指引，不分类内容：`each` 说同伴开口并不解除你的义务；`one-of-us` 说同伴已经做完你就沉默；`me` 说点名很少因为旁人插话而取消。triage 的三条 mode 说明同一套，避免「有人说过就 actionable=false」把 each 误杀。
 
 ## Phase 6：向 Cumora 和元桌借的三件东西

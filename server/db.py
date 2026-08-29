@@ -462,6 +462,20 @@ async def get_room_last_seq(pool: asyncpg.Pool, room_id: UUID) -> int:
     return int(value)
 
 
+CLAIM_TTL_S = 300.0
+"""Claims older than this may be stolen by another agent.
+
+A claim is a coordination signal, not a correctness invariant: its only
+job is to keep two agents from doing the same task concurrently. The
+normal leak valves are in-graph (the obligation nudge, the end-of-turn
+release), but a process that crashes mid-turn leaves its won claim
+pinned forever — release_claim only runs at the end of a turn. After
+the TTL another agent may steal it atomically; the old winner's in-flight
+reply, if any, still lands (dup-gate and freshness gate remain the
+correctness boundary), it just no longer holds the lock.
+"""
+
+
 async def try_claim(
     pool: asyncpg.Pool,
     room_id: UUID,
@@ -472,13 +486,18 @@ async def try_claim(
         """
         INSERT INTO claims (id, room_id, task_key, claimed_by)
         VALUES ($1, $2, $3, $4)
-        ON CONFLICT (room_id, task_key) DO NOTHING
+        ON CONFLICT (room_id, task_key) DO UPDATE
+            SET claimed_by = EXCLUDED.claimed_by,
+                created_at = EXCLUDED.created_at
+            WHERE claims.claimed_by = EXCLUDED.claimed_by
+               OR claims.created_at < now() - make_interval(secs => $5)
         RETURNING id
         """,
         uuid4(),
         room_id,
         task_key,
         claimed_by,
+        CLAIM_TTL_S,
     )
     return row is not None
 

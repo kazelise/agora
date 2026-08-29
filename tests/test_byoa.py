@@ -169,7 +169,9 @@ async def test_http_world_claim_and_llm_call_row(harness: Harness) -> None:
     world.bind_actor(agent_id)
 
     assert await world.try_claim(room_id, "t1", agent_id) is True
-    assert await world.try_claim(room_id, "t1", agent_id) is False
+    # Same holder re-claiming is an idempotent refresh, not a loss
+    # (cross-agent conflict is tested in tests/test_claims.py).
+    assert await world.try_claim(room_id, "t1", agent_id) is True
 
     await world.record_llm_call(
         agent_id, room_id, "gpt-test", 11, 5, "turn"
