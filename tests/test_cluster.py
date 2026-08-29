@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
+import redis.asyncio as redis
 from fastapi import FastAPI
 
 from server.db import truncate_all
 from server.main import create_app
+from server.scheduler import ClusterAgentLane
 from tests.asgi_ws import connect_asgi_ws
+from tests.conftest import REDIS_URL
 
 
 class Pair:
@@ -177,3 +180,32 @@ async def test_byoa_wake_reaches_socket_on_the_other_worker(pair: Pair) -> None:
         }
     finally:
         await ws.close()
+
+
+@pytest.mark.asyncio
+async def test_cluster_lane_coalesces_across_workers(require_services: None) -> None:
+    client = redis.from_url(REDIS_URL, decode_responses=True)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    runs = 0
+
+    async def stub(_agent_id, _room_id) -> None:
+        nonlocal runs
+        runs += 1
+        started.set()
+        await release.wait()
+
+    try:
+        owner = ClusterAgentLane(client, "wa", stub)
+        other = ClusterAgentLane(client, "wb", stub)
+        agent_id, room_id = uuid4(), uuid4()
+        await owner.notify(room_id, agent_id)
+        await started.wait()
+        for _ in range(4):
+            await other.notify(room_id, agent_id)
+        release.set()
+        await owner.wait_idle()
+        await other.wait_idle()
+        assert runs == 2
+    finally:
+        await client.aclose()

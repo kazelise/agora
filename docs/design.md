@@ -236,7 +236,9 @@ JWT 自己用 HMAC-SHA256 签，不引入第三方面包。过期看 `exp`。房
 2. **车道锁 + dirty。** 和进程内 `AgentLane` 同一句话，锁在 Redis。后到的 seq 打脏标记，持锁的人 rerun-once。
 3. **广播出进程。** 房间消息发 `agora:messages`，宿主叫醒发 `agora:host-wake`。有套接字的 worker 才 `send_json`。presence 的值是 worker id，断线只删自己写下的那把，避免把刚迁走的 Computer 标成离线。
 
-单进程也走这条路，所以 1 worker 和 N worker 的形状一样。测试是两台 `create_app` 对着同一份 Redis。
+单进程也走这条路，所以 1 worker 和 N worker 的形状一样。测试是两台 `create_app` 对着同一份 Redis；车道合并另有一条跨 worker dirty 的单测。bus 上的 Redis 错误和 seen-cursor 同一条：不 raise，认领当 miss。
+
+仓库用 GitHub Actions 跑 `-m "not llm"`。这不是新阶段——正确性不变量已经在测试里，CI 只是让它们在每条 PR 上自己跑。`-m llm` 仍要真中继，留在本机。
 
 ## 安全性与活性
 
