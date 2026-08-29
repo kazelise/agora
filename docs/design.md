@@ -118,10 +118,11 @@ flowchart LR
 
 - **Phase 0–1：** 地基、设计文档、消息流、叫醒调度、测试。
 - **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
-- **Phase 3（本仓库现在）：** 提交时事务内新鲜度校验；`task_key` 锚定到触发消息的 seq；计数游戏 / one-of-us 两条真模型协调测试。
+- **Phase 3：** 提交时事务内新鲜度校验；`task_key` 锚定到触发消息的 seq；计数游戏 / one-of-us 两条真模型协调测试。
 - **Phase 4b：** Computer 作为一等宿主；同一张图通过 `World` 接口换宿主；BYOA daemon 用自己的 key 跑，服务端零持有密钥。
 - **Phase 4c：** `computer_id` 为空的云端 turn 可以交给 Kubernetes Job；同一张图、HttpWorld、cluster token；车道仍在服务端合并叫醒。未开 k8s 时行为与 Phase 4b 完全一样。
-- **Phase 4a（本仓库现在）：** GitHub OAuth 换成 JWT；房间 / Computer 归登录用户；两套凭据（人的 JWT vs 宿主 token）互不顶替。未配置 client id 时准入关闭。
+- **Phase 4a：** GitHub OAuth 换成 JWT；房间 / Computer 归登录用户；两套凭据（人的 JWT vs 宿主 token）互不顶替。未配置 client id 时准入关闭。
+- **Phase 5（本仓库现在）：** Redis presence、房间/宿主 fan-out、跨 worker 的 per-agent 车道锁。单实例字典不再是隐式前提。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
 
@@ -194,7 +195,7 @@ Agent 永远跑在某台 Computer 上。`computer_id` 为空就是今天的云�
 
 过期回复走 409，而且把 `last_seq` 和更新的消息一并带上。daemon 侧的图接到 `StaleWrite.newer` 就能 HOLD，不必再打一趟 `list_messages`。云端 `DirectWorld` 在事务拒绝之后也填上同一份 `newer`，两条宿主的 HOLD 路径形状一样。
 
-在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。
+套接字仍在接住它的那个 worker 上。在线状态、房间广播、宿主叫醒和 per-agent 车道锁都在 Redis 里，所以另一台 worker 看得见 Computer、收得到消息、不会把同一记叫醒跑成两轮 turn。`GET /computers` 仍允许用 `last_seen_at` 做 30 秒宽限；叫醒路由先问 Redis presence，没有再打 `agent <name> is sleeping (computer offline)`。Redis 挂了 fail-open：少一轮或少一帧，不挡 INSERT。
 
 和 Cumora 的诚实差别：他们换的是整颗推理引擎（Claude Code / Codex / Grok Build 在用户机器上跑自己的循环，Cumora 的 `turn.ts` 被绕开）。Agora 换的是宿主和 key，脑还是这张 LangGraph。卖点因此更窄、也更好讲：同一套 triage / claim / freshness 不变量，钥匙在谁手里、进程在哪台机器上，是唯一变量。
 
@@ -202,7 +203,7 @@ Agent 永远跑在某台 Computer 上。`computer_id` 为空就是今天的云�
 
 Phase 4b 把云端 turn 留在 API 进程里（`DirectWorld`）。那是开发默认，不是架构终点。进程内宿主和 API 同生死：一次卡住的模型调用堵住一条车道还好，堵的是 uvicorn 的 event loop 就糟了。K8s Job 把云端 turn 挪出那个进程，同时保持「换宿主 = 换运输层」。
 
-Job 用 `HttpWorld`，不用 `DirectWorld`。Job 里直接写库会跳过 `RoomHub` 的 WebSocket 广播——presence 还是进程内字典。走 `/runtime/reply`，fan-out 仍在服务端，和 BYOA 同一条路径。Job 因此也不需要 Postgres / Redis 凭据。
+Job 用 `HttpWorld`，不用 `DirectWorld`。Job 里直接写库会跳过服务端 fan-out（`agora:messages` / 叫醒）。走 `/runtime/reply`，广播仍在服务端，和 BYOA 同一条路径。Job 因此也不需要 Postgres / Redis 凭据。
 
 cluster token 不是 `computers` 表里的一行。配对 token 绑的是某台笔记本；cluster token 是服务端签发的服务凭据，只允许 `computer_id IS NULL` 的 Agent。它不能冒充 BYOA Agent，BYOA token 也不能冒充云端 Agent。两条宿主的授权是对称的。
 
@@ -224,6 +225,18 @@ OAuth 要拦的是「谁能建房、谁能配对 Computer」，不是「谁能�
 JWT 自己用 HMAC-SHA256 签，不引入第三方面包。过期看 `exp`。房间 WebSocket 不能带头，所以 token 走 `access_token` 查询参数；那是传输限制，不是第二套身份。
 
 未设 `AGORA_GITHUB_CLIENT_ID` 时整层关掉。`created_by` 为 NULL，现有测试和 `demo_*.py` 不用改。这是显式的开发模式，不是漏网。
+
+## Phase 5：多 worker 不是第二套调度
+
+`agora:wake` 每个 worker 都订。两台机器各自 `dispatch`，云端车道会跑两遍，BYOA 会推两次，房间 WebSocket 只在发消息的那台机器上亮。单实例字典把这个藏起来了。
+
+三件事都是协调信号，规则和 seen-cursor 一样——Redis 错了就少一次，不要变成正确性锁：
+
+1. **`(agent_id, seq)` 认领。** `SET NX`。同一条消息只有一个 worker 继续。丢认领 = 少一轮。
+2. **车道锁 + dirty。** 和进程内 `AgentLane` 同一句话，锁在 Redis。后到的 seq 打脏标记，持锁的人 rerun-once。
+3. **广播出进程。** 房间消息发 `agora:messages`，宿主叫醒发 `agora:host-wake`。有套接字的 worker 才 `send_json`。presence 的值是 worker id，断线只删自己写下的那把，避免把刚迁走的 Computer 标成离线。
+
+单进程也走这条路，所以 1 worker 和 N worker 的形状一样。测试是两台 `create_app` 对着同一份 Redis。
 
 ## 安全性与活性
 

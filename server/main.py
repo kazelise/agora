@@ -62,18 +62,34 @@ def create_app(
         subscriber = redis.from_url(cfg.redis_url, decode_responses=True)
         await publisher.ping()
 
+        worker_id = secrets.token_hex(8)
         hub = RoomHub()
-        computers = ComputerHub()
+        computers = ComputerHub(redis_client=publisher, worker_id=worker_id)
         launcher = job_launcher
         if stub_turns:
-            scheduler = Scheduler(pool, computers=computers)
+            scheduler = Scheduler(
+                pool,
+                computers=computers,
+                redis_client=publisher,
+                worker_id=worker_id,
+            )
         elif run_turn is not None:
-            scheduler = Scheduler(pool, run_turn=run_turn, computers=computers)
+            scheduler = Scheduler(
+                pool,
+                run_turn=run_turn,
+                computers=computers,
+                redis_client=publisher,
+                worker_id=worker_id,
+            )
         elif launcher is not None or cfg.k8s_enabled:
             if launcher is None:
                 launcher = K8sJobLauncher.from_settings(cfg)
             scheduler = Scheduler(
-                pool, run_turn=launcher.run_turn, computers=computers
+                pool,
+                run_turn=launcher.run_turn,
+                computers=computers,
+                redis_client=publisher,
+                worker_id=worker_id,
             )
         else:
             from brain.graph import make_turn_fn
@@ -85,11 +101,17 @@ def create_app(
                 pool,
                 run_turn=make_turn_fn(pool, publisher, on_committed=on_committed),
                 computers=computers,
+                redis_client=publisher,
+                worker_id=worker_id,
             )
 
         ready = asyncio.Event()
         stop = asyncio.Event()
-        task = asyncio.create_task(run_subscriber(subscriber, scheduler, ready, stop))
+        task = asyncio.create_task(
+            run_subscriber(
+                subscriber, scheduler, ready, stop, hub=hub, computers=computers
+            )
+        )
         await ready.wait()
 
         app.state.settings = cfg
@@ -99,6 +121,7 @@ def create_app(
         app.state.hub = hub
         app.state.computers = computers
         app.state.job_launcher = launcher
+        app.state.worker_id = worker_id
         github_client = github
         github_http: httpx.AsyncClient | None = None
         if github_client is None and cfg.auth_enabled:
@@ -199,7 +222,7 @@ def register_routes(app: FastAPI) -> None:
                 name=row.name,
                 created_at=row.created_at,
                 last_seen_at=row.last_seen_at,
-                online=hub.listed_online(row.id, row.last_seen_at),
+                online=await hub.listed_online(row.id, row.last_seen_at),
                 created_by=row.created_by,
             )
             for row in rows

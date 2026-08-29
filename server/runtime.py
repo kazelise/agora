@@ -289,9 +289,10 @@ async def computer_ws(websocket: WebSocket, computer_id: UUID, token: str) -> No
             raw = await websocket.receive_json()
             if isinstance(raw, dict) and raw.get("type") == "ping":
                 await db.touch_computer(app.state.pool, computer_id)
+                await hub.touch(computer_id)
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
-        hub.disconnect(computer_id, websocket)
+        await hub.disconnect(computer_id, websocket)
     except Exception:
-        hub.disconnect(computer_id, websocket)
+        await hub.disconnect(computer_id, websocket)
         raise
