@@ -54,8 +54,12 @@ def create_app(
         hub = RoomHub()
         computers = ComputerHub()
 
-        async def wake_agent(agent_id: UUID, room_id: UUID) -> None:
-            await scheduler_lane_notify(agent_id, room_id)
+        async def wake_room(room_id: UUID, nominal_author_id: UUID) -> None:
+            # Stall nudges ride the same path as a landed message: host
+            # routing (lane / BYOA ws / K8s) and author exclusion come from
+            # dispatch. Waking a single agent's server-side lane here would
+            # run BYOA agents' brains on the server instead of their host.
+            await scheduler.dispatch(room_id, nominal_author_id)
 
         # Liveness leg: rooms that went quiet with work owed get one
         # deterministic nudge per sweep window, capped per stall. Fail-open
@@ -64,7 +68,7 @@ def create_app(
         # message resets its decline budget via fanout.
         stalls = StallSweeper(
             pool,
-            wake_agent,
+            wake_room,
             interval_s=cfg.stall_interval_s,
             min_s=cfg.stall_min_s,
             max_s=cfg.stall_max_s,
@@ -103,9 +107,6 @@ def create_app(
                 ),
                 computers=computers,
             )
-
-        async def scheduler_lane_notify(agent_id: UUID, room_id: UUID) -> None:
-            await scheduler.lane(agent_id).notify(room_id, agent_id)
 
         stalls.start()
 

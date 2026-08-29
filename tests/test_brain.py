@@ -102,6 +102,144 @@ async def test_empty_inbox_makes_zero_llm_calls(
 
 
 @pytest.mark.asyncio
+async def test_proactive_turn_shows_room_tail_to_triage_and_declines(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """A stall nudge wakes an agent whose inbox is EMPTY (it read
+    everything). The turn must still consult triage with the room's
+    recent tail — and triage declining ends the turn without a reply.
+
+    This is the contract the stall pipeline stands on: without it the
+    nudge is a no-op (outcome=empty, zero LLM calls) and the pipeline
+    can never revive anything."""
+    room_id, human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "please summarize the spec")
+    await db.insert_message(pool, room_id, marcus_id, "on it")
+    # Iris read everything but never replied — the stalled shape.
+    await db.set_last_read(pool, iris_id, room_id, 2)
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=False, reason="marcus is on it", response_mode="each")]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "skipped"
+    assert len(small.calls) == 1
+    assert big.calls == []
+    prompt = " ".join(
+        str(getattr(m, "content", "")) for m in small.calls[0]
+    )
+    # The triage prompt shows the room TAIL as evidence, plus the
+    # proactive framing that silence is allowed.
+    assert "please summarize the spec" in prompt
+    assert "on it" in prompt
+    assert "gone quiet" in prompt
+    # And the decline does not spend an LLM ledger row for the big model.
+    rows = await _calls(pool, room_id)
+    assert [r["purpose"] for r in rows] == ["triage"]
+
+
+@pytest.mark.asyncio
+async def test_proactive_turn_triage_yes_replies(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """Same shape, but triage says speak: the reply lands at the room's
+    current high-water mark (nothing raced it)."""
+    room_id, human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, _marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "please summarize the spec")
+    await db.set_last_read(pool, iris_id, room_id, 1)
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="asked me", response_mode="me")]
+    )
+    big = ScriptedChatModel([tool_call("reply", {"body": "spec: 3 points"})])
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "replied"
+    assert result.reply_body == "spec: 3 points"
+    stored = await db.list_messages(pool, room_id)
+    assert stored[-1].author_id == iris_id
+    assert stored[-1].seq == 2
+
+
+@pytest.mark.asyncio
+async def test_proactive_room_with_no_history_stays_empty(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """A nudge to a room that has NO messages at all (sweeper requires a
+    reader >= room seq, so this is belt-and-braces) still short-circuits
+    without an LLM call — there is nothing to judge."""
+    room_id, _human_id, agent_ids = await _room(pool)
+    small = ScriptedChatModel()
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(agent_ids[0], room_id)
+
+    assert result.outcome == "empty"
+    assert small.calls == []
+    assert big.calls == []
+
+
+@pytest.mark.asyncio
+async def test_proactive_turn_under_loop_cap_still_runs_triage(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """Under the deterministic agent-only loop cap, a proactive turn is
+    NOT short-circuited: triage runs and its decline ends the turn."""
+    room_id, _human_id, agent_ids = await _room(pool, agents=1)
+    iris_id = agent_ids[0]
+    await db.insert_message(pool, room_id, iris_id, "talking to myself")
+    await db.set_last_read(pool, iris_id, room_id, 1)
+
+    # stretch = 1 agent message, cap = 4 x 1 → under the cap.
+    small = ScriptedChatModel(
+        [triage_message(actionable=False, reason="nothing owed", response_mode="me")]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "skipped"
+    assert len(small.calls) == 1
+    assert big.calls == []
+
+
+@pytest.mark.asyncio
+async def test_proactive_turn_past_loop_cap_skips_without_llm(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """Past the cap, even a proactive turn is deterministically silent —
+    nudges cannot keep an agent-only circle spinning forever."""
+    room_id, _human_id, agent_ids = await _room(pool, agents=1)
+    iris_id = agent_ids[0]
+    # stretch = 5 agent messages > cap (4 x 1). The last message is read.
+    for i in range(5):
+        await db.insert_message(pool, room_id, iris_id, f"circle {i}")
+    await db.set_last_read(pool, iris_id, room_id, 5)
+
+    small = ScriptedChatModel()
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "skipped"
+    assert small.calls == []
+    assert big.calls == []
+    rows = await _calls(pool, room_id)
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_freshness_hold_then_different_reply(
     pool: asyncpg.Pool, redis_client: redis.Redis
 ) -> None:

@@ -3,18 +3,19 @@
 Agora's turns are reactive — a wake happens only when a message lands.
 Cumora's §5c adds the missing liveness leg: when a room is stalled (the
 latest message is from a peer an agent owes a reply to, and nobody has
-spoken for a while), a periodic sweep picks EXACTLY ONE agent and wakes
-it. Without this, a released claim + a silent room is a deadlock nobody
-ever wakes from.
+spoken for a while), a periodic sweep nudges the room's NON-author agents
+through the same dispatch path a real message takes. Without this, a
+released claim + a silent room is a deadlock nobody ever wakes from.
 
-Design constraints (from this repo's layered principles):
+    Design constraints (from this repo's layered principles):
 - The sweep is DETERMINISTIC: eligibility is arithmetic on committed rows
   (who spoke last, how long ago, who has read what). It never classifies
-  content. The brain still decides what, if anything, to say.
-- Exactly one agent is nudged per stall, chosen deterministically
-  (oldest-participant first among eligible agents). No NX claim needed:
-  the scheduler's per-agent lane already serializes turns, and the
-  Redis-pubsub topology means exactly one process runs the sweep.
+  content. The brain still decides what, if anything, to say — including
+  whether silence is the right reply on a proactive turn.
+- Nudges travel through dispatch (room_id + nominal author), so BYOA
+  computers and K8s jobs are woken over their own transports. Routing the
+  nudge into a server-side brain lane would silently strip a BYOA agent
+  of its model boundary.
 - A per-room decline cap bounds the burn: if the nudged agents keep
   declining (turns end without a new message), the sweep stops after
   STALL_MAX_NUDGES attempts until ANY new message lands (state changed,
@@ -42,9 +43,12 @@ STALL_MAX_NUDGES = 3
 # How often the sweep runs.
 SWEEP_INTERVAL_S = 10.0
 
-# WakeFn(agent_id, room_id) — matches Scheduler.lane(...).notify(room, agent)
-# arity after binding; the sweeper always calls with the agent first.
-WakeFn = Callable[[UUID, UUID], Awaitable[None]]
+# NudgeFn(room_id, author_id) — the same arity as Scheduler.dispatch. The
+# sweeper names the LAST AUTHOR as the nominal "message sender": dispatch
+# then routes each non-author agent through its real host (in-process
+# lane, BYOA websocket, or K8s job). Waking through the server-side lane
+# directly would silently turn BYOA agents into server-brained agents.
+NudgeFn = Callable[[UUID, UUID], Awaitable[None]]
 
 
 class StallSweeper:
@@ -53,7 +57,7 @@ class StallSweeper:
     def __init__(
         self,
         pool: Any,
-        wake: WakeFn,
+        nudge: NudgeFn,
         *,
         interval_s: float = SWEEP_INTERVAL_S,
         min_s: float = STALL_MIN_S,
@@ -61,7 +65,7 @@ class StallSweeper:
         max_nudges: int = STALL_MAX_NUDGES,
     ) -> None:
         self._pool = pool
-        self._wake = wake
+        self._nudge = nudge
         self._interval = interval_s
         self._min_s = min_s
         self._max_s = max_s
@@ -105,14 +109,18 @@ class StallSweeper:
         for stall in await self._stalled_rooms(now):
             if self._declines.get(stall["room_id"], 0) >= self._max_nudges:
                 continue
-            agent_id = stall["agent_id"]
             try:
-                await self._wake(agent_id, stall["room_id"])
+                # Route through dispatch semantics, not the server lane: a
+                # nudge must reach BYOA / K8s agents the same way a real
+                # message would. The room's last author is the nominal
+                # "sender"; dispatch wakes every agent except them, each
+                # through its own host (lane, computer ws, or cloud job).
+                await self._nudge(stall["room_id"], stall["last_author_id"])
             except Exception:
                 logger.warning(
-                    "stall wake failed room=%s agent=%s",
+                    "stall nudge failed room=%s last_author=%s",
                     stall["room_id"],
-                    agent_id,
+                    stall["last_author_id"],
                     exc_info=True,
                 )
                 continue
@@ -121,12 +129,11 @@ class StallSweeper:
                 self._declines.get(stall["room_id"], 0) + 1
             )
             logger.info(
-                "stall nudge room=%s agent=%s quiet_for=%.0fs last_author=%s "
+                "stall nudge room=%s last_author=%s quiet_for=%.0fs "
                 "declines=%s/%s",
                 stall["room_id"],
-                agent_id,
-                stall["quiet_for_s"],
                 stall["last_author_id"],
+                stall["quiet_for_s"],
                 self._declines[stall["room_id"]],
                 self._max_nudges,
             )
@@ -138,13 +145,14 @@ class StallSweeper:
         Eligibility is arithmetic on committed state only:
         - the room's latest message is older than min_s (silence)
         - ...but younger than max_s (not an abandoned room)
-        - the agent being nudged is not the author of the last message
-          (you don't owe yourself a reply)
-        - the agent has already READ that message (waking an agent with an
-          unread inbox is not a stall — its own lane missed a wake; that is
-          a different failure, and the cursor may still deliver it)
-        Among eligible agents the OLDEST participant wins: deterministic,
-        and rotation across sweeps comes from `declines` advancing.
+        - at least one non-author agent has READ the last message (waking
+          agents with an unread inbox is not a stall — their own lane
+          missed a wake; the cursor will deliver it). Unread agents are
+          still woken by the dispatch — they get the reactive delivery —
+          but a room where nobody has read counts as undelivered, not
+          stalled.
+        Individual wake routing (in-process lane vs computer ws vs cloud
+        job) is dispatch's job; the sweeper only judges the room.
         """
         from server import db
 
@@ -159,19 +167,21 @@ class StallSweeper:
                 continue
             last_author = UUID(str(room["author_id"]))
             agents = await db.list_agent_participants(self._pool, room_id)
-            candidates = [
+            # The last author never owes themselves a reply. Everyone else
+            # is woken — through dispatch — if at least one of them has
+            # already read the room's last word.
+            readers = [
                 a
                 for a in agents
                 if a.id != last_author
                 and await db.get_last_read(self._pool, a.id, room_id)
                 >= int(room["seq"])
             ]
-            if not candidates:
+            if not readers:
                 continue
             out.append(
                 {
                     "room_id": room_id,
-                    "agent_id": candidates[0].id,
                     "quiet_for_s": quiet_for,
                     "last_author_id": last_author,
                     "last_author_kind": str(room["author_kind"]),

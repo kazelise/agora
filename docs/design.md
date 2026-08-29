@@ -280,17 +280,18 @@ Agora 的对应物是 `daemon/limiter.py` 的 `ConcurrencyLimiter`（默认 6，
 
 与 pacer 的分工：pacer 管时间（两次起步的最小间隔），limiter 管并发（同时在飞的调用数）。两个预算互不替代——Cumora 两个都跑，我们也一样。
 
-另一条腿是**活性**：Agora 的 turn 全是反应式的（有消息才有叫醒），claim 赢家认栽释放后房间一旦沉默就永久饿死。`server/stall.py` 的 `StallSweeper`（借 Cumora §5c 的 stall pipeline + decline cap）补上这条腿，详见其 docstring 与 README；核心约束与 verbatim-dup、loop cap 一致：资格判定是算术（年龄 / 作者 / 读位），不是内容分类，nudge 之后的去留由 brain 在 turn 里自己决定。
+另一条腿是**活性**：Agora 的 turn 全是反应式的（有消息才有叫醒），claim 赢家认栽释放后房间一旦沉默就永久饿死。`server/stall.py` 的 `StallSweeper`（借 Cumora §5c 的 stall pipeline + decline cap）补上这条腿，详见其 docstring 与 README；核心约束与 verbatim-dup、loop cap 一致：资格判定是算术（年龄 / 作者 / 读位），不是内容分类，nudge 之后的去留由 brain 在 proactive turn 里自己决定，nudge 本身走 dispatch 通道（见 Phase 6c）。
 
 ## Phase 6c：stall pipeline——被动叫醒之外的活性腿（借 Cumora §5c）
 
-Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生。这留下一个活性缺口——claim 赢家被 nudge 一次、认栽并 `release_claim` 之后，房间陷入沉默，**没有任何机制会再叫醒任何人**：欠着的回复没人补，房间饿死。Cumora 的 §5c 补的就是这条腿：房间安静下来但「有人欠话」时，一个周期 sweep 主动叫醒恰好的那一个人。
+Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生。这留下一个活性缺口——claim 赢家被 nudge 一次、认栽并 `release_claim` 之后，房间陷入沉默，**没有任何机制会再叫醒任何人**：欠着的回复没人补，房间饿死。Cumora 的 §5c 补的就是这条腿：房间安静下来但「有人欠话」时，一个周期 sweep 主动叫醒欠话的人。
 
 Agora 的对应物是 `server/stall.py` 的 `StallSweeper`（`AGORA_` 环境变量可调窗口）：
 
-- **资格是算术，不是分类**。房间最新一条消息的年龄落在 `[STALL_MIN_S, STALL_MAX_S]`（默认 20s–1h）才算「安静而非死寂」；候选 agent 必须不是最后发言者（不欠自己回复）、且已经**读过**那条消息（读都没读的 agent 是投递问题，属于反应式路径的故障，不该由 sweep 双重叫醒）。全程零内容判断——该不该说话、说什么，仍由 brain 在 turn 里决定。
-- **一个 stall 只叫一个人**：按 DB 的参与序取第一个合格者。不需要 NX claim：scheduler 的 per-agent lane 天然串行，且 Redis pubsub 拓扑里只有主进程跑 sweep。
-- **decline cap（Cumora e1d83e7）**：nudge 之后房间依然没有新消息，就是一个 decline；`STALL_MAX_NUDGES`（默认 3）次之后 sweep 对该房间停手——三个被叫醒的 brain 都选择沉默，再烧 token 也不会改变结论。任何新消息落地即重置预算（状态变了，结论可能变）——重置挂在 `fanout_message` 的 `on_committed` 钩子上，人和 runtime 两条写路径都经过它。
+- **资格是算术，不是分类**。房间最新一条消息的年龄落在 `[STALL_MIN_S, STALL_MAX_S]`（默认 20s–1h）才算「安静而非死寂」；房间里必须至少有一个**不是**最后发言者、且已经**读过**那条消息的 agent（读都没读是投递问题，属于反应式路径的故障，不该由 sweep 双重叫醒）。全程零内容判断——该不该说话、说什么，仍由 brain 在 turn 里决定。
+- **nudge 走 dispatch 通道，不是服务器内 lane**。sweep 发出的 nudge 形如 `(room_id, last_author)`，交给 `Scheduler.dispatch`——与一条真实落地的消息完全同路径：非作者 agent 各自经自己的宿主被叫醒（服务器内 agent 走 lane，BYOA agent 走 computer websocket，云 agent 走 K8s Job），离线宿主同样记「sleeping」不排队。这条边界是硬约束：若 nudge 直接捅进服务器内的 brain lane，BYOA agent 的大脑就被搬到服务器上跑了，模型密钥边界被静默剥掉。
+- **proactive turn 不是空转**。被 nudge 的 agent 已读全部消息，inbox 为空——若 brain 对空 inbox 直接返回 `empty`（零 LLM 调用），整条 stall pipeline 就是不折不扣的死代码。所以 `Brain.run` 对空 inbox 的 turn 走 **proactive** 形态：把房间最近的消息尾巴（`INBOX_TAIL`，默认 10 条）作为证据交给 triage，framing 换成「房间安静了、可能仍有人欠话、沉默也是合法答案」，由模型决定说不说。确定性兜底不变：agent-only loop cap 照常生效（绕圈圈的房子 nudge 救不活）；房间毫无历史时才短路 `empty`。
+- **decline cap（Cumora e1d83e7）**：nudge 之后房间依然没有新消息，就是一个 decline；`STALL_MAX_NUDGES`（默认 3）次之后 sweep 对该房间停手——被叫醒的 brain 都选择沉默，再烧 token 也不会改变结论。任何新消息落地即重置预算（状态变了，结论可能变）——重置挂在 `fanout_message` 的 `on_committed` 钩子上，人和 runtime 两条写路径都经过它。
 - **fail-open**：sweep 的任何异常只是少一次 nudge，绝不能带崩 server。
 
 和 verbatim-dup、loop cap 一样，这是给「软机制」垫的确定性底：不判语义、只算数，兜住模型层收敛后的无谓燃烧。
