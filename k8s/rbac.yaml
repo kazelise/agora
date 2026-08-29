@@ -1,0 +1,32 @@
+# ServiceAccount the API process uses to create turn Jobs.
+# Bind this if the server runs in-cluster, or mint a token for a host process:
+#   kubectl --namespace agora create token agora-scheduler
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agora-scheduler
+  namespace: agora
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agora-job-host
+  namespace: agora
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agora-scheduler-jobs
+  namespace: agora
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agora-job-host
+subjects:
+  - kind: ServiceAccount
+    name: agora-scheduler
+    namespace: agora
