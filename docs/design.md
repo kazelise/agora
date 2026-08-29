@@ -217,3 +217,37 @@ cluster token 不是 `computers` 表里的一行。配对 token 绑的是某台�
 赢下 claim 是协议义务，不是 prompt 里的礼貌。代码兜底一次：tool_loop 要收束、手里有 won、本轮还没落地回复，就塞一条 user-role「You won claim `<key>`; you must reply now or the claim will be released.」，并只加 **一** 跳 hop 预算。再不开口，就把行 DELETE 掉（`release_claim`，只删自己赢的那把），打警告。未履行的 claim 不能把 `task_key` 永远钉死。语义对错仍归模型；代码只拦「赢了却不履约」这种协议违约。
 
 HOLD 重判按 `response_mode` 给语义指引，不分类内容：`each` 说同伴开口并不解除你的义务；`one-of-us` 说同伴已经做完你就沉默；`me` 说点名很少因为旁人插话而取消。triage 的三条 mode 说明同一套，避免「有人说过就 actionable=false」把 each 误杀。
+
+## Phase 6：向 Cumora 和元桌借的三件东西
+
+这两个参照系各取所长：Cumora 有生产级的多 Agent 协调经验（`docs/COORDINATION.md` 把踩过的坑全写了下来），元桌（yuanzhuo-ai-roundtable）有「讨论必须沉淀为产物」的产品闭环。Phase 6 各借一件，且都按 Agora 的分层原则落地——代码管机制、模型管语义、导出不做内容解释。
+
+### send_anyway 是确认，不是通行证（借 Cumora §5d）
+
+freshness 门被绕过的方式只有一种：agent 学会了抢跑。Cumora 的现场事故是 agent 为了省一次往返，在 *第一次* 发送时就带 `--send-anyway`，门从此形同虚设。修法不是「prompt 里叮嘱 responsibly」，是让 flag 在结构上无效，直到服务器 *确实出示过* 一次 HOLD：
+
+- HOLD 时（freshness 节点）在 Redis 记一枚 **hold token**（`(agent, room)` 一枚，2 分钟 TTL，存被出示到的最高 `seq`）。
+- `reply(body, send_anyway=True)` 在 freshness 门处原子消费 token：有、且 token 的 seq ≥ 房间当前 `last_seq`，才放行。房间往前走了，ack 作废——它只确认「被出示过的状态」，跳不过没见过的行。
+- 无 token 的 send_anyway 被忽略并打日志：抢跑者的 flag 什么都没做成，门照跑。
+- 提交成功即清 token。Redis 挂了 fail-open（退回旧行为），这是协调信号不是正确性不变量。
+
+与 Cumora 的 hold token 相比少了两条收尾（turn-end 清理、ack 清理）——Agora 的 token 生命周期就是一次 freshness 判定，图内回边结束 turn 也就结束了，不需要跨进程的清理漏斗。
+
+### verbatim-dup 在事务里拦（借 Cumora §5b）
+
+「Iris 和 Marcus 同时报 3」有两层：时间窗的碰撞由 freshness 管；但 agent **看见了** 同伴的 3 还是复读，是脑判失误，服务器必须替房间兜底。检查放在 `insert_message` 拿到房间行锁 *之后*（和 seq 计数、freshness 校验同一段事务），所以它读到的是已提交的同伴行，没有 pre-INSERT 检查的 TOCTOU 窗口。
+
+两条刻意的边界：
+
+- **对 agent 生效，对 human 不生效。** 人复读报数（评分、跟读）是正常参与；agent 复读同伴才是要治的病。作者的 `kind` 在同一事务里查。
+- **不可绕过。** 没有 flag 能绕开它——逐字重复同伴的上一条消息没有正当场景（Cumora：连 DM 里复述对方最后一句都是噪音）。命中时把事实塞回 tool_loop（「你的回复和同伴逐字重复」），脑在同一轮改口或沉默；hold 预算不动，这是语义错误不是竞态。
+
+### agent-only 循环上限（借 Cumora §6 的 loop floor）
+
+triage 是小模型门，但它有时不肯收尾。Cumora 用「计数不分类」的确定性下限兜底：一个纯 agent 对话跑过门槛（没有人类出现）就按条数判定为死循环。Agora 的版本：inbox 里 **自人类最后发言以来** 的 agent 消息数 ≥ `AGENT_LOOP_CAP × agent数`（默认 4 轮）→ 直接 `skipped`，一次模型都不花。这是算术，不是内容分类，符合本仓库「唯一允许的非模型短路是计数」的规矩。人类一开口，一切重置——小模型门重新接管（它还要产出 response_mode，所以人类消息不短路）。
+
+### 房间 digest：讨论沉淀为产物（借元桌）
+
+元桌圆桌的收尾是 secretary 导出：总结、待办、评分、Markdown。Agora 的对应物是 `GET /rooms/{id}/digest`——把房间渲染成一份自包含的 Markdown brief：transcript 表格、**active claims 作为 action items**（claim 在协议里只为真实共享工作存在，挂着没人认领的 claim 就是没人接的活）、`llm_calls` 按 purpose × model 汇总的花费表（含合计）。
+
+刻意的边界：导出是纯格式化，零模型调用、零内容解释。总结器模型以后可以叠上去，但导出本身永远不依赖一个模型——这也让 digest 在测试里是确定性的。

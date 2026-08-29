@@ -8,6 +8,7 @@ from uuid import UUID
 
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import PlainTextResponse
 
 from brain.world import WorldMessage
 from server import db
@@ -178,6 +179,18 @@ def register_routes(app: FastAPI) -> None:
         except db.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=exc.detail) from exc
         return MessageListOut(messages=[m.as_out() for m in rows])
+
+    @app.get("/rooms/{room_id}/digest", response_class=PlainTextResponse)
+    async def get_digest(room_id: UUID) -> PlainTextResponse:
+        from server.digest import build_room_digest
+
+        markdown = await build_room_digest(app.state.pool, room_id)
+        if markdown is None:
+            raise HTTPException(status_code=404, detail=f"room {room_id} not found")
+        return PlainTextResponse(
+            markdown,
+            headers={"content-disposition": f'inline; filename="room-{room_id}.md"'},
+        )
 
     @app.websocket("/ws/rooms/{room_id}")
     async def ws_room(websocket: WebSocket, room_id: UUID) -> None:

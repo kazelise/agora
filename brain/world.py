@@ -29,6 +29,18 @@ class StaleWrite(Exception):
         self.newer = newer
 
 
+class DuplicateReply(Exception):
+    """INSERT refused: body verbatim-duplicates the latest peer message.
+
+    Non-bypassable (no flag routes around it): the graph re-decides inside
+    the same turn — either rewrite the reply or yield.
+    """
+
+    def __init__(self, peer_seq: int) -> None:
+        super().__init__(f"message duplicates peer seq {peer_seq} verbatim")
+        self.peer_seq = peer_seq
+
+
 @dataclass(frozen=True)
 class WorldMessage:
     id: UUID

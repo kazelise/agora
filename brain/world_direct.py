@@ -13,6 +13,7 @@ import redis.asyncio as redis
 
 from brain.seen import record_seen as redis_record_seen
 from brain.world import (
+    DuplicateReply,
     StaleWrite,
     TurnContext,
     WorldMessage,
@@ -111,6 +112,8 @@ class DirectWorld:
         except db.StaleWriteError as exc:
             newer = await self._named_messages(room_id, not_after_seq)
             raise StaleWrite(exc.last_seq, newer) from exc
+        except db.DuplicateReplyError as exc:
+            raise DuplicateReply(exc.peer_seq) from exc
         names = await self._names(room_id)
         return _message(row, names.get(str(row.author_id), "?"))
 

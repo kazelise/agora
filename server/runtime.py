@@ -187,6 +187,14 @@ async def reply(
                 "messages": [m.model_dump(mode="json") for m in newer],
             },
         ) from exc
+    except db.DuplicateReplyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "duplicate_reply",
+                "peer_seq": exc.peer_seq,
+            },
+        ) from exc
     except db.NotFoundError as exc:
         raise HTTPException(status_code=404, detail=exc.detail) from exc
     await fanout_message(request.app.state.hub, request.app.state.redis, row)

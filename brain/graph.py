@@ -23,7 +23,8 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from brain import policy
-from brain.world import StaleWrite, World, WorldMessage
+from brain.holds import clear_hold, consume_hold, record_hold
+from brain.world import DuplicateReply, StaleWrite, World, WorldMessage
 
 logger = logging.getLogger("agora.brain")
 
@@ -33,6 +34,10 @@ LLM_RETRY_BACKOFF_S = 1.0
 # One extra hop after a won-claim obligation nudge. Bounded and obvious:
 # the winner gets exactly one more chance to reply before we release.
 CLAIM_OBLIGATION_HOPS = 1
+# Agent↔agent loop cap: an agent-only run that has circled this many full
+# rounds (x agent count) without a human is stale by count. The small
+# model is still the primary wind-down; this is the deterministic floor.
+AGENT_LOOP_CAP = 4
 
 # Protocol parse of the model's claim key — not content classification.
 # Free-form names never converge across two models; seq is objective.
@@ -41,6 +46,12 @@ CLAIM_KEY_ERROR = (
     "claim rejected: task_key must be t<seq> or t<seq>:<slug> "
     "(e.g. t1 or t1:intro), where <seq> is the seq of the message "
     "you are responding to. Retry with that format."
+)
+
+DUPLICATE_REPLY_ERROR = (
+    "reply rejected: it verbatim-duplicates the latest peer message. "
+    "Do not restate a peer. Either say something materially different "
+    "or stay silent."
 )
 
 
@@ -87,6 +98,8 @@ class BrainState(TypedDict, total=False):
     room_id: str
     inbox: list[InboxItem]
     author_names: dict[str, str]
+    human_id: str
+    agent_count: int
     seen_seq: int
     triage_actionable: bool
     triage_reason: str
@@ -98,11 +111,17 @@ class BrainState(TypedDict, total=False):
     outcome: str
     claims: list[ClaimRecord]
     claim_nudged: bool
+    send_anyway: bool
 
 
 @tool
-def reply(body: str) -> str:
-    """Post your message to the room."""
+def reply(body: str, send_anyway: bool = False) -> str:
+    """Post your message to the room.
+
+    send_anyway bypasses a freshness HOLD — but only one the server has
+    actually shown you this turn (a HELD reply armed a token). Without a
+    token the flag does nothing and the gate still runs.
+    """
     return body
 
 
@@ -261,6 +280,7 @@ class Brain:
         big_model_name: str | None = None,
         checkpointer: Any | None = None,
         on_committed: Callable[[WorldMessage], Awaitable[None]] | None = None,
+        hold_redis: Any | None = None,
     ) -> None:
         self.small_model_name = policy.assert_triage_model(
             policy.small_model_name() if small_model_name is None else small_model_name
@@ -271,6 +291,9 @@ class Brain:
         self.world = world
         self.small = small_model or ChatOpenAI(model=self.small_model_name)
         self.big = big_model or ChatOpenAI(model=self.big_model_name)
+        # Hold tokens live in Redis (server-side). The daemon constructs its
+        # Brain without one; its freshness gate is the runtime 409 path.
+        self._hold_redis = hold_redis
         # InMemorySaver: langgraph-checkpoint-postgres wants psycopg/libpq;
         # this repo is asyncpg-only. HOLD is an in-graph loop, so a durable
         # saver is not required for correctness. Swap via this arg later.
@@ -315,7 +338,7 @@ class Brain:
         return "tool_loop"
 
     def _after_commit(self, state: BrainState) -> str:
-        if state.get("outcome") in {"held_exhausted", "replied"}:
+        if state.get("outcome") in {"held_exhausted", "replied", "duplicate"}:
             return END
         return "tool_loop"
 
@@ -332,9 +355,40 @@ class Brain:
         )
 
     async def _triage(self, state: BrainState) -> dict[str, Any]:
+        inbox = state.get("inbox") or []
+        human_id = state.get("human_id") or ""
+        # Agent↔agent loop cap (deterministic backstop under the model
+        # gate): an agent-only stretch past the cap is stale by COUNT, not
+        # by wording — the one class of triage that is arithmetic, not
+        # classification (Cumora §6 loop floors; this repo's rule that a
+        # non-model short-circuit must be counting, never content). A
+        # human in the inbox resets everything: the model gate always runs
+        # there, because it also produces the response_mode the graph and
+        # HOLD guidance depend on.
+        agent_count = int(state.get("agent_count") or 0)
+        if agent_count > 0 and human_id:
+            since_human = sum(1 for m in inbox if str(m["author_id"]) != human_id)
+            cap = AGENT_LOOP_CAP * agent_count
+            if since_human >= cap:
+                logger.info(
+                    "triage %s agent-only run past loop cap (%s >= %s) — staying silent",
+                    state["agent_name"],
+                    since_human,
+                    cap,
+                )
+                return {
+                    "outcome": "skipped",
+                    "triage_actionable": False,
+                    "triage_reason": (
+                        f"agent-only run past loop cap "
+                        f"({since_human} agent messages without a human; "
+                        f"cap {AGENT_LOOP_CAP} x {agent_count} agents)"
+                    ),
+                    "response_mode": "",
+                }
         prompt = (
             f"You are {state['agent_name']}. Persona: {state.get('persona') or 'none'}.\n\n"
-            f"New messages since you last read:\n{_format_inbox(state.get('inbox') or [])}\n\n"
+            f"New messages since you last read:\n{_format_inbox(inbox)}\n\n"
             "Decide whether you should act. Reply with a single JSON object, no markdown:\n"
             '{"actionable": bool, "reason": str, "response_mode": "me"|"each"|"one-of-us"}\n'
             "me = addressed to you; new messages from others rarely mean you should skip.\n"
@@ -463,6 +517,8 @@ class Brain:
                 body = str(args.get("body") or "")
                 if body:
                     pending = body
+                    if _tc_get(args, "send_anyway"):
+                        state["send_anyway"] = True
                     after.append(ToolMessage(content="queued", tool_call_id=call_id))
                 else:
                     after.append(ToolMessage(content="empty body ignored", tool_call_id=call_id))
@@ -532,6 +588,10 @@ class Brain:
             )
         )
         await self.world.record_seen(UUID(state["agent_id"]), room_id, latest)
+        # Arm the hold token: the HELD envelope showed this agent state up
+        # to `latest`, so a later send_anyway THIS TURN may ack exactly that.
+        if self._hold_redis is not None:
+            await record_hold(self._hold_redis, UUID(state["agent_id"]), room_id, latest)
         logger.info(
             "HOLD %s seen=%s latest=%s hold=%s",
             state["agent_name"],
@@ -556,6 +616,29 @@ class Brain:
         seen = int(state["seen_seq"])
         if latest <= seen:
             return {}
+        # send_anyway is an ACKNOWLEDGEMENT, not a free pass (Cumora §5d):
+        # it works only if a prior HOLD this turn armed a token, and the
+        # token is seq-bound — it acknowledges exactly the state that was
+        # shown, so if the room has moved past it the ack is void and the
+        # gate still runs (the fresh HOLD re-arms with the newer state).
+        if state.get("send_anyway"):
+            acked = await consume_hold(
+                self._hold_redis, UUID(state["agent_id"]), room_id
+            )
+            state["send_anyway"] = False
+            if acked is not None and acked >= latest:
+                logger.info(
+                    "send_anyway %s accepted (hold token acked seq=%s, latest=%s)",
+                    state["agent_name"],
+                    acked,
+                    latest,
+                )
+                return {}
+            logger.info(
+                "send_anyway %s ignored (%s) — gate still runs",
+                state["agent_name"],
+                "no hold token" if acked is None else f"token acked {acked} < latest {latest}",
+            )
         return await self._hold(state, latest)
 
     async def _commit(self, state: BrainState) -> dict[str, Any]:
@@ -569,8 +652,27 @@ class Brain:
             )
         except StaleWrite as exc:
             return await self._hold(state, exc.last_seq, newer=exc.newer)
+        except DuplicateReply as exc:
+            # Non-bypassable gate: the brain is shown the fact and re-decides
+            # in the same turn. No holds are spent — this is a semantics
+            # error, not a race.
+            logger.info(
+                "duplicate reply %s peer seq=%s — re-decide",
+                state["agent_name"],
+                exc.peer_seq,
+            )
+            note = HumanMessage(content=DUPLICATE_REPLY_ERROR)
+            return {
+                "outcome": "",
+                "pending_reply": "",
+                "messages": [*(state.get("messages") or []), note],
+            }
         if self.on_committed is not None:
             await self.on_committed(row)
+        if self._hold_redis is not None:
+            await clear_hold(
+                self._hold_redis, UUID(state["agent_id"]), UUID(state["room_id"])
+            )
         logger.info("commit %s seq=%s", state["agent_name"], row.seq)
         return {"outcome": "replied"}
 
@@ -629,6 +731,10 @@ class Brain:
 
         # Inbox is about to be shown to the model — high-water goes to Redis.
         await self.world.record_seen(agent_id, room_id, seen_seq)
+        human_id = next(
+            (str(p.id) for p in ctx.participants if p.kind == "human"), ""
+        )
+        agent_count = sum(1 for p in ctx.participants if p.kind == "agent")
         initial: BrainState = {
             "agent_id": str(agent_id),
             "agent_name": ctx.agent.name,
@@ -636,6 +742,8 @@ class Brain:
             "room_id": str(room_id),
             "inbox": inbox,
             "author_names": names,
+            "human_id": human_id,
+            "agent_count": agent_count,
             "seen_seq": seen_seq,
             "triage_actionable": False,
             "triage_reason": "",
@@ -647,6 +755,7 @@ class Brain:
             "outcome": "",
             "claims": [],
             "claim_nudged": False,
+            "send_anyway": False,
         }
         final = await self.graph.ainvoke(
             initial,
@@ -697,5 +806,9 @@ def make_turn_fn(
     # Brain(HttpWorld, ...) and must not load the cloud host's drivers.
     from brain.world_direct import DirectWorld
 
-    brain = Brain(DirectWorld(pool, redis_client), **kwargs)
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        hold_redis=redis_client,
+        **kwargs,
+    )
     return brain.run

@@ -256,6 +256,21 @@ async def touch_computer(pool: asyncpg.Pool, computer_id: UUID) -> None:
     )
 
 
+class DuplicateReplyError(Exception):
+    """INSERT refused: body is verbatim-identical to the latest peer message.
+
+    Checked inside the same room-row-locked transaction as the seq claim,
+    so it sees committed peers and is race-free (the TOCTOU window that
+    defeats a pre-INSERT check). There is no legitimate use case for
+    repeating the immediately-prior peer message verbatim — not even a
+    HOLD override — so this gate is non-bypassable.
+    """
+
+    def __init__(self, peer_seq: int) -> None:
+        super().__init__(f"message duplicates peer seq {peer_seq} verbatim")
+        self.peer_seq = peer_seq
+
+
 async def insert_message(
     pool: asyncpg.Pool,
     room_id: UUID,
@@ -283,6 +298,9 @@ async def insert_message(
                 if exists is None:
                     raise NotFoundError(f"room {room_id} not found")
                 raise NotFoundError(f"author {author_id} is not in room {room_id}")
+            kind = await conn.fetchval(
+                "SELECT kind FROM participants WHERE id = $1", author_id
+            )
             current = await conn.fetchval(
                 "SELECT last_seq FROM rooms WHERE id = $1 FOR UPDATE",
                 room_id,
@@ -291,6 +309,29 @@ async def insert_message(
                 raise NotFoundError(f"room {room_id} not found")
             if not_after_seq is not None and int(current) > not_after_seq:
                 raise StaleWriteError(int(current))
+            # Verbatim-dup gate, inside the row lock: two agents composing
+            # the same "3" both pass any pre-transaction snapshot, but only
+            # the first INSERT commits; the second sees it here. Agents
+            # only — a human echoing the number (grading, joining in) is
+            # a legitimate move, and humans POST through the API directly.
+            peer = None
+            if kind == "agent":
+                peer = await conn.fetchrow(
+                    """
+                    SELECT body, seq FROM messages
+                    WHERE room_id = $1 AND author_id <> $2
+                    ORDER BY seq DESC
+                    LIMIT 1
+                    """,
+                    room_id,
+                    author_id,
+                )
+            if (
+                peer is not None
+                and peer["body"].strip() == body.strip()
+                and body.strip() != ""
+            ):
+                raise DuplicateReplyError(int(peer["seq"]))
             seq = await conn.fetchval(
                 """
                 UPDATE rooms
@@ -451,3 +492,68 @@ async def set_last_read(
 
 async def truncate_all(pool: asyncpg.Pool) -> None:
     await pool.execute("TRUNCATE rooms, computers CASCADE")
+
+
+async def room_digest(
+    pool: asyncpg.Pool,
+    room_id: UUID,
+) -> dict | None:
+    """Everything the markdown digest needs, in three queries.
+
+    Active claims are the action items (Cumora: claims are for real shared
+    work, so an unclaimed task_key here means an obligation nobody is
+    currently holding); the llm_calls rollup is the cost of the room.
+    """
+    room = await pool.fetchrow(
+        "SELECT id, name, created_at FROM rooms WHERE id = $1", room_id
+    )
+    if room is None:
+        return None
+    people = await pool.fetch(
+        """
+        SELECT id, kind, name FROM participants
+        WHERE room_id = $1
+        ORDER BY created_at
+        """,
+        room_id,
+    )
+    messages = await pool.fetch(
+        """
+        SELECT m.seq, m.body, m.created_at, m.author_id, p.name AS author_name, p.kind
+        FROM messages m
+        JOIN participants p ON p.id = m.author_id
+        WHERE m.room_id = $1
+        ORDER BY m.seq ASC
+        """,
+        room_id,
+    )
+    claims = await pool.fetch(
+        """
+        SELECT c.task_key, c.claimed_by, c.created_at, p.name AS claimed_by_name
+        FROM claims c
+        JOIN participants p ON p.id = c.claimed_by
+        WHERE c.room_id = $1
+        ORDER BY c.created_at ASC
+        """,
+        room_id,
+    )
+    usage = await pool.fetch(
+        """
+        SELECT purpose, model,
+               SUM(prompt_tokens) AS prompt_tokens,
+               SUM(completion_tokens) AS completion_tokens,
+               COUNT(*) AS calls
+        FROM llm_calls
+        WHERE room_id = $1
+        GROUP BY purpose, model
+        ORDER BY purpose, model
+        """,
+        room_id,
+    )
+    return {
+        "room": room,
+        "participants": people,
+        "messages": messages,
+        "claims": claims,
+        "usage": usage,
+    }

@@ -13,6 +13,7 @@ from uuid import UUID
 import httpx
 
 from brain.world import (
+    DuplicateReply,
     StaleWrite,
     TurnContext,
     WorldMessage,
@@ -93,6 +94,8 @@ class HttpWorld:
     def _raise_for_status(self, resp: httpx.Response) -> None:
         if resp.status_code == 409:
             detail = resp.json().get("detail") or {}
+            if detail.get("error") == "duplicate_reply":
+                raise DuplicateReply(int(detail["peer_seq"]))
             newer_raw = detail.get("messages") or []
             newer = [_message(item) for item in newer_raw]
             raise StaleWrite(int(detail["last_seq"]), newer)
