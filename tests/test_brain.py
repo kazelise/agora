@@ -550,3 +550,48 @@ async def test_won_claim_unfulfilled_releases_row(
     assert leftover == []
     stored = await db.list_messages(pool, room_id)
     assert [m.body for m in stored] == ["one of you intro"]
+
+
+@pytest.mark.asyncio
+async def test_commit_advances_cursor_no_self_re_serve(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """The committed row enters the agent's own seen cursor. Without the
+    advance, the next wake (peer message interleaved or a nudge) re-served
+    the agent its OWN last reply as new mail — triage saw a phantom
+    message and the inbox count lied."""
+    room_id, human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "pick a number")
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="asked", response_mode="me")]
+    )
+    big = ScriptedChatModel([tool_call("reply", {"body": "7"})])
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    first = await brain.run(iris_id, room_id)
+    assert first.outcome == "replied"
+    assert first.seen_seq == 2
+    assert await db.get_last_read(pool, iris_id, room_id) == 2
+
+    # A wake with nothing new: the turn must be PROACTIVE (empty reactive
+    # inbox — the agent's own "7" is not re-served as new mail), not a
+    # phantom reactive turn of one self-addressed message. A proactive
+    # turn's inbox_count is the room TAIL (2: the human ask + the agent's
+    # own "7"); a re-served reactive turn would show inbox_count == 1.
+    small2 = ScriptedChatModel(
+        [triage_message(actionable=False, reason="nothing to add", response_mode="me")]
+    )
+    big2 = ScriptedChatModel()
+    brain2 = Brain(DirectWorld(pool, redis_client), small_model=small2, big_model=big2)
+    second = await brain2.run(iris_id, room_id)
+
+    assert second.inbox_count == 2
+    assert second.outcome == "skipped"
+    assert len(small2.calls) == 1
+    # The cursor did not regress and the room is unchanged.
+    assert await db.get_last_read(pool, iris_id, room_id) == 2
+    # The tail shown to proactive triage still includes the room context.
+    tail_prompt = " ".join(str(getattr(m, "content", "")) for m in small2.calls[0])
+    assert "7" in tail_prompt

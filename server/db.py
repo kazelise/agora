@@ -350,6 +350,9 @@ async def insert_message(
     # raise StaleWriteError instead of inserting.
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # One query for both the membership check and the dup-gate's
+            # agent/human dispatch (the two reads cannot disagree: kind is
+            # immutable in this repo — no code path UPDATEs or DELETEs it).
             kind = await conn.fetchval(
                 """
                 SELECT kind FROM participants

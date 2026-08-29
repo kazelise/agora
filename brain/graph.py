@@ -789,7 +789,11 @@ class Brain:
         except DuplicateReply as exc:
             # Non-bypassable gate: the brain is shown the fact and re-decides
             # in the same turn. No holds are spent — this is a semantics
-            # error, not a race.
+            # error, not a race. No seen_seq sync either: the stale check
+            # runs BEFORE the dup check inside the same insert transaction,
+            # so at rejection time peer_seq <= seen_seq is an invariant —
+            # the cursor can never trail the peer row, and a room that has
+            # moved since is correctly routed to the stale/HOLD path.
             logger.info(
                 "duplicate reply %s peer seq=%s — re-decide",
                 state["agent_name"],
@@ -808,7 +812,11 @@ class Brain:
                 self._hold_redis, UUID(state["agent_id"]), UUID(state["room_id"])
             )
         logger.info("commit %s seq=%s", state["agent_name"], row.seq)
-        return {"outcome": "replied"}
+        # The cursor must swallow the committed row: the agent authored it,
+        # so it has by definition seen it. Left behind, the next turn's
+        # inbox (seq > last_read, no author filter) re-serves the agent its
+        # own message as new mail — confusing triage and wasting tokens.
+        return {"outcome": "replied", "seen_seq": int(row.seq)}
 
     async def _release_unfulfilled(
         self,

@@ -168,6 +168,57 @@ async def test_graph_duplicate_reply_no_holds_spent(
     assert stored.count("hello") == 1
 
 
+@pytest.mark.asyncio
+async def test_dup_rejection_retry_after_room_moved_takes_hold_path(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """A room that moves while the brain re-decides after a dup rejection
+    must SHOW the interfering row before the retry can commit: the
+    re-decided reply goes through the HOLD path (the fresh row lands in
+    the prompt) — never a silent commit over unseen state."""
+    room_id, human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "pick a number")
+    # seq 2: the peer "3" the agent will parrot.
+    await db.insert_message(pool, room_id, marcus_id, "3")
+
+    async def after_dup(_messages: list) -> object:
+        # While the brain re-decides, the human races to say EXACTLY what
+        # the agent was about to say (seq 3): the reworded retry must be
+        # re-judged against that row, not committed blind.
+        texts = [str(getattr(m, "content", "")) for m in _messages]
+        if any("verbatim-duplicates" in t for t in texts):
+            await db.insert_message(pool, room_id, human_id, "4 — next after 3")
+        return tool_call("reply", {"body": "4 — next after 3"})
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="each", response_mode="each")]
+    )
+    big = ScriptedChatModel(
+        [
+            tool_call("reply", {"body": "3"}),
+            after_dup,
+            tool_call("reply", {"body": "Ada took 4 — I'll take 5"}),
+        ]
+    )
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+    result = await brain.run(iris_id, room_id)
+
+    # Stale/HOLD path: the interfering row was SHOWN (one HOLD), then the
+    # revised reply committed — the re-decide prompt carries the shown row.
+    assert result.outcome == "replied"
+    assert result.hold_count == 1
+    redecide_prompt = " ".join(
+        str(getattr(m, "content", "")) for m in big.calls[2]
+    )
+    assert "New messages landed while you were composing" in redecide_prompt
+    assert "[seq=3" in redecide_prompt
+    stored = [m.body for m in await db.list_messages(pool, room_id)]
+    assert stored[-1] == "Ada took 4 — I'll take 5"
+    # Cursor advanced to the committed row's seq (3 human + 4 agent).
+    assert await db.get_last_read(pool, iris_id, room_id) == 4
+
+
 # ── hold tokens ──────────────────────────────────────────────────────────
 
 
