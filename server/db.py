@@ -214,6 +214,41 @@ async def list_active_rooms(pool: asyncpg.Pool) -> list[Any]:
     )
 
 
+async def count_agent_only_stretch(pool: asyncpg.Pool, room_id: UUID) -> int:
+    """Agent messages since the room's last human message (loop-cap cursor).
+
+    Room-level, not per-inbox: the inbox is this turn's delivery batch, the
+    stretch is the room's conversation state — a quick ping-pong keeps each
+    inbox tiny while the room circles, so the cap must count across turns.
+    One statement, ordered by the gapless per-room seq. Agents only: a
+    human message resets the count by definition; a room with no human
+    message yet (the MOST loop-prone shape) counts everything.
+    """
+    return int(
+        await pool.fetchval(
+            """
+            SELECT COUNT(*) FILTER (WHERE author_kind = 'agent')
+            FROM (
+                SELECT p.kind AS author_kind
+                FROM messages m
+                JOIN participants p ON p.id = m.author_id
+                WHERE m.room_id = $1
+                  AND m.seq > COALESCE((
+                        SELECT m2.seq
+                        FROM messages m2
+                        JOIN participants p2 ON p2.id = m2.author_id
+                        WHERE m2.room_id = $1 AND p2.kind = 'human'
+                        ORDER BY m2.seq DESC
+                        LIMIT 1
+                  ), 0)
+            ) stretch
+            """,
+            room_id,
+        )
+        or 0
+    )
+
+
 async def create_computer(pool: asyncpg.Pool, name: str, token: str) -> ComputerRow:
     row = await pool.fetchrow(
         """
@@ -315,19 +350,19 @@ async def insert_message(
     # raise StaleWriteError instead of inserting.
     async with pool.acquire() as conn:
         async with conn.transaction():
-            belongs = await conn.fetchval(
-                "SELECT 1 FROM participants WHERE id = $1 AND room_id = $2",
+            kind = await conn.fetchval(
+                """
+                SELECT kind FROM participants
+                WHERE id = $1 AND room_id = $2
+                """,
                 author_id,
                 room_id,
             )
-            if belongs is None:
+            if kind is None:
                 exists = await conn.fetchval("SELECT 1 FROM rooms WHERE id = $1", room_id)
                 if exists is None:
                     raise NotFoundError(f"room {room_id} not found")
                 raise NotFoundError(f"author {author_id} is not in room {room_id}")
-            kind = await conn.fetchval(
-                "SELECT kind FROM participants WHERE id = $1", author_id
-            )
             current = await conn.fetchval(
                 "SELECT last_seq FROM rooms WHERE id = $1 FOR UPDATE",
                 room_id,

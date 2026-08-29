@@ -83,6 +83,7 @@ class TurnContextOut(BaseModel):
     seen_seq: int
     participants: list[RuntimeParticipantOut]
     inbox: list[RuntimeMessageOut]
+    agent_only_stretch: int = 0
 
 
 async def named_since(
@@ -129,6 +130,9 @@ async def turn_context(
             for p in people
         ],
         inbox=inbox,
+        agent_only_stretch=await db.count_agent_only_stretch(
+            request.app.state.pool, room_id
+        ),
     )
 
 

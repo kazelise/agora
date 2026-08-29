@@ -79,6 +79,12 @@ class TurnContext:
     participants: list[WorldParticipant]
     last_read_seq: int
     seen_seq: int
+    # Room-level count of agent messages since the last human message
+    # (the loop-cap cursor; 0 when the latest message is human's). The
+    # graph's agent↔agent loop cap reads this, never the inbox size:
+    # the inbox is a per-turn delivery batch, the stretch is the room's
+    # conversation state. Default 0 keeps ad-hoc TurnContexts valid.
+    agent_only_stretch: int = 0
 
 
 class World(Protocol):

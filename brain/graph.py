@@ -98,8 +98,8 @@ class BrainState(TypedDict, total=False):
     room_id: str
     inbox: list[InboxItem]
     author_names: dict[str, str]
-    human_ids: list[str]
     agent_count: int
+    agent_only_stretch: int
     seen_seq: int
     triage_actionable: bool
     triage_reason: str
@@ -415,7 +415,7 @@ class Brain:
         return "tool_loop"
 
     def _after_commit(self, state: BrainState) -> str:
-        if state.get("outcome") in {"held_exhausted", "replied", "duplicate"}:
+        if state.get("outcome") in {"held_exhausted", "replied"}:
             return END
         return "tool_loop"
 
@@ -432,28 +432,28 @@ class Brain:
         )
 
     async def _triage(self, state: BrainState) -> dict[str, Any]:
-        inbox = state.get("inbox") or []
         # Agent↔agent loop cap (deterministic backstop under the model
         # gate): an agent-only stretch past the cap is stale by COUNT, not
         # by wording — the one class of triage that is arithmetic, not
         # classification (Cumora §6 loop floors; this repo's rule that a
-        # non-model short-circuit must be counting, never content). A
-        # human message in the inbox resets everything: the model gate
-        # always runs there, because it also produces the response_mode
-        # the graph and HOLD guidance depend on. No humans at all is the
-        # MOST loop-prone shape, so the cap arms hardest there.
+        # non-model short-circuit must be counting, never content). The
+        # count is ROOM-level — every agent message since the last human
+        # message, across turns — supplied by the World in TurnContext.
+        # Counting the per-turn inbox instead mis-scopes both directions:
+        # quick ping-pong replies each stay under one inbox batch yet the
+        # room is circling, and a single huge coalesced burst trips the
+        # cap on a room that was fine one message ago. No humans at all
+        # is the MOST loop-prone shape, so the cap arms hardest there;
+        # any human's message resets the counter at the source.
         agent_count = int(state.get("agent_count") or 0)
-        human_ids = set(state.get("human_ids") or [])
+        stretch = int(state.get("agent_only_stretch") or 0)
         if agent_count > 0:
-            since_human = sum(
-                1 for m in inbox if str(m["author_id"]) not in human_ids
-            )
             cap = AGENT_LOOP_CAP * agent_count
-            if since_human >= cap:
+            if stretch >= cap:
                 logger.info(
                     "triage %s agent-only run past loop cap (%s >= %s) — staying silent",
                     state["agent_name"],
-                    since_human,
+                    stretch,
                     cap,
                 )
                 return {
@@ -461,14 +461,15 @@ class Brain:
                     "triage_actionable": False,
                     "triage_reason": (
                         f"agent-only run past loop cap "
-                        f"({since_human} agent messages without a human; "
+                        f"({stretch} agent messages without a human; "
                         f"cap {AGENT_LOOP_CAP} x {agent_count} agents)"
                     ),
                     "response_mode": "",
                 }
         prompt = (
             f"You are {state['agent_name']}. Persona: {state.get('persona') or 'none'}.\n\n"
-            f"New messages since you last read:\n{_format_inbox(inbox)}\n\n"
+            f"New messages since you last read:\n"
+            f"{_format_inbox(state.get('inbox') or [])}\n\n"
             "Decide whether you should act. Reply with a single JSON object, no markdown:\n"
             '{"actionable": bool, "reason": str, "response_mode": "me"|"each"|"one-of-us"}\n'
             "me = addressed to you; new messages from others rarely mean you should skip.\n"
@@ -695,7 +696,11 @@ class Brain:
             "hold_count": hold_count + 1,
             "hop_count": 0,
             "pending_reply": "",
-            "seen_seq": latest,
+            # max(): the cursor never regresses. In every legitimate path
+            # latest > seen already; the max only matters for the defensive
+            # foreign-409 shape (unknown last_seq → 0), where regressing
+            # seen_seq would re-serve the whole room as inbox next turn.
+            "seen_seq": max(seen, latest),
             "author_names": names,
             "inbox": [*(state.get("inbox") or []), *extra],
             "messages": [*(state.get("messages") or []), note],
@@ -857,10 +862,8 @@ class Brain:
             "room_id": str(room_id),
             "inbox": inbox,
             "author_names": names,
-            "human_ids": sorted(
-                str(p.id) for p in ctx.participants if p.kind == "human"
-            ),
             "agent_count": agent_count,
+            "agent_only_stretch": int(ctx.agent_only_stretch),
             "seen_seq": seen_seq,
             "triage_actionable": False,
             "triage_reason": "",
@@ -893,6 +896,15 @@ class Brain:
             await self._release_unfulfilled(
                 agent_id, room_id, ctx.agent.name, final.get("claims") or []
             )
+        # A token outlives only a COMMITTED send (which cleared it in
+        # _commit). Any other ending — skipped, held_exhausted, llm_error,
+        # crash — must drop it, or the 2-minute TTL window lets a future
+        # turn's preemptive send_anyway spend an acknowledgement that was
+        # shown in a different turn (Cumora §5d). It is cleanup, not
+        # authority: clearing can fail (Redis down) without affecting the
+        # result — a stale token still has to beat the seq check.
+        if self._hold_redis is not None:
+            await clear_hold(self._hold_redis, agent_id, room_id)
         return TurnResult(
             agent_id=agent_id,
             agent_name=ctx.agent.name,
