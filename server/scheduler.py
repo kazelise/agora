@@ -164,10 +164,26 @@ class Scheduler:
         await asyncio.gather(*(lane.wait_idle() for lane in list(self._lanes.values())))
 
 
-async def fanout_message(hub: Any, client: redis.Redis, row: Any) -> None:
-    """Broadcast + wake, the same path human POST and a runtime reply share."""
+async def fanout_message(
+    hub: Any,
+    client: redis.Redis,
+    row: Any,
+    *,
+    on_committed: Callable[[UUID], Awaitable[None]] | None = None,
+) -> None:
+    """Broadcast + wake, the same path human POST and a runtime reply share.
+
+    `on_committed` (room_id) fires for every landed message; the stall
+    sweeper uses it to reset its decline budget (state changed, fresh
+    nudge budget).
+    """
     await hub.broadcast(row.room_id, row.as_ws())
     await publish_wake(client, row.room_id, row.author_id, row.seq)
+    if on_committed is not None:
+        try:
+            await on_committed(UUID(str(row.room_id)))
+        except Exception:
+            logger.warning("on_committed hook failed — fail-open", exc_info=True)
 
 
 async def publish_wake(

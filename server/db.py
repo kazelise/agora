@@ -180,11 +180,73 @@ async def list_agent_participants(pool: asyncpg.Pool, room_id: UUID) -> list[Par
         SELECT {_PARTICIPANT_COLS}
         FROM participants
         WHERE room_id = $1 AND kind = 'agent'
-        ORDER BY created_at
+        ORDER BY created_at, id
         """,
         room_id,
     )
     return [_participant(r) for r in rows]
+
+
+async def list_active_rooms(pool: asyncpg.Pool) -> list[Any]:
+    """Every room with its latest message, for the stall sweep.
+
+    One query instead of N+1 per room: the LATERAL join fetches each
+    room's newest row (with the author's kind) alongside the room row.
+    Rooms with no messages are skipped by the sweep (nothing can be owed
+    about silence).
+    """
+    return await pool.fetch(
+        """
+        SELECT r.id, r.name, r.created_at,
+               latest.created_at AS last_at,
+               latest.seq, latest.body, latest.author_id, latest.author_kind
+        FROM rooms r
+        LEFT JOIN LATERAL (
+            SELECT m.seq, m.body, m.created_at, m.author_id, p.kind AS author_kind
+            FROM messages m
+            JOIN participants p ON p.id = m.author_id
+            WHERE m.room_id = r.id
+            ORDER BY m.seq DESC
+            LIMIT 1
+        ) latest ON true
+        WHERE latest.seq IS NOT NULL
+        """
+    )
+
+
+async def count_agent_only_stretch(pool: asyncpg.Pool, room_id: UUID) -> int:
+    """Agent messages since the room's last human message (loop-cap cursor).
+
+    Room-level, not per-inbox: the inbox is this turn's delivery batch, the
+    stretch is the room's conversation state — a quick ping-pong keeps each
+    inbox tiny while the room circles, so the cap must count across turns.
+    One statement, ordered by the gapless per-room seq. Agents only: a
+    human message resets the count by definition; a room with no human
+    message yet (the MOST loop-prone shape) counts everything.
+    """
+    return int(
+        await pool.fetchval(
+            """
+            SELECT COUNT(*) FILTER (WHERE author_kind = 'agent')
+            FROM (
+                SELECT p.kind AS author_kind
+                FROM messages m
+                JOIN participants p ON p.id = m.author_id
+                WHERE m.room_id = $1
+                  AND m.seq > COALESCE((
+                        SELECT m2.seq
+                        FROM messages m2
+                        JOIN participants p2 ON p2.id = m2.author_id
+                        WHERE m2.room_id = $1 AND p2.kind = 'human'
+                        ORDER BY m2.seq DESC
+                        LIMIT 1
+                  ), 0)
+            ) stretch
+            """,
+            room_id,
+        )
+        or 0
+    )
 
 
 async def create_computer(pool: asyncpg.Pool, name: str, token: str) -> ComputerRow:
@@ -288,19 +350,19 @@ async def insert_message(
     # raise StaleWriteError instead of inserting.
     async with pool.acquire() as conn:
         async with conn.transaction():
-            belongs = await conn.fetchval(
-                "SELECT 1 FROM participants WHERE id = $1 AND room_id = $2",
+            kind = await conn.fetchval(
+                """
+                SELECT kind FROM participants
+                WHERE id = $1 AND room_id = $2
+                """,
                 author_id,
                 room_id,
             )
-            if belongs is None:
+            if kind is None:
                 exists = await conn.fetchval("SELECT 1 FROM rooms WHERE id = $1", room_id)
                 if exists is None:
                     raise NotFoundError(f"room {room_id} not found")
                 raise NotFoundError(f"author {author_id} is not in room {room_id}")
-            kind = await conn.fetchval(
-                "SELECT kind FROM participants WHERE id = $1", author_id
-            )
             current = await conn.fetchval(
                 "SELECT last_seq FROM rooms WHERE id = $1 FOR UPDATE",
                 room_id,

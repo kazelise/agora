@@ -93,12 +93,22 @@ class HttpWorld:
 
     def _raise_for_status(self, resp: httpx.Response) -> None:
         if resp.status_code == 409:
-            detail = resp.json().get("detail") or {}
+            # Our own 409s always carry this shape, but a proxy or gateway
+            # between the daemon and the server may rewrite the body. A
+            # 409 without our fields is a stale-write-shaped refusal with
+            # no details: raise StaleWrite with an empty newer list rather
+            # than crash parsing.
+            try:
+                detail = resp.json().get("detail") or {}
+                if not isinstance(detail, dict):
+                    detail = {}
+            except Exception:
+                detail = {}
             if detail.get("error") == "duplicate_reply":
                 raise DuplicateReply(int(detail["peer_seq"]))
             newer_raw = detail.get("messages") or []
             newer = [_message(item) for item in newer_raw]
-            raise StaleWrite(int(detail["last_seq"]), newer)
+            raise StaleWrite(int(detail.get("last_seq") or 0), newer)
         resp.raise_for_status()
 
     async def load_turn(self, agent_id: UUID, room_id: UUID) -> TurnContext:
@@ -123,6 +133,7 @@ class HttpWorld:
             participants=people,
             last_read_seq=int(data["last_read_seq"]),
             seen_seq=int(data["seen_seq"]),
+            agent_only_stretch=int(data.get("agent_only_stretch") or 0),
         )
 
     async def get_last_read(self, agent_id: UUID, room_id: UUID) -> int:

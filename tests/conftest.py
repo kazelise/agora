@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -68,3 +69,23 @@ def require_services() -> None:
         pytest.skip(
             "Postgres/Redis unreachable and docker compose could not start them"
         )
+
+
+@pytest.fixture
+async def app_client(require_services: None) -> AsyncIterator[tuple]:
+    from collections.abc import AsyncIterator as _AI
+
+    import httpx
+    from fastapi import FastAPI
+
+    from server import db
+    from server.main import create_app
+
+    app = create_app(stub_turns=True)
+    async with app.router.lifespan_context(app):
+        await db.truncate_all(app.state.pool)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            yield app, client

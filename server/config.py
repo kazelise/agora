@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     k8s_ttl_s: int = 120
     k8s_secret_name: str = ""
 
+    # Stall sweep (server/stall.py): proactive wake for quiet rooms with
+    # work owed. Arithmetic eligibility, per-stall decline cap.
+    stall_min_s: float = 20.0
+    stall_max_s: float = 3600.0
+    stall_max_nudges: int = 3
+    stall_interval_s: float = 10.0
+
 
 @lru_cache
 def get_settings() -> Settings:

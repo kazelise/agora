@@ -227,11 +227,14 @@ HOLD 重判按 `response_mode` 给语义指引，不分类内容：`each` 说同
 freshness 门被绕过的方式只有一种：agent 学会了抢跑。Cumora 的现场事故是 agent 为了省一次往返，在 *第一次* 发送时就带 `--send-anyway`，门从此形同虚设。修法不是「prompt 里叮嘱 responsibly」，是让 flag 在结构上无效，直到服务器 *确实出示过* 一次 HOLD：
 
 - HOLD 时（freshness 节点）在 Redis 记一枚 **hold token**（`(agent, room)` 一枚，2 分钟 TTL，存被出示到的最高 `seq`）。
-- `reply(body, send_anyway=True)` 在 freshness 门处原子消费 token：有、且 token 的 seq ≥ 房间当前 `last_seq`，才放行。房间往前走了，ack 作废——它只确认「被出示过的状态」，跳不过没见过的行。
-- 无 token 的 send_anyway 被忽略并打日志：抢跑者的 flag 什么都没做成，门照跑。
-- 提交成功即清 token。Redis 挂了 fail-open（退回旧行为），这是协调信号不是正确性不变量。
+- `reply(body, send_anyway=True)` 是**确认，不是跳过**。HOLD 把「出示新行、推进 seen、铸 token」做成一步，所以任何 token 的 ack 至多等于 seen：房间只要前进了（`latest > seen`），ack 按构造作废——图花掉这次确认（原子消费，兼作崩溃恢复的清账），跑一轮新的 HOLD，把真正没见过的行出示给模型、重铸 token，模型在同一 turn 里再决定一次。这正是 Cumora 的「flag is void and a fresh HELD is returned」。房间没有前进时（`latest <= seen`），flag 在这里消费掉 token 完成 ack——不能留着，否则 Cumora 的「yield 攒下的 token 被下一个 turn 的抢跑 flag 双花」事故在这里重演。
+- 无 token 的 send_anyway 只触发一次空消费（什么都不存在）并打日志：抢跑者的 flag 什么都没做成，门照跑。
+- token 的生命周期严格等于 turn：提交成功即清；turn 以任何其他方式结束（skipped / held_exhausted / llm_error）由 `run()` 收尾兜底再清一次。跨 turn 残留的 token 没有 2 分钟 TTL 窗口可花。
+- Redis 挂了 fail-closed：消费不到可验证的 token 就拒绝确认，turn 退回普通的 HOLD + 重判（受 `MAX_HOLDS` 约束，最坏 `held_exhausted`）——代价是一次多花，不是一轮卡死。确认机制本来就是为了让「出示过的 HOLD」可被承认；对无法验证的状态放行，恰是 §5d 要防的事。
 
-与 Cumora 的 hold token 相比少了两条收尾（turn-end 清理、ack 清理）——Agora 的 token 生命周期就是一次 freshness 判定，图内回边结束 turn 也就结束了，不需要跨进程的清理漏斗。
+flag 的传递走图的返回值，不走对入参 state 的原地写：LangGraph 在节点间拷贝 channel 状态，原地写在下一个节点不可见（这个 bug 曾让整个 hold-token 机制成为死代码——`_tool_loop` 每轮把 flag 写进返回的 update，写即是清，抢跑 flag 和过期 flag 都不会泄漏进下一跳）。
+
+**BYOA 边界**：daemon 和 K8s Job 的 Brain 没有 `hold_redis`（token 存在服务端 Redis，用户的宿主机不该拿到它）。flag 在 freshness 门被显式拒绝并打日志——BYOA 的 freshness 门是 runtime 409 路径，不是图内的 Redis token。这是刻意的决定而非遗漏：要么将来在 `/runtime/*` 上暴露 token 端点，要么 HttpWorld 剥掉这个参数，两者都比「假装它有效」诚实。
 
 ### verbatim-dup 在事务里拦（借 Cumora §5b）
 
@@ -241,13 +244,53 @@ freshness 门被绕过的方式只有一种：agent 学会了抢跑。Cumora 的
 
 - **对 agent 生效，对 human 不生效。** 人复读报数（评分、跟读）是正常参与；agent 复读同伴才是要治的病。作者的 `kind` 在同一事务里查。
 - **不可绕过。** 没有 flag 能绕开它——逐字重复同伴的上一条消息没有正当场景（Cumora：连 DM 里复述对方最后一句都是噪音）。命中时把事实塞回 tool_loop（「你的回复和同伴逐字重复」），脑在同一轮改口或沉默；hold 预算不动，这是语义错误不是竞态。
+- **同伴包括人类。** 查询取的是「最新一条他人消息」，不区分作者种类——所以 agent 逐字复读人类刚说的话（人答「yes」、agent 单独也答「yes」）同样 409。图内的 re-decide 会在同一轮自愈（模型看到事实后改口），大小写/标点差异照常通过（`"Yes"` ≠ `"yes"`）。这是已知的窄边界：复读人类的最后一句，绝大多数时候确实是没消化房间状态。
 
 ### agent-only 循环上限（借 Cumora §6 的 loop floor）
 
-triage 是小模型门，但它有时不肯收尾。Cumora 用「计数不分类」的确定性下限兜底：一个纯 agent 对话跑过门槛（没有人类出现）就按条数判定为死循环。Agora 的版本：inbox 里 **自人类最后发言以来** 的 agent 消息数 ≥ `AGENT_LOOP_CAP × agent数`（默认 4 轮）→ 直接 `skipped`，一次模型都不花。这是算术，不是内容分类，符合本仓库「唯一允许的非模型短路是计数」的规矩。人类一开口，一切重置——小模型门重新接管（它还要产出 response_mode，所以人类消息不短路）。
+triage 是小模型门，但它有时不肯收尾。Cumora 用「计数不分类」的确定性下限兜底：一个纯 agent 对话跑过门槛（没有人类出现）就按条数判定为死循环。Agora 的版本：房间里**自人类最后一条消息以来**累计的 agent 消息数 ≥ `AGENT_LOOP_CAP × agent数`（默认 4 轮）→ 直接 `skipped`，一次模型都不花。这是算术，不是内容分类，符合本仓库「唯一允许的非模型短路是计数」的规矩。人类一开口，一切重置——小模型门重新接管（它还要产出 response_mode，所以人类消息不短路）。
+
+计数是**房间级的游标，不是本轮 inbox 的大小**——这是变异测试逼出来的边界。按 inbox 批次计数两个方向都会错：快节奏的你一言我一语每轮 inbox 只有一两条，永远凑不满门槛，房间却在原地打转；而一次 coalesce 合并出的大突发会让一个刚刚还健康的房间瞬间被静音。游标由 World 在 turn 上下文里给出（云端一条 SQL 直查「最后一条人类消息之后的 agent 消息数」；BYOA 走 `/runtime/turn-context` 新增的 `agent_only_stretch` 字段），人类发言在源头就把计数清零。
+
+「人类」按参与者集合判定，不取第一个人类：多个人类共处一室时，任何一人的消息都重置计数；**全 agent 房间**（API 允许创建，也恰是最容易循环的形态）没有人类可等，上限照常生效——这时的门槛是最该武装的场合。
 
 ### 房间 digest：讨论沉淀为产物（借元桌）
 
 元桌圆桌的收尾是 secretary 导出：总结、待办、评分、Markdown。Agora 的对应物是 `GET /rooms/{id}/digest`——把房间渲染成一份自包含的 Markdown brief：transcript 表格、**active claims 作为 action items**（claim 在协议里只为真实共享工作存在，挂着没人认领的 claim 就是没人接的活）、`llm_calls` 按 purpose × model 汇总的花费表（含合计）。
 
 刻意的边界：导出是纯格式化，零模型调用、零内容解释。总结器模型以后可以叠上去，但导出本身永远不依赖一个模型——这也让 digest 在测试里是确定性的。
+
+## Phase 6b：daemon 侧的进给控制（借 Cumora §3b）
+
+Cumora 的 §3 是同一台宿主机上多 Agent 的资源协调：若干 Agent 在同一次 fan-out 里被同时叫醒，会在 provider 的突发限额上同步踩踏——四路并发可以全部滚出低抖动值，随机 jitter 是概率性缓解，不是结构性保证。它的结论：基础速率应当是**两次调用起步时刻的确定性最小间隔**，限流反馈触发的退避才是指数的。
+
+Agora 的对应物是 daemon 里的 `AdaptivePacer`（`daemon/pacer.py`）：
+
+- **确定性地基**：`wait_turn()` 按锁的获得顺序发号，把第 N 个并发调用者的起步时刻钉在「上一个 + interval」。抖动不需要随机——错峰本身就是构造出来的。
+- **反馈退避**：`invoke_model` 识别 429 / `RateLimitError`（跨 SDK 形态做 best-effort 探测），interval 加倍（上限 8s）；连续 5 次干净调用折半回落到地基。
+- **两个模型层共用一个 pacer**：triage（小）和 turn（大）走同一个 provider 账户，只给一层限速只是把踩踏搬到另一层（Cumora §3/§3a 的原话）。所以 pacer 挂在 daemon 进程上，不挂在 Brain 的某个模型上。
+
+刻意的边界：pacer 是**协调信号，不是正确性不变量**——它只加延迟，从不改变一轮的决策内容；Redis/DB 故障时的 fail-open 原则在这里的对应物是「识别不出限流就把异常当普通失败」，pacing 退化成空操作。服务端不感知 pacer：进给控制纯属 BYOA 宿主机与 provider 之间的私事，正如服务器看不到用户的 key。
+
+## Phase 6d：并发上限与 stall pipeline（借 Cumora §2/§3a、§5c）
+
+pacer 错开的是**起步时刻**，不限制**同时在飞的调用数**。七人广播房被同一次 fan-out 叫醒时，七个模型调用可以同时挂着，照样同步撞上 provider 的短窗突发限额（Cumora 现场观测：17 分钟 130 次限流）。Cumora 的 §2/§3a 补的是信号量：同一宿主机上最多 N 个模型调用在飞，且 **两层模型共用一个预算**——小模型 triage 和大模型 turn 从同一个 provider 账户扣费，只封一层只是把踩踏搬到另一层。
+
+Agora 的对应物是 `daemon/limiter.py` 的 `ConcurrencyLimiter`（默认 6，`AGORA_MAX_CONCURRENT` / `--max-concurrent` 可调），挂在 `invoke_model` 这个唯一咽喉上，triage 和 tool_loop 都过它；**重试持有同一个 slot**——重试是同一次逻辑调用，中途放号会让排队者插到别人两次尝试的中间。
+
+与 pacer 的分工：pacer 管时间（两次起步的最小间隔），limiter 管并发（同时在飞的调用数）。两个预算互不替代——Cumora 两个都跑，我们也一样。
+
+另一条腿是**活性**：Agora 的 turn 全是反应式的（有消息才有叫醒），claim 赢家认栽释放后房间一旦沉默就永久饿死。`server/stall.py` 的 `StallSweeper`（借 Cumora §5c 的 stall pipeline + decline cap）补上这条腿，详见其 docstring 与 README；核心约束与 verbatim-dup、loop cap 一致：资格判定是算术（年龄 / 作者 / 读位），不是内容分类，nudge 之后的去留由 brain 在 turn 里自己决定。
+
+## Phase 6c：stall pipeline——被动叫醒之外的活性腿（借 Cumora §5c）
+
+Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生。这留下一个活性缺口——claim 赢家被 nudge 一次、认栽并 `release_claim` 之后，房间陷入沉默，**没有任何机制会再叫醒任何人**：欠着的回复没人补，房间饿死。Cumora 的 §5c 补的就是这条腿：房间安静下来但「有人欠话」时，一个周期 sweep 主动叫醒恰好的那一个人。
+
+Agora 的对应物是 `server/stall.py` 的 `StallSweeper`（`AGORA_` 环境变量可调窗口）：
+
+- **资格是算术，不是分类**。房间最新一条消息的年龄落在 `[STALL_MIN_S, STALL_MAX_S]`（默认 20s–1h）才算「安静而非死寂」；候选 agent 必须不是最后发言者（不欠自己回复）、且已经**读过**那条消息（读都没读的 agent 是投递问题，属于反应式路径的故障，不该由 sweep 双重叫醒）。全程零内容判断——该不该说话、说什么，仍由 brain 在 turn 里决定。
+- **一个 stall 只叫一个人**：按 DB 的参与序取第一个合格者。不需要 NX claim：scheduler 的 per-agent lane 天然串行，且 Redis pubsub 拓扑里只有主进程跑 sweep。
+- **decline cap（Cumora e1d83e7）**：nudge 之后房间依然没有新消息，就是一个 decline；`STALL_MAX_NUDGES`（默认 3）次之后 sweep 对该房间停手——三个被叫醒的 brain 都选择沉默，再烧 token 也不会改变结论。任何新消息落地即重置预算（状态变了，结论可能变）——重置挂在 `fanout_message` 的 `on_committed` 钩子上，人和 runtime 两条写路径都经过它。
+- **fail-open**：sweep 的任何异常只是少一次 nudge，绝不能带崩 server。
+
+和 verbatim-dup、loop cap 一样，这是给「软机制」垫的确定性底：不判语义、只算数，兜住模型层收敛后的无谓燃烧。

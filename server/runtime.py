@@ -19,7 +19,7 @@ from server.auth import hosted_agent, require_host
 from server.computers import ComputerHub
 from server.models import MessageOut
 from server.runtime_types import Host
-from server.scheduler import fanout_message
+from server.scheduler import fanout_message  # noqa: F401 (re-exported for tests)
 
 router = APIRouter(prefix="/runtime", tags=["runtime"])
 
@@ -83,6 +83,7 @@ class TurnContextOut(BaseModel):
     seen_seq: int
     participants: list[RuntimeParticipantOut]
     inbox: list[RuntimeMessageOut]
+    agent_only_stretch: int = 0
 
 
 async def named_since(
@@ -129,6 +130,9 @@ async def turn_context(
             for p in people
         ],
         inbox=inbox,
+        agent_only_stretch=await db.count_agent_only_stretch(
+            request.app.state.pool, room_id
+        ),
     )
 
 
@@ -197,7 +201,9 @@ async def reply(
         ) from exc
     except db.NotFoundError as exc:
         raise HTTPException(status_code=404, detail=exc.detail) from exc
-    await fanout_message(request.app.state.hub, request.app.state.redis, row)
+    await request.app.state.fanout_with_stall_reset(
+        request.app.state.hub, request.app.state.redis, row
+    )
     return row.as_out()
 
 

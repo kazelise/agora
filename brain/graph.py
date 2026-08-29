@@ -98,8 +98,8 @@ class BrainState(TypedDict, total=False):
     room_id: str
     inbox: list[InboxItem]
     author_names: dict[str, str]
-    human_id: str
     agent_count: int
+    agent_only_stretch: int
     seen_seq: int
     triage_actionable: bool
     triage_reason: str
@@ -118,8 +118,10 @@ class BrainState(TypedDict, total=False):
 def reply(body: str, send_anyway: bool = False) -> str:
     """Post your message to the room.
 
-    send_anyway bypasses a freshness HOLD — but only one the server has
-    actually shown you this turn (a HELD reply armed a token). Without a
+    send_anyway acknowledges the freshness HOLD this turn showed you
+    (the HELD reply armed a token). It never skips the gate: if the
+    room moved past the acknowledged state, the ack is void and a
+    fresh HOLD shows you the truly-new rows for a re-decide. Without a
     token the flag does nothing and the gate still runs.
     """
     return body
@@ -239,15 +241,71 @@ def _payload_shape(messages: list[Any]) -> str:
     return "[" + " ".join(bits) + "]"
 
 
-async def invoke_model(model: Any, messages: list[Any], *, label: str) -> Any | None:
+def _is_rate_limited(exc: BaseException) -> bool:
+    """Best-effort detection of provider throttling across SDK shapes.
+
+    OpenAI SDK: RateLimitError (subclass of APIStatusError, status 429);
+    httpx-style payloads put "rate limit" in the message. Unrecognized
+    errors are treated as ordinary failures — pacing degrades to nothing.
+    """
+    cls = type(exc)
+    if cls.__name__ == "RateLimitError":
+        return True
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    text = str(exc).lower()
+    return "rate limit" in text or "429" in text
+
+
+async def invoke_model(
+    model: Any,
+    messages: list[Any],
+    *,
+    label: str,
+    pacer: Any | None = None,
+    limiter: Any | None = None,
+) -> Any | None:
     """Call the model; retry once after a short backoff; None if both fail.
 
+    When a pacer is given, every call start first waits for its slot; a
+    rate-limited response doubles the global interval, clean calls restore
+    it. When a limiter is given, the call runs inside a concurrency slot —
+    a per-computer cap shared by BOTH model classes (Cumora §2/§3a: the
+    pacer spaces call starts, the semaphore bounds calls in flight; the
+    retry stays inside the same slot, it is the same logical call).
     Fail-open: a dead relay is a missed reply, not a crashed turn. No
     caller should write a ledger row unless this returns a message.
     """
+    if limiter is not None:
+        async with limiter.slot():
+            return await _invoke_with_pacer(model, messages, label=label, pacer=pacer)
+    return await _invoke_with_pacer(model, messages, label=label, pacer=pacer)
+
+
+async def _invoke_with_pacer(
+    model: Any,
+    messages: list[Any],
+    *,
+    label: str,
+    pacer: Any | None,
+) -> Any | None:
+    if pacer is not None:
+        waited = await pacer.wait_turn()
+        if waited:
+            logger.info("pacer %s waited %.1fs", label, waited)
     try:
-        return await model.ainvoke(messages)
+        result = await model.ainvoke(messages)
+        if pacer is not None:
+            pacer.on_ok()
+        return result
     except Exception as first:
+        if pacer is not None and _is_rate_limited(first):
+            logger.warning(
+                "LLM %s rate-limited — pacer interval now %.1fs",
+                label,
+                pacer.on_rate_limited(),
+            )
         logger.warning(
             "LLM %s failed (%s: %s); retrying once; payload=%s",
             label,
@@ -256,9 +314,20 @@ async def invoke_model(model: Any, messages: list[Any], *, label: str) -> Any | 
             _payload_shape(messages),
         )
         await asyncio.sleep(LLM_RETRY_BACKOFF_S)
+        if pacer is not None:
+            await pacer.wait_turn()
         try:
-            return await model.ainvoke(messages)
+            result = await model.ainvoke(messages)
+            if pacer is not None:
+                pacer.on_ok()
+            return result
         except Exception as second:
+            if pacer is not None and _is_rate_limited(second):
+                logger.warning(
+                    "LLM %s rate-limited on retry — pacer interval now %.1fs",
+                    label,
+                    pacer.on_rate_limited(),
+                )
             logger.warning(
                 "LLM %s retry failed (%s: %s) — ending turn llm_error; payload=%s",
                 label,
@@ -281,6 +350,8 @@ class Brain:
         checkpointer: Any | None = None,
         on_committed: Callable[[WorldMessage], Awaitable[None]] | None = None,
         hold_redis: Any | None = None,
+        pacer: Any | None = None,
+        limiter: Any | None = None,
     ) -> None:
         self.small_model_name = policy.assert_triage_model(
             policy.small_model_name() if small_model_name is None else small_model_name
@@ -294,6 +365,12 @@ class Brain:
         # Hold tokens live in Redis (server-side). The daemon constructs its
         # Brain without one; its freshness gate is the runtime 409 path.
         self._hold_redis = hold_redis
+        # Optional AdaptivePacer (daemon-side): deterministic spacing between
+        # LLM call starts plus exponential backoff on provider rate limits.
+        self._pacer = pacer
+        # Optional ConcurrencyLimiter (daemon-side): per-computer cap on
+        # model calls in flight, shared by both model classes.
+        self._limiter = limiter
         # InMemorySaver: langgraph-checkpoint-postgres wants psycopg/libpq;
         # this repo is asyncpg-only. HOLD is an in-graph loop, so a durable
         # saver is not required for correctness. Swap via this arg later.
@@ -338,7 +415,7 @@ class Brain:
         return "tool_loop"
 
     def _after_commit(self, state: BrainState) -> str:
-        if state.get("outcome") in {"held_exhausted", "replied", "duplicate"}:
+        if state.get("outcome") in {"held_exhausted", "replied"}:
             return END
         return "tool_loop"
 
@@ -355,25 +432,28 @@ class Brain:
         )
 
     async def _triage(self, state: BrainState) -> dict[str, Any]:
-        inbox = state.get("inbox") or []
-        human_id = state.get("human_id") or ""
         # Agent↔agent loop cap (deterministic backstop under the model
         # gate): an agent-only stretch past the cap is stale by COUNT, not
         # by wording — the one class of triage that is arithmetic, not
         # classification (Cumora §6 loop floors; this repo's rule that a
-        # non-model short-circuit must be counting, never content). A
-        # human in the inbox resets everything: the model gate always runs
-        # there, because it also produces the response_mode the graph and
-        # HOLD guidance depend on.
+        # non-model short-circuit must be counting, never content). The
+        # count is ROOM-level — every agent message since the last human
+        # message, across turns — supplied by the World in TurnContext.
+        # Counting the per-turn inbox instead mis-scopes both directions:
+        # quick ping-pong replies each stay under one inbox batch yet the
+        # room is circling, and a single huge coalesced burst trips the
+        # cap on a room that was fine one message ago. No humans at all
+        # is the MOST loop-prone shape, so the cap arms hardest there;
+        # any human's message resets the counter at the source.
         agent_count = int(state.get("agent_count") or 0)
-        if agent_count > 0 and human_id:
-            since_human = sum(1 for m in inbox if str(m["author_id"]) != human_id)
+        stretch = int(state.get("agent_only_stretch") or 0)
+        if agent_count > 0:
             cap = AGENT_LOOP_CAP * agent_count
-            if since_human >= cap:
+            if stretch >= cap:
                 logger.info(
                     "triage %s agent-only run past loop cap (%s >= %s) — staying silent",
                     state["agent_name"],
-                    since_human,
+                    stretch,
                     cap,
                 )
                 return {
@@ -381,14 +461,15 @@ class Brain:
                     "triage_actionable": False,
                     "triage_reason": (
                         f"agent-only run past loop cap "
-                        f"({since_human} agent messages without a human; "
+                        f"({stretch} agent messages without a human; "
                         f"cap {AGENT_LOOP_CAP} x {agent_count} agents)"
                     ),
                     "response_mode": "",
                 }
         prompt = (
             f"You are {state['agent_name']}. Persona: {state.get('persona') or 'none'}.\n\n"
-            f"New messages since you last read:\n{_format_inbox(inbox)}\n\n"
+            f"New messages since you last read:\n"
+            f"{_format_inbox(state.get('inbox') or [])}\n\n"
             "Decide whether you should act. Reply with a single JSON object, no markdown:\n"
             '{"actionable": bool, "reason": str, "response_mode": "me"|"each"|"one-of-us"}\n'
             "me = addressed to you; new messages from others rarely mean you should skip.\n"
@@ -398,7 +479,11 @@ class Brain:
             "completed the request, actionable=false."
         )
         ai = await invoke_model(
-            self.small, [SystemMessage(content=prompt)], label="triage"
+            self.small,
+            [SystemMessage(content=prompt)],
+            label="triage",
+            pacer=self._pacer,
+            limiter=self._limiter,
         )
         if ai is None:
             return {
@@ -480,7 +565,9 @@ class Brain:
             history = [SystemMessage(content=_tool_prompt(state))]
 
         bound = self.big.bind_tools(TOOLS) if hasattr(self.big, "bind_tools") else self.big
-        ai = await invoke_model(bound, history, label="tool_loop")
+        ai = await invoke_model(
+            bound, history, label="tool_loop", pacer=self._pacer, limiter=self._limiter
+        )
         if ai is None:
             return {"outcome": "llm_error"}
         await self._ledger(state, "turn", ai)
@@ -489,6 +576,7 @@ class Brain:
         after: list[BaseMessage] = [*history, ai]
         claims = list(state.get("claims") or [])
         pending = ""
+        send_anyway = False
         for tc in getattr(ai, "tool_calls", None) or []:
             name = _tc_get(tc, "name")
             args = _tc_get(tc, "args") or {}
@@ -517,19 +605,24 @@ class Brain:
                 body = str(args.get("body") or "")
                 if body:
                     pending = body
-                    if _tc_get(args, "send_anyway"):
-                        state["send_anyway"] = True
+                    send_anyway = send_anyway or bool(_tc_get(args, "send_anyway"))
                     after.append(ToolMessage(content="queued", tool_call_id=call_id))
                 else:
                     after.append(ToolMessage(content="empty body ignored", tool_call_id=call_id))
             else:
                 after.append(ToolMessage(content=f"unknown tool {name}", tool_call_id=call_id))
 
+        # send_anyway must travel in the returned update: LangGraph copies
+        # channel state between nodes, so an in-place write to `state`
+        # never reaches `_freshness` (verified by a minimal two-node repro).
+        # Writing it every round both sets it on a flagged call and clears
+        # it afterwards, so a stale flag cannot leak into the next hop.
         update: dict[str, Any] = {
             "messages": after,
             "hop_count": hop,
             "claims": claims,
             "pending_reply": pending,
+            "send_anyway": send_anyway,
         }
         if pending:
             return update
@@ -603,7 +696,11 @@ class Brain:
             "hold_count": hold_count + 1,
             "hop_count": 0,
             "pending_reply": "",
-            "seen_seq": latest,
+            # max(): the cursor never regresses. In every legitimate path
+            # latest > seen already; the max only matters for the defensive
+            # foreign-409 shape (unknown last_seq → 0), where regressing
+            # seen_seq would re-serve the whole room as inbox next turn.
+            "seen_seq": max(seen, latest),
             "author_names": names,
             "inbox": [*(state.get("inbox") or []), *extra],
             "messages": [*(state.get("messages") or []), note],
@@ -612,33 +709,55 @@ class Brain:
     async def _freshness(self, state: BrainState) -> dict[str, Any]:
         # Cheap first check. The transactional insert is the invariant.
         room_id = UUID(state["room_id"])
+        agent_id = UUID(state["agent_id"])
         latest = await self.world.get_room_last_seq(room_id)
         seen = int(state["seen_seq"])
         if latest <= seen:
+            if state.get("send_anyway"):
+                # Nothing new since the HELD envelope: the ack spends here.
+                # Consuming (rather than leaving the token armed) closes
+                # Cumora's double-spend hole — a yielded token must not be
+                # reusable by a later turn's preemptive flag.
+                acked = await consume_hold(self._hold_redis, agent_id, room_id)
+                if acked is not None:
+                    logger.info(
+                        "send_anyway %s acked held state (token seq=%s, room unchanged)",
+                        state["agent_name"],
+                        acked,
+                    )
+                else:
+                    logger.info(
+                        "send_anyway %s no-op (room unchanged since last read)",
+                        state["agent_name"],
+                    )
+                return {"send_anyway": False}
             return {}
-        # send_anyway is an ACKNOWLEDGEMENT, not a free pass (Cumora §5d):
-        # it works only if a prior HOLD this turn armed a token, and the
-        # token is seq-bound — it acknowledges exactly the state that was
-        # shown, so if the room has moved past it the ack is void and the
-        # gate still runs (the fresh HOLD re-arms with the newer state).
-        if state.get("send_anyway"):
-            acked = await consume_hold(
-                self._hold_redis, UUID(state["agent_id"]), room_id
-            )
-            state["send_anyway"] = False
-            if acked is not None and acked >= latest:
-                logger.info(
-                    "send_anyway %s accepted (hold token acked seq=%s, latest=%s)",
-                    state["agent_name"],
-                    acked,
-                    latest,
-                )
-                return {}
+        if state.get("send_anyway") and self._hold_redis is None:
+            # This process has no hold-token store (BYOA daemon / K8s job).
+            # Deliberate: the runtime 409 freshness path is their gate, and
+            # a flag with nothing to ack must never look like a pass.
             logger.info(
-                "send_anyway %s ignored (%s) — gate still runs",
+                "send_anyway %s ignored (no hold-token store in this process)",
                 state["agent_name"],
-                "no hold token" if acked is None else f"token acked {acked} < latest {latest}",
             )
+            return {"send_anyway": False, **await self._hold(state, latest)}
+        if state.get("send_anyway"):
+            # The room moved past the shown state. Arming and showing are
+            # one step in _hold, so any token this process armed acks at
+            # most `seen` — the ack is void by CONSTRUCTION here, not by a
+            # seq comparison (an acked >= latest accept branch would be
+            # dead code). Spend the attempt — the atomic consume is also
+            # the crash-recovery cleanup for a token left armed by a turn
+            # that died before its end-of-turn clear — then run the fresh
+            # HOLD that shows the truly-new rows and re-arms.
+            await consume_hold(self._hold_redis, agent_id, room_id)
+            logger.info(
+                "send_anyway %s void (room at %s, shown state %s) — fresh HOLD",
+                state["agent_name"],
+                latest,
+                seen,
+            )
+            return {"send_anyway": False, **await self._hold(state, latest)}
         return await self._hold(state, latest)
 
     async def _commit(self, state: BrainState) -> dict[str, Any]:
@@ -731,9 +850,6 @@ class Brain:
 
         # Inbox is about to be shown to the model — high-water goes to Redis.
         await self.world.record_seen(agent_id, room_id, seen_seq)
-        human_id = next(
-            (str(p.id) for p in ctx.participants if p.kind == "human"), ""
-        )
         agent_count = sum(1 for p in ctx.participants if p.kind == "agent")
         initial: BrainState = {
             "agent_id": str(agent_id),
@@ -742,8 +858,8 @@ class Brain:
             "room_id": str(room_id),
             "inbox": inbox,
             "author_names": names,
-            "human_id": human_id,
             "agent_count": agent_count,
+            "agent_only_stretch": int(ctx.agent_only_stretch),
             "seen_seq": seen_seq,
             "triage_actionable": False,
             "triage_reason": "",
@@ -776,6 +892,15 @@ class Brain:
             await self._release_unfulfilled(
                 agent_id, room_id, ctx.agent.name, final.get("claims") or []
             )
+        # A token outlives only a COMMITTED send (which cleared it in
+        # _commit). Any other ending — skipped, held_exhausted, llm_error,
+        # crash — must drop it, or the 2-minute TTL window lets a future
+        # turn's preemptive send_anyway spend an acknowledgement that was
+        # shown in a different turn (Cumora §5d). It is cleanup, not
+        # authority: clearing can fail (Redis down) without affecting the
+        # result — a stale token still has to beat the seq check.
+        if self._hold_redis is not None:
+            await clear_hold(self._hold_redis, agent_id, room_id)
         return TurnResult(
             agent_id=agent_id,
             agent_name=ctx.agent.name,

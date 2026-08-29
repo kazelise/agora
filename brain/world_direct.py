@@ -69,12 +69,14 @@ class DirectWorld:
         rows = await db.list_messages(self.pool, room_id, since_seq=last_read)
         inbox = [_message(row, names.get(str(row.author_id), "?")) for row in rows]
         seen_seq = max((m.seq for m in inbox), default=last_read)
+        stretch = await db.count_agent_only_stretch(self.pool, room_id)
         return TurnContext(
             agent=_participant(agent),
             inbox=inbox,
             participants=[_participant(p) for p in people],
             last_read_seq=last_read,
             seen_seq=seen_seq,
+            agent_only_stretch=stretch,
         )
 
     async def get_last_read(self, agent_id: UUID, room_id: UUID) -> int:

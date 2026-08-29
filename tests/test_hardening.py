@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 import httpx
@@ -18,7 +18,7 @@ import pytest
 import redis.asyncio as redis
 
 from brain.holds import consume_hold, record_hold
-from brain.world import DuplicateReply
+from brain.world import DuplicateReply, StaleWrite
 from brain.world_direct import DirectWorld
 from server import db
 from server.main import create_app
@@ -172,11 +172,8 @@ async def test_graph_duplicate_reply_no_holds_spent(
 
 
 @pytest.mark.asyncio
-async def test_hold_token_roundtrip(
-    pool: asyncpg.Pool, redis_client: redis.Redis
-) -> None:
-    room_id, _human_id, agent_ids = await _room(pool)
-    agent_id = agent_ids[0]
+async def test_hold_token_roundtrip(redis_client: redis.Redis) -> None:
+    room_id, agent_id = uuid4(), uuid4()
     assert await consume_hold(redis_client, agent_id, room_id) is None
     await record_hold(redis_client, agent_id, room_id, 7)
     assert await consume_hold(redis_client, agent_id, room_id) == 7
@@ -185,13 +182,44 @@ async def test_hold_token_roundtrip(
 
 
 @pytest.mark.asyncio
-async def test_send_anyway_without_token_does_not_bypass(
-    pool: asyncpg.Pool, redis_client: redis.Redis
+async def test_consume_hold_fail_closed_when_redis_down(
+    redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pre-emptive send_anyway is ignored: the gate still HOLDs."""
+    """Redis outage → the ack is REFUSED (None), never honored: an
+    unverifiable token must not upgrade the flag into a free pass. The
+    gate keeps running, so the cost is one extra HOLD."""
+    room_id, agent_id = uuid4(), uuid4()
+    await record_hold(redis_client, agent_id, room_id, 5)
+
+    class BrokenClient:
+        def __getattr__(self, name: str):
+            raise redis.ConnectionError("redis down")
+
+        async def eval(self, *args: object, **kwargs: object) -> object:
+            raise redis.ConnectionError("redis down")
+
+    assert await consume_hold(BrokenClient(), agent_id, room_id) is None
+
+
+@pytest.mark.asyncio
+async def test_send_anyway_without_token_does_not_bypass(
+    pool: asyncpg.Pool, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-emptive send_anyway is ignored: the gate still HOLDs, and the
+    preemptive flag never touches the token store (no consume, no skip)."""
     room_id, human_id, agent_ids = await _room(pool)
     iris_id, marcus_id = agent_ids
     await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    consumed: list[int | None] = []
+    _real_consume = consume_hold
+
+    async def spy_consume(client: object, agent_id: UUID, room_id: UUID) -> int | None:
+        result = await _real_consume(client, agent_id, room_id)
+        consumed.append(result)
+        return result
+
+    monkeypatch.setattr("brain.graph.consume_hold", spy_consume)
 
     async def peer_first(_messages: list) -> object:
         await db.insert_message(pool, room_id, marcus_id, "3")
@@ -212,32 +240,53 @@ async def test_send_anyway_without_token_does_not_bypass(
 
     assert result.hold_count == 1
     assert result.reply_body == "4"
+    # The preemptive flag consumed NOTHING: the void path found no token
+    # (None — nothing to spend, ack refused) and armed no authority.
+    assert consumed == [None]
 
 
 @pytest.mark.asyncio
 async def test_send_anyway_with_token_bypasses_hold(
-    pool: asyncpg.Pool, redis_client: redis.Redis
+    pool: asyncpg.Pool, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """HELD once → token armed; the retry with send_anyway ships without
-    a second HOLD (the legitimate flow)."""
+    a second HOLD — the legitimate flow, and one that only works while
+    the room is exactly at the acknowledged state (seq binding)."""
     room_id, human_id, agent_ids = await _room(pool)
     iris_id, marcus_id = agent_ids
     await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    consumed: list[int | None] = []
+    _real_consume = consume_hold
+
+    async def spy_consume(client: object, agent_id: UUID, room_id: UUID) -> int | None:
+        result = await _real_consume(client, agent_id, room_id)
+        consumed.append(result)
+        return result
+
+    monkeypatch.setattr("brain.graph.consume_hold", spy_consume)
 
     async def peer_first(_messages: list) -> object:
         await db.insert_message(pool, room_id, marcus_id, "3")
         return tool_call("reply", {"body": "3"})
 
     async def retry_with_flag(_messages: list) -> object:
-        # The HELD envelope armed a token bound to seq 2; acknowledging it
-        # is legitimate — the agent has seen everything up to that point.
-        # (The body differs from the peer's, so the dup gate stays clear.)
+        # The HELD envelope armed a token bound to seq 2 (marcus's "3"),
+        # and no new message has landed since — the ack covers exactly the
+        # shown state. (The body differs from the peer's, so the dup gate
+        # stays clear.) Post-commit the graph re-enters tool_loop; the
+        # third scripted response keeps that hop silent.
         return tool_call("reply", {"body": "3, going with 4", "send_anyway": True})
 
     small = ScriptedChatModel(
         [triage_message(actionable=True, reason="each", response_mode="each")]
     )
-    big = ScriptedChatModel([peer_first, retry_with_flag])
+    # 1) peer_first (reply without flag) → HOLD; 2) retry_with_flag → token
+    # acked, ships; 3) post-commit re-decide (loop continues after commit)
+    # → silent.
+    big = ScriptedChatModel(
+        [peer_first, retry_with_flag, text_message("peer raced ahead; silence")]
+    )
     brain = Brain(
         DirectWorld(pool, redis_client),
         small_model=small,
@@ -255,6 +304,81 @@ async def test_send_anyway_with_token_bypasses_hold(
         iris_id,
         "3, going with 4",
     )
+    # The ack was REAL: the flagged reply spent the token the HOLD armed.
+    # (The mutation "flag never reaches the gate" kills this — consume
+    # never fires — and the mutation "token never armed" kills the
+    # roundtrip assertion upstream.)
+    assert consumed == [2]
+
+
+@pytest.mark.asyncio
+async def test_send_anyway_with_stale_token_re_holds(
+    pool: asyncpg.Pool, redis_client: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cumora §5d seq binding: the room moved past the acknowledged state,
+    so the ack is void — the gate runs a fresh HOLD (showing the truly-new
+    rows and re-arming the token) instead of letting the flag skip them."""
+    room_id, human_id, agent_ids = await _room(pool)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    consumed: list[int | None] = []
+    _real_consume = consume_hold
+
+    async def spy_consume(client: object, agent_id: UUID, room_id: UUID) -> int | None:
+        result = await _real_consume(client, agent_id, room_id)
+        consumed.append(result)
+        return result
+
+    monkeypatch.setattr("brain.graph.consume_hold", spy_consume)
+
+    async def peer_first(_messages: list) -> object:
+        await db.insert_message(pool, room_id, marcus_id, "3")
+        return tool_call("reply", {"body": "3"})
+
+    async def retry_with_flag(_messages: list) -> object:
+        # New message AFTER the HOLD armed the token at seq 2: latest is
+        # now 3, token acks 2 < 3 → void. A fresh HOLD must follow.
+        await db.insert_message(pool, room_id, marcus_id, "wait, 4 is mine")
+        return tool_call("reply", {"body": "3, going with 4", "send_anyway": True})
+
+    async def after_rehold(_messages: list) -> object:
+        # Second HELD showed seq 3 and re-armed the token at 3; the room
+        # has not moved since, so this ack is honored.
+        return tool_call("reply", {"body": "4 then", "send_anyway": True})
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="each", response_mode="each")]
+    )
+    # 1) peer_first → HOLD#1 (token@2); 2) flagged retry → void, HOLD#2
+    # (token@3, shows the new row); 3) flagged again → acked, ships;
+    # 4) post-commit re-decide → silent.
+    big = ScriptedChatModel(
+        [
+            peer_first,
+            retry_with_flag,
+            after_rehold,
+            text_message("peer raced ahead; silence"),
+        ]
+    )
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=small,
+        big_model=big,
+        hold_redis=redis_client,
+    )
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "replied"
+    assert result.reply_body == "4 then"
+    assert result.hold_count == 2
+    stored = await db.list_messages(pool, room_id)
+    assert [(m.author_id, m.body) for m in stored][-1] == (iris_id, "4 then")
+    # The flagged retry SPENT the stale token@2 before the fresh HOLD
+    # re-armed at 3 — the ack was consumed, not silently ignored, and the
+    # second flagged reply spent the re-armed token@3.
+    assert consumed == [2, 3]
 
 
 @pytest.mark.asyncio
@@ -279,6 +403,42 @@ async def test_successful_send_clears_lingering_token(
     result = await brain.run(iris_id, room_id)
 
     assert result.outcome == "replied"
+    assert await consume_hold(redis_client, iris_id, room_id) is None
+
+
+@pytest.mark.asyncio
+async def test_turn_end_clears_token_when_turn_ends_without_commit(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """S1: a token must not outlive the turn that earned it. HOLD arms
+    the token, then the turn ends WITHOUT a commit (the model declines
+    to re-reply) — a future turn's preemptive send_anyway must find
+    nothing to spend."""
+    room_id, human_id, agent_ids = await _room(pool)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    async def peer_first(_messages: list) -> object:
+        await db.insert_message(pool, room_id, marcus_id, "3")
+        return tool_call("reply", {"body": "3"})
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="each", response_mode="each")]
+    )
+    # Hop 1 triggers the HOLD; hop 2 declines (plain text, no reply) —
+    # the turn ends skipped, never reaching commit.
+    big = ScriptedChatModel([peer_first, text_message("no number from me")])
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=small,
+        big_model=big,
+        hold_redis=redis_client,
+    )
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "skipped"
+    assert result.hold_count == 1
     assert await consume_hold(redis_client, iris_id, room_id) is None
 
 
@@ -313,6 +473,70 @@ async def test_agent_only_run_past_loop_cap_stays_silent(
 
 
 @pytest.mark.asyncio
+async def test_loop_cap_counts_across_turns_not_per_inbox(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """The stretch is ROOM-level: an earlier turn's replies accumulate in
+    the room count even though each wake's inbox holds a single message.
+    Per-inbox counting (the pre-room-level bug) would keep waking the
+    model gate here forever; the room cursor trips the cap instead."""
+    room_id, _human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, marcus_id = agent_ids
+    # Seed 7 agent-only messages (cap is 8 for this room): turn 1 sits
+    # one below the cap, so the model gate still runs.
+    for i in range(6):
+        await db.insert_message(pool, room_id, marcus_id, f"agent chatter {i}")
+    await db.insert_message(pool, room_id, iris_id, "agent chatter 6")
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=False, reason="calm", response_mode="me")]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+    result = await brain.run(iris_id, room_id)
+    assert result.outcome == "skipped"
+    assert len(small.calls) == 1
+    assert "loop cap" not in (result.triage_reason or "")
+
+    # One more agent reply lands. The new wake's inbox holds exactly ONE
+    # message — under any per-inbox reading — but the ROOM has now run 8
+    # agent messages with no human: the cap fires without the model.
+    await db.insert_message(pool, room_id, marcus_id, "agent chatter 7")
+    result = await brain.run(iris_id, room_id)
+    assert result.outcome == "skipped"
+    assert len(small.calls) == 1
+    assert "loop cap" in (result.triage_reason or "")
+    assert big.calls == []
+
+
+@pytest.mark.asyncio
+async def test_burst_inbox_under_room_cap_still_runs_model_gate(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """A coalesced burst can push the per-turn inbox far past the cap on
+    a room whose agent-only stretch is still young (the human just
+    spoke, or a short run). The room cursor — not the batch size —
+    decides, so the model gate runs instead of a silent skip."""
+    room_id, human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "plans, quickly")
+    for i in range(6):
+        await db.insert_message(pool, room_id, marcus_id, f"burst {i}")
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=False, reason="calm", response_mode="me")]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris_id, room_id)
+
+    assert result.outcome == "skipped"
+    assert len(small.calls) == 1
+    assert "loop cap" not in (result.triage_reason or "")
+
+
+@pytest.mark.asyncio
 async def test_human_message_resets_loop_cap(
     pool: asyncpg.Pool, redis_client: redis.Redis
 ) -> None:
@@ -335,17 +559,66 @@ async def test_human_message_resets_loop_cap(
     assert len(small.calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_loop_cap_arms_in_human_free_room(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """No human participant at all: the cap still arms (this is the MOST
+    loop-prone shape — nobody will ever reset the counter)."""
+    room = await db.create_room(pool, "no-human-room")
+    iris = await db.add_participant(pool, room.id, "agent", "Iris", None)
+    marcus = await db.add_participant(pool, room.id, "agent", "Marcus", None)
+    for i in range(4):
+        await db.insert_message(pool, room.id, str(marcus.id), f"agent chatter {i}")
+    for i in range(4):
+        await db.insert_message(pool, room.id, str(iris.id), f"agent chatter {i + 4}")
+
+    small = ScriptedChatModel()
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris.id, room.id)
+
+    assert result.outcome == "skipped"
+    assert small.calls == []
+    assert "loop cap" in (result.triage_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_second_human_message_resets_loop_cap(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """Every human resets the counter, not just the first one found."""
+    room = await db.create_room(pool, "two-humans")
+    ada = await db.add_participant(pool, room.id, "human", "Ada", None)
+    bob = await db.add_participant(pool, room.id, "human", "Bob", None)
+    iris = await db.add_participant(pool, room.id, "agent", "Iris", None)
+    marcus = await db.add_participant(pool, room.id, "agent", "Marcus", None)
+    for i in range(4):
+        await db.insert_message(pool, room.id, marcus.id, f"chatter {i}")
+    # Bob (the SECOND human) speaks: counter resets even though the
+    # first-human-only heuristic would have kept counting.
+    await db.insert_message(pool, room.id, str(bob.id), "keep going")
+    for i in range(3):
+        await db.insert_message(pool, room.id, marcus.id, f"more {i}")
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=False, reason="calm", response_mode="me")]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    result = await brain.run(iris.id, room.id)
+
+    assert result.outcome == "skipped"
+    assert len(small.calls) == 1
+    assert "loop cap" not in (result.triage_reason or "")
+
+    # And with Ada silent the whole time, her id never gates anything.
+    assert str(ada) != str(bob)
+
+
 # ── digest ───────────────────────────────────────────────────────────────
-
-
-@pytest.fixture
-async def app_client(require_services: None) -> AsyncIterator[tuple]:
-    app = create_app(stub_turns=True)
-    async with app.router.lifespan_context(app):
-        await db.truncate_all(app.state.pool)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            yield app, client
 
 
 @pytest.mark.asyncio
@@ -390,6 +663,31 @@ async def test_digest_endpoint_renders_transcript_claims_and_spend(
     assert "`t1:review` — held by **Jules**" in body
     assert "| triage | m-small | 1 | 10 | 2 |" in body
     assert "**110**" in body
+
+
+@pytest.mark.asyncio
+async def test_digest_escapes_pipe_and_newline_in_names(app_client: tuple) -> None:
+    """A name containing a pipe or newline must not corrupt the table."""
+    app, client = app_client
+    room = (await client.post("/rooms", json={"name": "pipe | room"})).json()
+    agent = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "agent", "name": "a | b"},
+        )
+    ).json()
+    await client.post(
+        f"/rooms/{room['id']}/messages",
+        json={"author_id": agent["id"], "body": "hello"},
+    )
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    # Exactly one table row for the message, with the pipe escaped.
+    assert "| 1 | a \\| b | hello |" in body
+    # The H1 title is not inside a table; the pipe stays literal there.
+    assert "# pipe | room" in body
 
 
 @pytest.mark.asyncio
@@ -442,13 +740,14 @@ async def test_duplicate_reply_over_runtime_returns_409(app_client: tuple) -> No
 
     first = await post_reply("3", 1)
     assert first.status_code == 200
-    # Fresh cursor (seen up to seq 2), but body duplicates the peer's "3"
-    # — wait, the peer here is the agent's own first reply; author rows
-    # are excluded, so re-post "3" when the human echoes it first.
-    await client.post(
+    # The dup gate's peer is the latest OTHER message. After the agent's
+    # "3", the human echoes "3" (legitimate — humans bypass the gate),
+    # which becomes the new peer; the agent re-posting "3" now hits it.
+    echo = await client.post(
         f"/rooms/{room['id']}/messages",
         json={"author_id": human["id"], "body": "3"},
     )
+    assert echo.status_code == 200
     second = await post_reply("3", 3)
     assert second.status_code == 409
     assert second.json()["detail"]["error"] == "duplicate_reply"
@@ -460,3 +759,62 @@ async def test_duplicate_reply_over_runtime_returns_409(app_client: tuple) -> No
     world.bind_actor(agent_id)
     with pytest.raises(DuplicateReply):
         await world.insert_message(UUID(room["id"]), agent_id, "3", not_after_seq=3)
+
+
+@pytest.mark.asyncio
+async def test_http_world_survives_foreign_409_shape(app_client: tuple) -> None:
+    """A 409 rewritten by a proxy/gateway (plain text, no detail dict)
+    must surface as StaleWrite with empty details, not crash parsing."""
+    from daemon.world_http import HttpWorld
+
+    _app, client = app_client
+
+    class RewritingTransport(httpx.AsyncBaseTransport):
+        """Wraps ASGI and flattens any 409 body to plain text."""
+
+        def __init__(self, app: object) -> None:
+            self._inner = httpx.ASGITransport(app=app)  # type: ignore[arg-type]
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            resp = await self._inner.handle_async_request(request)
+            if resp.status_code == 409:
+                return httpx.Response(409, text="gateway says conflict")
+            return resp
+
+    app, _client = app_client
+    computer = (await client.post("/computers", json={"name": "laptop"})).json()
+    room = (await client.post("/rooms", json={"name": "proxy-room"})).json()
+    human = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "human", "name": "Ada"},
+        )
+    ).json()
+    await client.post(
+        f"/rooms/{room['id']}/messages",
+        json={"author_id": human["id"], "body": "pick a number"},
+    )
+    agent = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={
+                "kind": "agent",
+                "name": "Jules",
+                "computer_id": computer["id"],
+            },
+        )
+    ).json()
+
+    world = HttpWorld(
+        httpx.AsyncClient(transport=RewritingTransport(app), base_url="http://test"),
+        computer["token"],
+    )
+    world.bind_actor(UUID(agent["id"]))
+    # last_seq 0: unknown, but the cursor can never regress below what
+    # the turn has already seen — the graph holds on max(seen, latest).
+    with pytest.raises(StaleWrite) as exc:
+        await world.insert_message(
+            UUID(room["id"]), UUID(agent["id"]), "3", not_after_seq=0
+        )
+    assert exc.value.last_seq == 0
+    assert exc.value.newer == []

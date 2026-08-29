@@ -8,11 +8,13 @@ token is atomic. The token is seq-bound: it acknowledges exactly the room
 state the agent was shown, so a stale ack cannot skip messages the agent
 has never seen.
 
-Fail-open: coordination signal, not a correctness invariant. If Redis is
-down the gate degrades to the old behavior (always honor the flag) rather
-than blocking a turn. A lost HOLD override is at worst one extra collision —
-the failure class this module exists to *reduce*, never a correctness
-invariant to guarantee.
+Fail-closed: coordination signal, not a correctness invariant, so a Redis
+outage must not UPGRADE the agent's authority — but the flag itself only
+ever exists to bypass a gate this module owns. If Redis is down we cannot
+verify a token, so the ack is refused and the turn keeps its ordinary
+HOLD + re-decide path (bounded by MAX_HOLDS, worst case held_exhausted).
+That is one missed override, not a blocked conversation. Honoring the flag
+on unverifiable state is what §5d exists to prevent.
 """
 
 from __future__ import annotations
@@ -75,19 +77,21 @@ async def consume_hold(
 ) -> int | None:
     """Atomically pop the token; return the seq it acknowledged, or None.
 
-    None means no server-shown HOLD exists for this scope: an override
-    flag at this moment is a pre-emptive bypass and must be refused.
+    None means no verifiable server-shown HOLD exists for this scope —
+    absent token OR Redis failure — and a send_anyway at this moment is
+    an unverified bypass: refused. The gate still runs, so the cost is
+    one extra HOLD, never a blocked turn.
     """
     try:
         raw = await client.eval(_CONSUME_SCRIPT, 1, _key(agent_id, room_id))
     except Exception:
         logger.warning(
-            "consume_hold(%s, %s) failed — fail-open to honored",
+            "consume_hold(%s, %s) failed — fail-closed to gate",
             agent_id,
             room_id,
             exc_info=True,
         )
-        return 0
+        return None
     if raw is None:
         return None
     try:

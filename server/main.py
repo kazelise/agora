@@ -30,6 +30,7 @@ from server.models import (
 )
 from server.runtime import computer_ws, router as runtime_router
 from server.scheduler import Scheduler, TurnFn, fanout_message, run_subscriber
+from server.stall import StallSweeper
 
 
 def create_app(
@@ -52,6 +53,32 @@ def create_app(
 
         hub = RoomHub()
         computers = ComputerHub()
+
+        async def wake_agent(agent_id: UUID, room_id: UUID) -> None:
+            await scheduler_lane_notify(agent_id, room_id)
+
+        # Liveness leg: rooms that went quiet with work owed get one
+        # deterministic nudge per sweep window, capped per stall. Fail-open
+        # by construction (the sweeper swallows its own errors). The
+        # sweeper is created before the scheduler because every landed
+        # message resets its decline budget via fanout.
+        stalls = StallSweeper(
+            pool,
+            wake_agent,
+            interval_s=cfg.stall_interval_s,
+            min_s=cfg.stall_min_s,
+            max_s=cfg.stall_max_s,
+            max_nudges=cfg.stall_max_nudges,
+        )
+
+        async def on_message_committed(room_id: UUID) -> None:
+            stalls.on_message(room_id)
+
+        def fanout_with_stall_reset(hub_: Any, client_: Any, row_: Any) -> Any:
+            return fanout_message(
+                hub_, client_, row_, on_committed=on_message_committed
+            )
+
         launcher = job_launcher
         if stub_turns:
             scheduler = Scheduler(pool, computers=computers)
@@ -66,14 +93,21 @@ def create_app(
         else:
             from brain.graph import make_turn_fn
 
-            async def on_committed(row: WorldMessage) -> None:
-                await fanout_message(hub, publisher, row)
+            async def on_brain_committed(row: WorldMessage) -> None:
+                await fanout_with_stall_reset(hub, publisher, row)
 
             scheduler = Scheduler(
                 pool,
-                run_turn=make_turn_fn(pool, publisher, on_committed=on_committed),
+                run_turn=make_turn_fn(
+                    pool, publisher, on_committed=on_brain_committed
+                ),
                 computers=computers,
             )
+
+        async def scheduler_lane_notify(agent_id: UUID, room_id: UUID) -> None:
+            await scheduler.lane(agent_id).notify(room_id, agent_id)
+
+        stalls.start()
 
         ready = asyncio.Event()
         stop = asyncio.Event()
@@ -87,10 +121,13 @@ def create_app(
         app.state.hub = hub
         app.state.computers = computers
         app.state.job_launcher = launcher
+        app.state.stalls = stalls
+        app.state.fanout_with_stall_reset = fanout_with_stall_reset
 
         try:
             yield
         finally:
+            await stalls.stop()
             stop.set()
             task.cancel()
             try:
@@ -166,7 +203,7 @@ def register_routes(app: FastAPI) -> None:
             row = await db.insert_message(app.state.pool, room_id, body.author_id, body.body)
         except db.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=exc.detail) from exc
-        await fanout_message(app.state.hub, app.state.redis, row)
+        await app.state.fanout_with_stall_reset(app.state.hub, app.state.redis, row)
         return row.as_out()
 
     @app.get("/rooms/{room_id}/messages", response_model=MessageListOut)

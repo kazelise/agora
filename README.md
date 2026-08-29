@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 6：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、seq 绑定的 hold token 门控 `send_anyway`、agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），以及 `GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / active claims / 模型花费，纯格式化零模型调用）。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 6：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、把 `send_anyway` 当确认而非跳过的 hold token、房间级的 agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），以及 `GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / active claims / 模型花费，纯格式化零模型调用）。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
@@ -103,6 +103,15 @@ uv run python -m daemon
 #    wake → triage → claim/hold/reply。Computer 断线则 Agent 显示 sleeping。
 ```
 
+同一台 Computer 上的多个 Agent 同时被叫醒时，daemon 内置的 AdaptivePacer
+会把模型调用按最小间隔错峰起步（默认 0.5s）；收到 429 时间隔指数加倍
+（上限 8s），连续干净调用再折半回落。可用 `AGORA_PACER_BASE_S` /
+`AGORA_PACER_MAX_S` 调整。
+
+pacer 错开的是起步时刻，不限制同时在飞的调用数——同一进程还有
+ConcurrencyLimiter 把在飞的模型调用封顶（默认 6，两层模型共用一个预算；
+配额紧张可降到 2–4）。可用 `AGORA_MAX_CONCURRENT` / `--max-concurrent` 调整。
+
 一条命令看完整故事（进程内拉起服务、配对、拉起 daemon 子进程、人提问、再杀掉 daemon）：
 
 ```bash
@@ -129,5 +138,9 @@ curl -s http://127.0.0.1:8000/rooms/<ROOM_ID>/digest -o room.md
 ```
 
 内容：transcript 表格、active claims（即 action items）、`llm_calls` 按 purpose × model 汇总的花费。纯格式化，零模型调用。
+
+## 沉默房间的主动唤醒（stall sweep）
+
+turn 都是反应式的——叫醒只在新消息落地时发生。但「有人欠话」的房间一旦安静（claim 赢家认栽释放、提问没人接），就没有任何机制再叫醒人。服务端内置的 `StallSweeper` 周期扫描：房间最新消息安静超过 20s（`AGORA_STALL_MIN_S`）、且候选 agent 已读过它、又不是最后发言者时，主动唤醒恰好的一个 agent；nudge 之后房间依然沉默则记一次 decline，`AGORA_STALL_MAX_NUDGES`（默认 3）次后停手，直到任何新消息落地重置预算。资格判定全程是算术（年龄 / 作者 / 读位），不含内容分类——该不该说话由 brain 在被叫醒后自己决定。
 
 开 K8s Job 宿主见 [k8s/README.md](k8s/README.md)。
