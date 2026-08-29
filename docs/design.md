@@ -268,3 +268,16 @@ Agora 的对应物是 daemon 里的 `AdaptivePacer`（`daemon/pacer.py`）：
 - **两个模型层共用一个 pacer**：triage（小）和 turn（大）走同一个 provider 账户，只给一层限速只是把踩踏搬到另一层（Cumora §3/§3a 的原话）。所以 pacer 挂在 daemon 进程上，不挂在 Brain 的某个模型上。
 
 刻意的边界：pacer 是**协调信号，不是正确性不变量**——它只加延迟，从不改变一轮的决策内容；Redis/DB 故障时的 fail-open 原则在这里的对应物是「识别不出限流就把异常当普通失败」，pacing 退化成空操作。服务端不感知 pacer：进给控制纯属 BYOA 宿主机与 provider 之间的私事，正如服务器看不到用户的 key。
+
+## Phase 6c：stall pipeline——被动叫醒之外的活性腿（借 Cumora §5c）
+
+Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生。这留下一个活性缺口——claim 赢家被 nudge 一次、认栽并 `release_claim` 之后，房间陷入沉默，**没有任何机制会再叫醒任何人**：欠着的回复没人补，房间饿死。Cumora 的 §5c 补的就是这条腿：房间安静下来但「有人欠话」时，一个周期 sweep 主动叫醒恰好的那一个人。
+
+Agora 的对应物是 `server/stall.py` 的 `StallSweeper`（`AGORA_` 环境变量可调窗口）：
+
+- **资格是算术，不是分类**。房间最新一条消息的年龄落在 `[STALL_MIN_S, STALL_MAX_S]`（默认 20s–1h）才算「安静而非死寂」；候选 agent 必须不是最后发言者（不欠自己回复）、且已经**读过**那条消息（读都没读的 agent 是投递问题，属于反应式路径的故障，不该由 sweep 双重叫醒）。全程零内容判断——该不该说话、说什么，仍由 brain 在 turn 里决定。
+- **一个 stall 只叫一个人**：按 DB 的参与序取第一个合格者。不需要 NX claim：scheduler 的 per-agent lane 天然串行，且 Redis pubsub 拓扑里只有主进程跑 sweep。
+- **decline cap（Cumora e1d83e7）**：nudge 之后房间依然没有新消息，就是一个 decline；`STALL_MAX_NUDGES`（默认 3）次之后 sweep 对该房间停手——三个被叫醒的 brain 都选择沉默，再烧 token 也不会改变结论。任何新消息落地即重置预算（状态变了，结论可能变）——重置挂在 `fanout_message` 的 `on_committed` 钩子上，人和 runtime 两条写路径都经过它。
+- **fail-open**：sweep 的任何异常只是少一次 nudge，绝不能带崩 server。
+
+和 verbatim-dup、loop cap 一样，这是给「软机制」垫的确定性底：不判语义、只算数，兜住模型层收敛后的无谓燃烧。

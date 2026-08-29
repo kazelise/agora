@@ -180,11 +180,38 @@ async def list_agent_participants(pool: asyncpg.Pool, room_id: UUID) -> list[Par
         SELECT {_PARTICIPANT_COLS}
         FROM participants
         WHERE room_id = $1 AND kind = 'agent'
-        ORDER BY created_at
+        ORDER BY created_at, id
         """,
         room_id,
     )
     return [_participant(r) for r in rows]
+
+
+async def list_active_rooms(pool: asyncpg.Pool) -> list[Any]:
+    """Every room with its latest message, for the stall sweep.
+
+    One query instead of N+1 per room: the LATERAL join fetches each
+    room's newest row (with the author's kind) alongside the room row.
+    Rooms with no messages are skipped by the sweep (nothing can be owed
+    about silence).
+    """
+    return await pool.fetch(
+        """
+        SELECT r.id, r.name, r.created_at,
+               latest.created_at AS last_at,
+               latest.seq, latest.body, latest.author_id, latest.author_kind
+        FROM rooms r
+        LEFT JOIN LATERAL (
+            SELECT m.seq, m.body, m.created_at, m.author_id, p.kind AS author_kind
+            FROM messages m
+            JOIN participants p ON p.id = m.author_id
+            WHERE m.room_id = r.id
+            ORDER BY m.seq DESC
+            LIMIT 1
+        ) latest ON true
+        WHERE latest.seq IS NOT NULL
+        """
+    )
 
 
 async def create_computer(pool: asyncpg.Pool, name: str, token: str) -> ComputerRow:

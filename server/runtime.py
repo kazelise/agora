@@ -19,7 +19,7 @@ from server.auth import hosted_agent, require_host
 from server.computers import ComputerHub
 from server.models import MessageOut
 from server.runtime_types import Host
-from server.scheduler import fanout_message
+from server.scheduler import fanout_message  # noqa: F401 (re-exported for tests)
 
 router = APIRouter(prefix="/runtime", tags=["runtime"])
 
@@ -197,7 +197,9 @@ async def reply(
         ) from exc
     except db.NotFoundError as exc:
         raise HTTPException(status_code=404, detail=exc.detail) from exc
-    await fanout_message(request.app.state.hub, request.app.state.redis, row)
+    await request.app.state.fanout_with_stall_reset(
+        request.app.state.hub, request.app.state.redis, row
+    )
     return row.as_out()
 
 

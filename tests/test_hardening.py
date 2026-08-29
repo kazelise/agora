@@ -461,16 +461,6 @@ async def test_second_human_message_resets_loop_cap(
 # ── digest ───────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-async def app_client(require_services: None) -> AsyncIterator[tuple]:
-    app = create_app(stub_turns=True)
-    async with app.router.lifespan_context(app):
-        await db.truncate_all(app.state.pool)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            yield app, client
-
-
 @pytest.mark.asyncio
 async def test_digest_endpoint_renders_transcript_claims_and_spend(
     app_client: tuple,
