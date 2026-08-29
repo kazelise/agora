@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 6：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、seq 绑定的 hold token 门控 `send_anyway`、agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），以及 `GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / active claims / 模型花费，纯格式化零模型调用）。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 6：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、把 `send_anyway` 当确认而非跳过的 hold token、房间级的 agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），以及 `GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / active claims / 模型花费，纯格式化零模型调用）。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
