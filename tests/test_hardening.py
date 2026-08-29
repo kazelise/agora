@@ -711,7 +711,7 @@ async def test_digest_endpoint_renders_transcript_claims_and_spend(
     body = resp.text
     assert "# review" in body
     assert "review the plan \\| first" in body
-    assert "`t1:review` — held by **Jules**" in body
+    assert "`t1:review` — held by **Jules** (" in body
     assert "| triage | m-small | 1 | 10 | 2 |" in body
     assert "**110**" in body
 
@@ -739,6 +739,34 @@ async def test_digest_escapes_pipe_and_newline_in_names(app_client: tuple) -> No
     assert "| 1 | a \\| b | hello |" in body
     # The H1 title is not inside a table; the pipe stays literal there.
     assert "# pipe | room" in body
+
+
+@pytest.mark.asyncio
+async def test_digest_marks_stale_claim_as_crash_orphan(app_client: tuple) -> None:
+    """A claim past the steal TTL is a crash orphan, not a live
+    obligation: the digest labels it instead of presenting a dead lock as
+    'held by X'."""
+    app, client = app_client
+    room = (await client.post("/rooms", json={"name": "stale-claim"})).json()
+    agent = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "agent", "name": "Jules"},
+        )
+    ).json()
+    await db.try_claim(app.state.pool, UUID(room["id"]), "t1:orphan", UUID(agent["id"]))
+    # Age the claim past the steal TTL, as if the holder crashed right
+    # after claiming.
+    await app.state.pool.execute(
+        "UPDATE claims SET created_at = now() - interval '400 seconds'"
+    )
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "`t1:orphan`" in body
+    assert "stale" in body
+    assert "stealable" in body
 
 
 @pytest.mark.asyncio

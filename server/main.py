@@ -73,6 +73,7 @@ def create_app(
             min_s=cfg.stall_min_s,
             max_s=cfg.stall_max_s,
             max_nudges=cfg.stall_max_nudges,
+            unread_grace_s=cfg.stall_unread_grace_s,
         )
 
         async def on_message_committed(room_id: UUID) -> None:

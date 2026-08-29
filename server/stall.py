@@ -42,6 +42,13 @@ STALL_MAX_S = 3600.0
 STALL_MAX_NUDGES = 3
 # How often the sweep runs.
 SWEEP_INTERVAL_S = 10.0
+# How long a room where NOBODY has read the last message stays classified
+# as "delivery in flight" (a wake may still land) before the sweeper
+# treats the wake as lost and nudges anyway. Must comfortably exceed one
+# turn (model latency + retries); losing a wake with no follow-up event
+# would otherwise starve the room forever (the reactive path has no
+# retry — the pub/sub wake is fire-and-forget).
+STALL_UNREAD_GRACE_S = 120.0
 
 # NudgeFn(room_id, author_id) — the same arity as Scheduler.dispatch. The
 # sweeper names the LAST AUTHOR as the nominal "message sender": dispatch
@@ -63,6 +70,7 @@ class StallSweeper:
         min_s: float = STALL_MIN_S,
         max_s: float = STALL_MAX_S,
         max_nudges: int = STALL_MAX_NUDGES,
+        unread_grace_s: float = STALL_UNREAD_GRACE_S,
     ) -> None:
         self._pool = pool
         self._nudge = nudge
@@ -70,6 +78,7 @@ class StallSweeper:
         self._min_s = min_s
         self._max_s = max_s
         self._max_nudges = max_nudges
+        self._unread_grace_s = unread_grace_s
         # room_id -> declines since the last message landed there.
         self._declines: dict[UUID, int] = {}
         self._task: asyncio.Task[None] | None = None
@@ -151,6 +160,14 @@ class StallSweeper:
           still woken by the dispatch — they get the reactive delivery —
           but a room where nobody has read counts as undelivered, not
           stalled.
+
+        The unread rule has a starvation hole: a room whose ONLY non-author
+        agents are unread (an offline BYOA host that missed the pub/sub
+        wake — it is fire-and-forget) never becomes eligible, and no
+        further event will ever re-dispatch. So an unread room graduates
+        to stalled once the last message is older than unread_grace_s —
+        longer than any legitimate turn, so a live lane cannot still be
+        "in flight"; the wake was lost and the nudge is the retry.
         Individual wake routing (in-process lane vs computer ws vs cloud
         job) is dispatch's job; the sweeper only judges the room.
         """
@@ -177,7 +194,7 @@ class StallSweeper:
                 and await db.get_last_read(self._pool, a.id, room_id)
                 >= int(room["seq"])
             ]
-            if not readers:
+            if not readers and quiet_for < self._unread_grace_s:
                 continue
             out.append(
                 {

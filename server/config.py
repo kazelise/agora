@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     stall_max_s: float = 3600.0
     stall_max_nudges: int = 3
     stall_interval_s: float = 10.0
+    # Unread rooms (nobody read the last message — a possibly-lost
+    # fire-and-forget wake) only become nudge-eligible after this much
+    # silence; before that, a live lane may still be in flight.
+    stall_unread_grace_s: float = 120.0
 
 
 @lru_cache

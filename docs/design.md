@@ -262,6 +262,8 @@ triage 是小模型门，但它有时不肯收尾。Cumora 用「计数不分类
 
 刻意的边界：导出是纯格式化，零模型调用、零内容解释。总结器模型以后可以叠上去，但导出本身永远不依赖一个模型——这也让 digest 在测试里是确定性的。
 
+三个查询没有共同快照：transcript、claims、花费是三次独立读取，并发的写入者可能让 action items 引用 transcript 里还没有的行。这与「人拉一份 Markdown 贴进 issue」的用途等价于普通分页错位——重跑即得新版本，不构成数据损坏；若将来 digest 喂自动化管线，再包 `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`。claim 行渲染持有时长，超过 steal TTL（`CLAIM_TTL_S`）的行标注 stale——那是一记崩溃留下的孤儿（holder 死在 release 之前），不是还活着的 obligation。
+
 ## Phase 6b：daemon 侧的进给控制（借 Cumora §3b）
 
 Cumora 的 §3 是同一台宿主机上多 Agent 的资源协调：若干 Agent 在同一次 fan-out 里被同时叫醒，会在 provider 的突发限额上同步踩踏——四路并发可以全部滚出低抖动值，随机 jitter 是概率性缓解，不是结构性保证。它的结论：基础速率应当是**两次调用起步时刻的确定性最小间隔**，限流反馈触发的退避才是指数的。
@@ -291,6 +293,7 @@ Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生�
 Agora 的对应物是 `server/stall.py` 的 `StallSweeper`（`AGORA_` 环境变量可调窗口）：
 
 - **资格是算术，不是分类**。房间最新一条消息的年龄落在 `[STALL_MIN_S, STALL_MAX_S]`（默认 20s–1h）才算「安静而非死寂」；房间里必须至少有一个**不是**最后发言者、且已经**读过**那条消息的 agent（读都没读是投递问题，属于反应式路径的故障，不该由 sweep 双重叫醒）。全程零内容判断——该不该说话、说什么，仍由 brain 在 turn 里决定。
+- **未读房间的饥饿补课（unread grace）**。上面那条未读规则有个洞：唯一非作者 agent 是离线 BYOA 宿主时（pub/sub wake 是 fire-and-forget，宿主离线即丢），它永远读不到，也没有任何后续事件会再次 dispatch——房间饿死。所以未读房间在安静超过 `STALL_UNREAD_GRACE_S`（默认 120s，远超一次合法 turn 的时长）后晋升为 stalled：此时「lane 还在飞」的解释不再成立，丢失的 wake 只能由 nudge 补投。宽限期内照旧不碰——双叫醒一条活 lane 的风险仍然真实。
 - **nudge 走 dispatch 通道，不是服务器内 lane**。sweep 发出的 nudge 形如 `(room_id, last_author)`，交给 `Scheduler.dispatch`——与一条真实落地的消息完全同路径：非作者 agent 各自经自己的宿主被叫醒（服务器内 agent 走 lane，BYOA agent 走 computer websocket，云 agent 走 K8s Job），离线宿主同样记「sleeping」不排队。这条边界是硬约束：若 nudge 直接捅进服务器内的 brain lane，BYOA agent 的大脑就被搬到服务器上跑了，模型密钥边界被静默剥掉。
 - **proactive turn 不是空转**。被 nudge 的 agent 已读全部消息，inbox 为空——若 brain 对空 inbox 直接返回 `empty`（零 LLM 调用），整条 stall pipeline 就是不折不扣的死代码。所以 `Brain.run` 对空 inbox 的 turn 走 **proactive** 形态：把房间最近的消息尾巴（`INBOX_TAIL`，默认 10 条）作为证据交给 triage，framing 换成「房间安静了、可能仍有人欠话、沉默也是合法答案」，由模型决定说不说。确定性兜底不变：agent-only loop cap 照常生效（绕圈圈的房子 nudge 救不活）；房间毫无历史时才短路 `empty`。
 - **decline cap（Cumora e1d83e7）**：nudge 之后房间依然没有新消息，就是一个 decline；`STALL_MAX_NUDGES`（默认 3）次之后 sweep 对该房间停手——被叫醒的 brain 都选择沉默，再烧 token 也不会改变结论。任何新消息落地即重置预算（状态变了，结论可能变）——重置挂在 `fanout_message` 的 `on_committed` 钩子上，人和 runtime 两条写路径都经过它。

@@ -153,6 +153,36 @@ async def test_unread_rooms_are_not_stalled(pool: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_unread_room_graduates_after_unread_grace(pool: Any) -> None:
+    """The unread rule's starvation hole: an offline BYOA host that
+    missed the fire-and-forget pub/sub wake never reads, and no further
+    event ever re-dispatches — the room starves. Past the unread grace
+    (longer than any legitimate turn), the lost wake is treated as
+    undelivered and the nudge becomes the retry."""
+    room_id, human_id, _agent_ids = await _setup_room(
+        pool, last_author="human", read_by_agents=False
+    )
+    nudges: list[tuple[UUID, UUID]] = []
+
+    async def nudge(room: UUID, author: UUID) -> None:
+        nudges.append((room, author))
+
+    sweeper = StallSweeper(
+        pool, nudge, interval_s=9999, unread_grace_s=300.0
+    )
+    # 60s silence: inside the grace — a live lane may still be running.
+    assert await sweeper.sweep_once() == 0
+    assert nudges == []
+    # Age the last message past the grace: the wake is lost, retry it.
+    await pool.execute(
+        "UPDATE messages SET created_at = $1 WHERE room_id = $2",
+        _old(400.0),
+        room_id,
+    )
+    assert await sweeper.sweep_once() == 1
+    assert nudges == [(room_id, human_id)]
+
+@pytest.mark.asyncio
 async def test_nudge_error_is_fail_open(pool: Any) -> None:
     room_id, _human, _agent_ids = await _setup_room(pool, last_author="human")
 

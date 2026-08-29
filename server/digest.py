@@ -11,9 +11,11 @@ but the export itself must never require one.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from server import db
+from server.db import CLAIM_TTL_S
 
 
 def _esc(text: str) -> str:
@@ -70,7 +72,14 @@ def render_digest(data: dict[str, Any]) -> str:
     else:
         for c in claims:
             owner = c["claimed_by_name"] or names.get(c["claimed_by"], "?")
-            lines.append(f"- `{c['task_key']}` — held by **{_esc(owner)}**")
+            age_s = max(0.0, (datetime.now(UTC) - c["created_at"]).total_seconds())
+            age = f"{age_s:.0f}s"
+            # A claim older than the steal TTL is a crash orphan (the
+            # holder died before release/fulfil): label it, so the
+            # action-item list does not present a dead lock as an
+            # obligation someone is actively holding.
+            mark = " (stale — holder likely crashed; stealable)" if age_s > CLAIM_TTL_S else ""
+            lines.append(f"- `{c['task_key']}` — held by **{_esc(owner)}** ({age}){mark}")
     lines.append("")
 
     lines.append("## Model spend")
