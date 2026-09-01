@@ -61,7 +61,7 @@ Phase 1 里 Redis 只承担 pub/sub 叫醒。发布失败同样 fail-open：消�
 
 1. WebSocket 向房间内已连接的客户端广播这条消息。
 2. 经 Redis pub/sub 发一条 wake。订阅端查出该房间所有 `kind=agent` 的参与者，**排除作者**（自己刚发的消息不要把自己再叫起来）。
-3. 每个 Agent 一条车道：同一时刻只跑一轮 turn。突发叫醒用脏标记合并——进行中的 turn 只记住「结束后再跑一次」，不把 N 次叫醒排成 N 个队列。5 条连发最多是「正在跑的一轮 + 合并后的一轮」。
+3. 每个 Agent 一条车道：同一时刻只跑一轮 turn。突发叫醒用脏标记合并——进行中的 turn 只记住「结束后再跑一次」，不把 N 次叫醒排成 N 个队列。5 条连发最多是「正在跑的一轮 + 合并后的一轮」。合并记住的是**最新一次叫醒的 (room, agent) 对**，不是第一轮的房间：身兼数房的 agent 在房间 A 的 turn 中途收到房间 B 的叫醒，重跑必须落在 B（A 期间挤进来的新消息由 B 之后的 cursor 补课）。代价明码标价：两个别的房间同时抢进同一轮 turn 时只有最后一个活下来，另一个等下一次事件——和丢一条 pub/sub wake 的最终投递语义相同。
 
 Phase 1 的 turn 是桩：打一行日志（inbox 相对 `last_read_seq` 有几条新消息），然后推进 `conversation_reads`。桩的意义是把「串行 + 合并」做成可测的不变量，后面换 LangGraph 时调度器不用重写。
 
@@ -194,7 +194,7 @@ Agent 永远跑在某台 Computer 上。`computer_id` 为空就是今天的云�
 
 过期回复走 409，而且把 `last_seq` 和更新的消息一并带上。daemon 侧的图接到 `StaleWrite.newer` 就能 HOLD，不必再打一趟 `list_messages`。云端 `DirectWorld` 在事务拒绝之后也填上同一份 `newer`，两条宿主的 HOLD 路径形状一样。
 
-在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。
+在线状态是进程内的 websocket 字典。这是刻意的单实例简化：多 worker 得把 presence 放到 Redis。`GET /computers` 允许用 `last_seen_at` 心跳做 30 秒宽限（列表好看）；叫醒路由更严，只有套接字还连着才推，否则打一行 `agent <name> is sleeping (computer offline)`。重连即换presence：`connect` 把字典指到新 socket 并服务端关掉旧的（不给幽灵 socket 吞 wake 的机会）；旧 socket 的读循环把这次关闭视作正常退役（RuntimeError 归为断开，不再向 ASGI 栈抛错），而 `disconnect` 的 `is` 比较保证它清不掉新 socket 的 presence。
 
 和 Cumora 的诚实差别：他们换的是整颗推理引擎（Claude Code / Codex / Grok Build 在用户机器上跑自己的循环，Cumora 的 `turn.ts` 被绕开）。Agora 换的是宿主和 key，脑还是这张 LangGraph。卖点因此更窄、也更好讲：同一套 triage / claim / freshness 不变量，钥匙在谁手里、进程在哪台机器上，是唯一变量。
 
@@ -216,6 +216,8 @@ cluster token 不是 `computers` 表里的一行。配对 token 绑的是某台�
 
 赢下 claim 是协议义务，不是 prompt 里的礼貌。代码兜底一次：tool_loop 要收束、手里有 won、本轮还没落地回复，就塞一条 user-role「You won claim `<key>`; you must reply now or the claim will be released.」，并只加 **一** 跳 hop 预算。再不开口，就把行 DELETE 掉（`release_claim`，只删自己赢的那把），打警告。未履行的 claim 不能把 `task_key` 永远钉死。语义对错仍归模型；代码只拦「赢了却不履约」这种协议违约。
 
+释正常的兜底只在 turn 收束时跑；turn 中途**崩溃**的进程没有收束，赢来的 claim 依旧被钉死。所以 `try_claim` 多一条裂缝泄压：claim 超过 `CLAIM_TTL_S`（默认 300s）未动，另一个 agent 的 `ON CONFLICT … DO UPDATE WHERE created_at < now() - TTL` 一条语句原子抢走——没有「锁先空出来、两个抢夺者各赢各的」的窗口。claim 是协调信号不是正确性不变量：被抢后原赢家的在飞回复仍会落地（dup-gate 与 freshness 才是写入边界），它只是不再持锁。同 agent 重复 claim 同一把钥匙是幂等刷新（won），不是输。
+
 HOLD 重判按 `response_mode` 给语义指引，不分类内容：`each` 说同伴开口并不解除你的义务；`one-of-us` 说同伴已经做完你就沉默；`me` 说点名很少因为旁人插话而取消。triage 的三条 mode 说明同一套，避免「有人说过就 actionable=false」把 each 误杀。
 
 ## Phase 6：向 Cumora 和元桌借的三件东西
@@ -229,7 +231,7 @@ freshness 门被绕过的方式只有一种：agent 学会了抢跑。Cumora 的
 - HOLD 时（freshness 节点）在 Redis 记一枚 **hold token**（`(agent, room)` 一枚，2 分钟 TTL，存被出示到的最高 `seq`）。
 - `reply(body, send_anyway=True)` 是**确认，不是跳过**。HOLD 把「出示新行、推进 seen、铸 token」做成一步，所以任何 token 的 ack 至多等于 seen：房间只要前进了（`latest > seen`），ack 按构造作废——图花掉这次确认（原子消费，兼作崩溃恢复的清账），跑一轮新的 HOLD，把真正没见过的行出示给模型、重铸 token，模型在同一 turn 里再决定一次。这正是 Cumora 的「flag is void and a fresh HELD is returned」。房间没有前进时（`latest <= seen`），flag 在这里消费掉 token 完成 ack——不能留着，否则 Cumora 的「yield 攒下的 token 被下一个 turn 的抢跑 flag 双花」事故在这里重演。
 - 无 token 的 send_anyway 只触发一次空消费（什么都不存在）并打日志：抢跑者的 flag 什么都没做成，门照跑。
-- token 的生命周期严格等于 turn：提交成功即清；turn 以任何其他方式结束（skipped / held_exhausted / llm_error）由 `run()` 收尾兜底再清一次。跨 turn 残留的 token 没有 2 分钟 TTL 窗口可花。
+- token 的生命周期严格等于 turn：提交成功即清；turn 以任何其他方式结束（skipped / held_exhausted / llm_error）由 `run()` 收尾兜底再清一次；图内半路崩溃（GraphRecursionError、LLM 重试路径之外的传输错误）由 `run()` 的 except 分支在重新抛出前清掉——铸出未花的 token 不留过夜。跨 turn 残留的 token 没有 2 分钟 TTL 窗口可花。
 - Redis 挂了 fail-closed：消费不到可验证的 token 就拒绝确认，turn 退回普通的 HOLD + 重判（受 `MAX_HOLDS` 约束，最坏 `held_exhausted`）——代价是一次多花，不是一轮卡死。确认机制本来就是为了让「出示过的 HOLD」可被承认；对无法验证的状态放行，恰是 §5d 要防的事。
 
 flag 的传递走图的返回值，不走对入参 state 的原地写：LangGraph 在节点间拷贝 channel 状态，原地写在下一个节点不可见（这个 bug 曾让整个 hold-token 机制成为死代码——`_tool_loop` 每轮把 flag 写进返回的 update，写即是清，抢跑 flag 和过期 flag 都不会泄漏进下一跳）。
@@ -260,6 +262,8 @@ triage 是小模型门，但它有时不肯收尾。Cumora 用「计数不分类
 
 刻意的边界：导出是纯格式化，零模型调用、零内容解释。总结器模型以后可以叠上去，但导出本身永远不依赖一个模型——这也让 digest 在测试里是确定性的。
 
+三个查询没有共同快照：transcript、claims、花费是三次独立读取，并发的写入者可能让 action items 引用 transcript 里还没有的行。这与「人拉一份 Markdown 贴进 issue」的用途等价于普通分页错位——重跑即得新版本，不构成数据损坏；若将来 digest 喂自动化管线，再包 `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`。claim 行渲染持有时长，超过 steal TTL（`CLAIM_TTL_S`）的行标注 stale——那是一记崩溃留下的孤儿（holder 死在 release 之前），不是还活着的 obligation。
+
 ## Phase 6b：daemon 侧的进给控制（借 Cumora §3b）
 
 Cumora 的 §3 是同一台宿主机上多 Agent 的资源协调：若干 Agent 在同一次 fan-out 里被同时叫醒，会在 provider 的突发限额上同步踩踏——四路并发可以全部滚出低抖动值，随机 jitter 是概率性缓解，不是结构性保证。它的结论：基础速率应当是**两次调用起步时刻的确定性最小间隔**，限流反馈触发的退避才是指数的。
@@ -280,17 +284,19 @@ Agora 的对应物是 `daemon/limiter.py` 的 `ConcurrencyLimiter`（默认 6，
 
 与 pacer 的分工：pacer 管时间（两次起步的最小间隔），limiter 管并发（同时在飞的调用数）。两个预算互不替代——Cumora 两个都跑，我们也一样。
 
-另一条腿是**活性**：Agora 的 turn 全是反应式的（有消息才有叫醒），claim 赢家认栽释放后房间一旦沉默就永久饿死。`server/stall.py` 的 `StallSweeper`（借 Cumora §5c 的 stall pipeline + decline cap）补上这条腿，详见其 docstring 与 README；核心约束与 verbatim-dup、loop cap 一致：资格判定是算术（年龄 / 作者 / 读位），不是内容分类，nudge 之后的去留由 brain 在 turn 里自己决定。
+另一条腿是**活性**：Agora 的 turn 全是反应式的（有消息才有叫醒），claim 赢家认栽释放后房间一旦沉默就永久饿死。`server/stall.py` 的 `StallSweeper`（借 Cumora §5c 的 stall pipeline + decline cap）补上这条腿，详见其 docstring 与 README；核心约束与 verbatim-dup、loop cap 一致：资格判定是算术（年龄 / 作者 / 读位），不是内容分类，nudge 之后的去留由 brain 在 proactive turn 里自己决定，nudge 本身走 dispatch 通道（见 Phase 6c）。
 
 ## Phase 6c：stall pipeline——被动叫醒之外的活性腿（借 Cumora §5c）
 
-Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生。这留下一个活性缺口——claim 赢家被 nudge 一次、认栽并 `release_claim` 之后，房间陷入沉默，**没有任何机制会再叫醒任何人**：欠着的回复没人补，房间饿死。Cumora 的 §5c 补的就是这条腿：房间安静下来但「有人欠话」时，一个周期 sweep 主动叫醒恰好的那一个人。
+Agora 的所有 turn 都是反应式的：叫醒只在新消息落地时发生。这留下一个活性缺口——claim 赢家被 nudge 一次、认栽并 `release_claim` 之后，房间陷入沉默，**没有任何机制会再叫醒任何人**：欠着的回复没人补，房间饿死。Cumora 的 §5c 补的就是这条腿：房间安静下来但「有人欠话」时，一个周期 sweep 主动叫醒欠话的人。
 
 Agora 的对应物是 `server/stall.py` 的 `StallSweeper`（`AGORA_` 环境变量可调窗口）：
 
-- **资格是算术，不是分类**。房间最新一条消息的年龄落在 `[STALL_MIN_S, STALL_MAX_S]`（默认 20s–1h）才算「安静而非死寂」；候选 agent 必须不是最后发言者（不欠自己回复）、且已经**读过**那条消息（读都没读的 agent 是投递问题，属于反应式路径的故障，不该由 sweep 双重叫醒）。全程零内容判断——该不该说话、说什么，仍由 brain 在 turn 里决定。
-- **一个 stall 只叫一个人**：按 DB 的参与序取第一个合格者。不需要 NX claim：scheduler 的 per-agent lane 天然串行，且 Redis pubsub 拓扑里只有主进程跑 sweep。
-- **decline cap（Cumora e1d83e7）**：nudge 之后房间依然没有新消息，就是一个 decline；`STALL_MAX_NUDGES`（默认 3）次之后 sweep 对该房间停手——三个被叫醒的 brain 都选择沉默，再烧 token 也不会改变结论。任何新消息落地即重置预算（状态变了，结论可能变）——重置挂在 `fanout_message` 的 `on_committed` 钩子上，人和 runtime 两条写路径都经过它。
+- **资格是算术，不是分类**。房间最新一条消息的年龄落在 `[STALL_MIN_S, STALL_MAX_S]`（默认 20s–1h）才算「安静而非死寂」；房间里必须至少有一个**不是**最后发言者、且已经**读过**那条消息的 agent（读都没读是投递问题，属于反应式路径的故障，不该由 sweep 双重叫醒）。全程零内容判断——该不该说话、说什么，仍由 brain 在 turn 里决定。
+- **未读房间的饥饿补课（unread grace）**。上面那条未读规则有个洞：唯一非作者 agent 是离线 BYOA 宿主时（pub/sub wake 是 fire-and-forget，宿主离线即丢），它永远读不到，也没有任何后续事件会再次 dispatch——房间饿死。所以未读房间在安静超过 `STALL_UNREAD_GRACE_S`（默认 120s，远超一次合法 turn 的时长）后晋升为 stalled：此时「lane 还在飞」的解释不再成立，丢失的 wake 只能由 nudge 补投。宽限期内照旧不碰——双叫醒一条活 lane 的风险仍然真实。
+- **nudge 走 dispatch 通道，不是服务器内 lane**。sweep 发出的 nudge 形如 `(room_id, last_author)`，交给 `Scheduler.dispatch`——与一条真实落地的消息完全同路径：非作者 agent 各自经自己的宿主被叫醒（服务器内 agent 走 lane，BYOA agent 走 computer websocket，云 agent 走 K8s Job），离线宿主同样记「sleeping」不排队。这条边界是硬约束：若 nudge 直接捅进服务器内的 brain lane，BYOA agent 的大脑就被搬到服务器上跑了，模型密钥边界被静默剥掉。
+- **proactive turn 不是空转**。被 nudge 的 agent 已读全部消息，inbox 为空——若 brain 对空 inbox 直接返回 `empty`（零 LLM 调用），整条 stall pipeline 就是不折不扣的死代码。所以 `Brain.run` 对空 inbox 的 turn 走 **proactive** 形态：把房间最近的消息尾巴（`INBOX_TAIL`，默认 10 条）作为证据交给 triage，framing 换成「房间安静了、可能仍有人欠话、沉默也是合法答案」，由模型决定说不说。确定性兜底不变：agent-only loop cap 照常生效（绕圈圈的房子 nudge 救不活）；房间毫无历史时才短路 `empty`。
+- **decline cap（Cumora e1d83e7）**：nudge 之后房间依然没有新消息，就是一个 decline；`STALL_MAX_NUDGES`（默认 3）次之后 sweep 对该房间停手——被叫醒的 brain 都选择沉默，再烧 token 也不会改变结论。任何新消息落地即重置预算（状态变了，结论可能变）——重置挂在 `fanout_message` 的 `on_committed` 钩子上，人和 runtime 两条写路径都经过它。
 - **fail-open**：sweep 的任何异常只是少一次 nudge，绝不能带崩 server。
 
 和 verbatim-dup、loop cap 一样，这是给「软机制」垫的确定性底：不判语义、只算数，兜住模型层收敛后的无谓燃烧。

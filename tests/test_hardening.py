@@ -17,6 +17,8 @@ import httpx
 import pytest
 import redis.asyncio as redis
 
+import brain.graph as graph_mod
+import brain.holds as holds_mod
 from brain.holds import consume_hold, record_hold
 from brain.world import DuplicateReply, StaleWrite
 from brain.world_direct import DirectWorld
@@ -166,6 +168,57 @@ async def test_graph_duplicate_reply_no_holds_spent(
     assert result.hold_count == 0
     stored = [m.body for m in await db.list_messages(pool, room_id)]
     assert stored.count("hello") == 1
+
+
+@pytest.mark.asyncio
+async def test_dup_rejection_retry_after_room_moved_takes_hold_path(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """A room that moves while the brain re-decides after a dup rejection
+    must SHOW the interfering row before the retry can commit: the
+    re-decided reply goes through the HOLD path (the fresh row lands in
+    the prompt) — never a silent commit over unseen state."""
+    room_id, human_id, agent_ids = await _room(pool, agents=2)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "pick a number")
+    # seq 2: the peer "3" the agent will parrot.
+    await db.insert_message(pool, room_id, marcus_id, "3")
+
+    async def after_dup(_messages: list) -> object:
+        # While the brain re-decides, the human races to say EXACTLY what
+        # the agent was about to say (seq 3): the reworded retry must be
+        # re-judged against that row, not committed blind.
+        texts = [str(getattr(m, "content", "")) for m in _messages]
+        if any("verbatim-duplicates" in t for t in texts):
+            await db.insert_message(pool, room_id, human_id, "4 — next after 3")
+        return tool_call("reply", {"body": "4 — next after 3"})
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="each", response_mode="each")]
+    )
+    big = ScriptedChatModel(
+        [
+            tool_call("reply", {"body": "3"}),
+            after_dup,
+            tool_call("reply", {"body": "Ada took 4 — I'll take 5"}),
+        ]
+    )
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+    result = await brain.run(iris_id, room_id)
+
+    # Stale/HOLD path: the interfering row was SHOWN (one HOLD), then the
+    # revised reply committed — the re-decide prompt carries the shown row.
+    assert result.outcome == "replied"
+    assert result.hold_count == 1
+    redecide_prompt = " ".join(
+        str(getattr(m, "content", "")) for m in big.calls[2]
+    )
+    assert "New messages landed while you were composing" in redecide_prompt
+    assert "[seq=3" in redecide_prompt
+    stored = [m.body for m in await db.list_messages(pool, room_id)]
+    assert stored[-1] == "Ada took 4 — I'll take 5"
+    # Cursor advanced to the committed row's seq (3 human + 4 agent).
+    assert await db.get_last_read(pool, iris_id, room_id) == 4
 
 
 # ── hold tokens ──────────────────────────────────────────────────────────
@@ -442,6 +495,54 @@ async def test_turn_end_clears_token_when_turn_ends_without_commit(
     assert await consume_hold(redis_client, iris_id, room_id) is None
 
 
+@pytest.mark.asyncio
+async def test_turn_crash_mid_graph_still_reaps_hold_token(
+    pool: asyncpg.Pool,
+    redis_client: redis.Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-graph crash (GraphRecursionError, a world transport error
+    outside the LLM retry path) must not leave a HOLD-minted token
+    armed: the next turn's send_anyway could spend an acknowledgement
+    earned in a different turn. run() reaps the token before re-raising."""
+    room_id, human_id, agent_ids = await _room(pool)
+    iris_id, marcus_id = agent_ids
+    await db.insert_message(pool, room_id, human_id, "next number after 2")
+
+    async def peer_first(_messages: list) -> object:
+        await db.insert_message(pool, room_id, marcus_id, "3")
+        return tool_call("reply", {"body": "3"})
+
+    small = ScriptedChatModel(
+        [triage_message(actionable=True, reason="each", response_mode="each")]
+    )
+    big = ScriptedChatModel([peer_first])
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=small,
+        big_model=big,
+        hold_redis=redis_client,
+    )
+
+    # LLM failures are folded into llm_error by invoke_model, so the crash
+    # must come from outside that path: blow up right after the HOLD mints
+    # its token — the token exists, the turn never ends normally.
+    real_record_hold = holds_mod.record_hold
+
+    async def mint_then_explode(*args: object, **kwargs: object) -> None:
+        await real_record_hold(*args, **kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("transport exploded right after minting")
+
+    # graph.py imports record_hold by name; patch both sides.
+    monkeypatch.setattr(graph_mod, "record_hold", mint_then_explode)
+
+    with pytest.raises(RuntimeError, match="transport exploded"):
+        await brain.run(iris_id, room_id)
+
+    # The token minted by the crashed turn is reaped.
+    assert await consume_hold(redis_client, iris_id, room_id) is None
+
+
 # ── loop cap ─────────────────────────────────────────────────────────────
 
 
@@ -660,7 +761,7 @@ async def test_digest_endpoint_renders_transcript_claims_and_spend(
     body = resp.text
     assert "# review" in body
     assert "review the plan \\| first" in body
-    assert "`t1:review` — held by **Jules**" in body
+    assert "`t1:review` — held by **Jules** (" in body
     assert "| triage | m-small | 1 | 10 | 2 |" in body
     assert "**110**" in body
 
@@ -688,6 +789,34 @@ async def test_digest_escapes_pipe_and_newline_in_names(app_client: tuple) -> No
     assert "| 1 | a \\| b | hello |" in body
     # The H1 title is not inside a table; the pipe stays literal there.
     assert "# pipe | room" in body
+
+
+@pytest.mark.asyncio
+async def test_digest_marks_stale_claim_as_crash_orphan(app_client: tuple) -> None:
+    """A claim past the steal TTL is a crash orphan, not a live
+    obligation: the digest labels it instead of presenting a dead lock as
+    'held by X'."""
+    app, client = app_client
+    room = (await client.post("/rooms", json={"name": "stale-claim"})).json()
+    agent = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "agent", "name": "Jules"},
+        )
+    ).json()
+    await db.try_claim(app.state.pool, UUID(room["id"]), "t1:orphan", UUID(agent["id"]))
+    # Age the claim past the steal TTL, as if the holder crashed right
+    # after claiming.
+    await app.state.pool.execute(
+        "UPDATE claims SET created_at = now() - interval '400 seconds'"
+    )
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "`t1:orphan`" in body
+    assert "stale" in body
+    assert "stealable" in body
 
 
 @pytest.mark.asyncio

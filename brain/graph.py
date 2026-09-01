@@ -38,6 +38,10 @@ CLAIM_OBLIGATION_HOPS = 1
 # rounds (x agent count) without a human is stale by count. The small
 # model is still the primary wind-down; this is the deterministic floor.
 AGENT_LOOP_CAP = 4
+# Messages of recent room history shown to triage on a PROACTIVE turn
+# (stall nudge: the inbox itself is empty — the agent already read
+# everything). A bounded tail, not the whole room, keeps the prompt small.
+INBOX_TAIL = 10
 
 # Protocol parse of the model's claim key — not content classification.
 # Free-form names never converge across two models; seq is objective.
@@ -100,6 +104,7 @@ class BrainState(TypedDict, total=False):
     author_names: dict[str, str]
     agent_count: int
     agent_only_stretch: int
+    proactive: bool
     seen_seq: int
     triage_actionable: bool
     triage_reason: str
@@ -466,11 +471,21 @@ class Brain:
                     ),
                     "response_mode": "",
                 }
+        if state.get("proactive"):
+            framing = (
+                "The room has gone quiet after the messages below (you have "
+                "read them all). Someone may still be owed a reply — the task "
+                "may be unfinished. Decide whether to speak now; staying "
+                "silent is a valid, common answer when nothing is owed."
+            )
+        else:
+            framing = "Decide whether you should act."
         prompt = (
             f"You are {state['agent_name']}. Persona: {state.get('persona') or 'none'}.\n\n"
-            f"New messages since you last read:\n"
+            f"{framing}\n"
+            f"Recent room messages:\n"
             f"{_format_inbox(state.get('inbox') or [])}\n\n"
-            "Decide whether you should act. Reply with a single JSON object, no markdown:\n"
+            "Reply with a single JSON object, no markdown:\n"
             '{"actionable": bool, "reason": str, "response_mode": "me"|"each"|"one-of-us"}\n'
             "me = addressed to you; new messages from others rarely mean you should skip.\n"
             "each = everyone should respond; a peer already speaking does not "
@@ -774,7 +789,11 @@ class Brain:
         except DuplicateReply as exc:
             # Non-bypassable gate: the brain is shown the fact and re-decides
             # in the same turn. No holds are spent — this is a semantics
-            # error, not a race.
+            # error, not a race. No seen_seq sync either: the stale check
+            # runs BEFORE the dup check inside the same insert transaction,
+            # so at rejection time peer_seq <= seen_seq is an invariant —
+            # the cursor can never trail the peer row, and a room that has
+            # moved since is correctly routed to the stale/HOLD path.
             logger.info(
                 "duplicate reply %s peer seq=%s — re-decide",
                 state["agent_name"],
@@ -793,7 +812,11 @@ class Brain:
                 self._hold_redis, UUID(state["agent_id"]), UUID(state["room_id"])
             )
         logger.info("commit %s seq=%s", state["agent_name"], row.seq)
-        return {"outcome": "replied"}
+        # The cursor must swallow the committed row: the agent authored it,
+        # so it has by definition seen it. Left behind, the next turn's
+        # inbox (seq > last_read, no author filter) re-serves the agent its
+        # own message as new mail — confusing triage and wasting tokens.
+        return {"outcome": "replied", "seen_seq": int(row.seq)}
 
     async def _release_unfulfilled(
         self,
@@ -831,22 +854,46 @@ class Brain:
             for message in ctx.inbox
         ]
         seen_seq = ctx.seen_seq
-        if not inbox:
-            return TurnResult(
-                agent_id=agent_id,
-                agent_name=ctx.agent.name,
-                room_id=room_id,
-                outcome="empty",
-                hold_count=0,
-                hop_count=0,
-                seen_seq=seen_seq,
-                inbox_count=0,
-                triage_actionable=None,
-                triage_reason=None,
-                response_mode=None,
-                claims=(),
-                reply_body=None,
+        # A proactive turn (stall nudge) arrives with an empty inbox: the
+        # agent has read everything. That is a PROMPT to speak — "the room
+        # went quiet with work owed" — not a reason to no-op. The triage
+        # model sees the recent room tail and decides whether silence is
+        # right; the deterministic loop cap still bounds it. Reactive
+        # wakes with a real inbox run the same graph below; only the
+        # triage prompt differs.
+        proactive = not inbox
+        if proactive:
+            tail = await self.world.list_messages_since(
+                room_id, max(seen_seq - INBOX_TAIL, 0)
             )
+            inbox = [
+                {
+                    "seq": message.seq,
+                    "body": message.body,
+                    "author_id": str(message.author_id),
+                    "author_name": message.author_name
+                    or names.get(str(message.author_id), "?"),
+                }
+                for message in tail
+            ]
+            if not inbox:
+                # Nothing to judge — a silent room with no history (or the
+                # agent has no persona to act on). Keep the cheap no-op.
+                return TurnResult(
+                    agent_id=agent_id,
+                    agent_name=ctx.agent.name,
+                    room_id=room_id,
+                    outcome="empty",
+                    hold_count=0,
+                    hop_count=0,
+                    seen_seq=seen_seq,
+                    inbox_count=0,
+                    triage_actionable=None,
+                    triage_reason=None,
+                    response_mode=None,
+                    claims=(),
+                    reply_body=None,
+                )
 
         # Inbox is about to be shown to the model — high-water goes to Redis.
         await self.world.record_seen(agent_id, room_id, seen_seq)
@@ -860,6 +907,7 @@ class Brain:
             "author_names": names,
             "agent_count": agent_count,
             "agent_only_stretch": int(ctx.agent_only_stretch),
+            "proactive": proactive,
             "seen_seq": seen_seq,
             "triage_actionable": False,
             "triage_reason": "",
@@ -873,13 +921,27 @@ class Brain:
             "claim_nudged": False,
             "send_anyway": False,
         }
-        final = await self.graph.ainvoke(
-            initial,
-            {
-                "configurable": {"thread_id": str(uuid4())},
-                "recursion_limit": 40,
-            },
-        )
+        final: dict[str, Any]
+        try:
+            final = await self.graph.ainvoke(
+                initial,
+                {
+                    "configurable": {"thread_id": str(uuid4())},
+                    "recursion_limit": 40,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # An in-graph crash (GraphRecursionError, a world transport
+            # error outside the LLM retry path) must not skip cleanup:
+            # a HOLD minted this turn would otherwise survive until its
+            # TTL and get spent by a future turn's send_anyway. Claims
+            # have their own TTL steal, so only the token is reaped here;
+            # the turn surfaces as a raised error, same as before.
+            if self._hold_redis is not None:
+                await clear_hold(self._hold_redis, agent_id, room_id)
+            raise
         last_read = int(final.get("seen_seq") or seen_seq)
         await self.world.set_last_read(agent_id, room_id, last_read)
         claims = tuple(

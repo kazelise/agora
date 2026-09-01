@@ -169,7 +169,9 @@ async def test_http_world_claim_and_llm_call_row(harness: Harness) -> None:
     world.bind_actor(agent_id)
 
     assert await world.try_claim(room_id, "t1", agent_id) is True
-    assert await world.try_claim(room_id, "t1", agent_id) is False
+    # Same holder re-claiming is an idempotent refresh, not a loss
+    # (cross-agent conflict is tested in tests/test_claims.py).
+    assert await world.try_claim(room_id, "t1", agent_id) is True
 
     await world.record_llm_call(
         agent_id, room_id, "gpt-test", 11, 5, "turn"
@@ -368,3 +370,49 @@ async def test_ws_rejects_bad_token(harness: Harness) -> None:
             f"/ws/computers/{computer['id']}",
             query_string="token=nope",
         )
+
+
+@pytest.mark.asyncio
+async def test_ws_reconnect_replaces_presence_and_closes_old(harness: Harness) -> None:
+    """A reconnecting daemon (network blip, laptop wake) replaces its
+    presence socket: the old socket is closed server-side (no ghost that
+    swallows wakes), and the new one receives the wakes."""
+    from tests.asgi_ws import connect_asgi_ws
+
+    computer = await _pair(harness.client)
+    setup = await _room_with_hosts(harness.client, computer_id=computer["id"], cloud=False)
+    room_id = setup["room"]["id"]
+    human_id = setup["human"]["id"]
+    byoa_id = UUID(setup["byoa"]["id"])
+
+    hub = harness.app.state.computers
+    old_ws = await connect_asgi_ws(
+        harness.app,
+        f"/ws/computers/{computer['id']}",
+        query_string=f"token={computer['token']}",
+    )
+    new_ws = await connect_asgi_ws(
+        harness.app,
+        f"/ws/computers/{computer['id']}",
+        query_string=f"token={computer['token']}",
+    )
+    try:
+        assert hub.is_online(UUID(computer["id"]))
+        # The replaced socket is closed by the server, not left ghosting.
+        with pytest.raises(ConnectionError):
+            await old_ws.receive_json(timeout=4.0)
+
+        posted = await harness.client.post(
+            f"/rooms/{room_id}/messages",
+            json={"author_id": human_id, "body": "anyone home"},
+        )
+        assert posted.status_code == 200
+        frame = await new_ws.receive_json(timeout=4.0)
+        assert frame == {
+            "type": "wake",
+            "agent_id": str(byoa_id),
+            "room_id": str(room_id),
+        }
+    finally:
+        await new_ws.close()
+        await old_ws.close()
