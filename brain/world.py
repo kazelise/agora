@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 
@@ -70,6 +70,7 @@ class WorldParticipant:
     persona: str | None
     kind: str = "agent"
     computer_id: UUID | None = None
+    role: str = "member"
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,17 @@ class TurnContext:
     # the inbox is a per-turn delivery batch, the stretch is the room's
     # conversation state. Default 0 keeps ad-hoc TurnContexts valid.
     agent_only_stretch: int = 0
+    room_mode: str = "open"
+    # Set when this wake is a moderator call_on. Default False keeps
+    # ad-hoc TurnContexts valid (ordinary reactive / proactive turns).
+    called_on: bool = False
+
+
+@dataclass(frozen=True)
+class DecisionResult:
+    status: Literal["won", "already_decided"]
+    action: str
+    target_id: UUID | None
 
 
 class World(Protocol):
@@ -130,3 +142,12 @@ class World(Protocol):
     ) -> None: ...
 
     async def record_seen(self, agent_id: UUID, room_id: UUID, seq: int) -> None: ...
+
+    async def record_decision(
+        self,
+        room_id: UUID,
+        moderator_id: UUID,
+        trigger_seq: int,
+        action: str,
+        target_id: UUID | None,
+    ) -> DecisionResult: ...

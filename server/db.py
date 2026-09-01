@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -9,14 +9,17 @@ import asyncpg
 from server.computers import hash_token
 from server.models import (
     ComputerRow,
+    DecisionRow,
     MessageRow,
     ParticipantKind,
+    ParticipantRole,
     ParticipantRow,
+    RoomMode,
     RoomRow,
 )
 
 _PARTICIPANT_COLS = (
-    "id, room_id, kind, name, persona, computer_id, created_at"
+    "id, room_id, kind, name, persona, computer_id, role, created_at"
 )
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -24,6 +27,38 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 class NotFoundError(Exception):
     def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class DuplicateModeratorError(Exception):
+    """A room may have at most one moderator seat."""
+
+    def __init__(self, detail: str = "room already has a moderator") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class InvalidParticipantRoleError(Exception):
+    """role=moderator is an agent seat; a human cannot hold it."""
+
+    def __init__(self, detail: str = "role=moderator requires kind=agent") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class DuplicateParticipantNameError(Exception):
+    """Names address @-mentions and call_on targets; one per room."""
+
+    def __init__(self, detail: str = "participant name already used in this room") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class InvalidTriggerSeqError(Exception):
+    """trigger_seq must be a committed room seq (1..last_seq)."""
+
+    def __init__(self, detail: str = "trigger_seq is outside the room's committed seq range") -> None:
         super().__init__(detail)
         self.detail = detail
 
@@ -52,10 +87,17 @@ async def migrate(pool: asyncpg.Pool) -> None:
 
 
 def _room(row: asyncpg.Record) -> RoomRow:
-    return RoomRow(id=row["id"], name=row["name"], created_at=row["created_at"])
+    mode = row["mode"] if "mode" in row.keys() else "open"
+    return RoomRow(
+        id=row["id"],
+        name=row["name"],
+        created_at=row["created_at"],
+        mode=str(mode or "open"),
+    )
 
 
 def _participant(row: asyncpg.Record) -> ParticipantRow:
+    role = row["role"] if "role" in row.keys() else "member"
     return ParticipantRow(
         id=row["id"],
         room_id=row["room_id"],
@@ -64,6 +106,19 @@ def _participant(row: asyncpg.Record) -> ParticipantRow:
         persona=row["persona"],
         created_at=row["created_at"],
         computer_id=row["computer_id"],
+        role=str(role or "member"),
+    )
+
+
+def _decision(row: asyncpg.Record) -> DecisionRow:
+    return DecisionRow(
+        id=row["id"],
+        room_id=row["room_id"],
+        moderator_id=row["moderator_id"],
+        trigger_seq=int(row["trigger_seq"]),
+        action=str(row["action"]),
+        target_id=row["target_id"],
+        created_at=row["created_at"],
     )
 
 
@@ -87,15 +142,18 @@ def _message(row: asyncpg.Record) -> MessageRow:
     )
 
 
-async def create_room(pool: asyncpg.Pool, name: str) -> RoomRow:
+async def create_room(
+    pool: asyncpg.Pool, name: str, mode: RoomMode = "open"
+) -> RoomRow:
     row = await pool.fetchrow(
         """
-        INSERT INTO rooms (id, name)
-        VALUES ($1, $2)
-        RETURNING id, name, created_at
+        INSERT INTO rooms (id, name, mode)
+        VALUES ($1, $2, $3)
+        RETURNING id, name, created_at, mode
         """,
         uuid4(),
         name,
+        mode,
     )
     assert row is not None
     return _room(row)
@@ -103,7 +161,7 @@ async def create_room(pool: asyncpg.Pool, name: str) -> RoomRow:
 
 async def get_room(pool: asyncpg.Pool, room_id: UUID) -> RoomRow:
     row = await pool.fetchrow(
-        "SELECT id, name, created_at FROM rooms WHERE id = $1",
+        "SELECT id, name, created_at, mode FROM rooms WHERE id = $1",
         room_id,
     )
     if row is None:
@@ -118,31 +176,52 @@ async def add_participant(
     name: str,
     persona: str | None,
     computer_id: UUID | None = None,
+    role: ParticipantRole = "member",
 ) -> ParticipantRow:
     async with pool.acquire() as conn:
         async with conn.transaction():
             exists = await conn.fetchval("SELECT 1 FROM rooms WHERE id = $1", room_id)
             if exists is None:
                 raise NotFoundError(f"room {room_id} not found")
+            if role == "moderator" and kind != "agent":
+                raise InvalidParticipantRoleError()
             if computer_id is not None:
                 hosted = await conn.fetchval(
                     "SELECT 1 FROM computers WHERE id = $1", computer_id
                 )
                 if hosted is None:
                     raise NotFoundError(f"computer {computer_id} not found")
-            row = await conn.fetchrow(
-                f"""
-                INSERT INTO participants (id, room_id, kind, name, persona, computer_id)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING {_PARTICIPANT_COLS}
-                """,
-                uuid4(),
-                room_id,
-                kind,
-                name,
-                persona,
-                computer_id,
-            )
+            if role == "moderator":
+                taken = await conn.fetchval(
+                    """
+                    SELECT 1 FROM participants
+                    WHERE room_id = $1 AND role = 'moderator'
+                    """,
+                    room_id,
+                )
+                if taken is not None:
+                    raise DuplicateModeratorError()
+            try:
+                row = await conn.fetchrow(
+                    f"""
+                    INSERT INTO participants
+                        (id, room_id, kind, name, persona, computer_id, role)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING {_PARTICIPANT_COLS}
+                    """,
+                    uuid4(),
+                    room_id,
+                    kind,
+                    name,
+                    persona,
+                    computer_id,
+                    role,
+                )
+            except asyncpg.UniqueViolationError as exc:
+                constraint = exc.constraint_name or ""
+                if "one_moderator" in constraint:
+                    raise DuplicateModeratorError() from exc
+                raise DuplicateParticipantNameError() from exc
     assert row is not None
     return _participant(row)
 
@@ -422,6 +501,100 @@ async def insert_message(
             )
     assert row is not None
     return _message(row)
+
+
+async def get_message_by_seq(
+    pool: asyncpg.Pool, room_id: UUID, seq: int
+) -> MessageRow | None:
+    row = await pool.fetchrow(
+        """
+        SELECT id, room_id, author_id, body, seq, created_at
+        FROM messages
+        WHERE room_id = $1 AND seq = $2
+        """,
+        room_id,
+        seq,
+    )
+    return None if row is None else _message(row)
+
+
+async def record_decision(
+    pool: asyncpg.Pool,
+    room_id: UUID,
+    moderator_id: UUID,
+    trigger_seq: int,
+    action: str,
+    target_id: UUID | None,
+) -> tuple[Literal["won", "already_decided"], DecisionRow]:
+    """Insert the decision, or return the existing row for this trigger.
+
+    UNIQUE (room_id, trigger_seq) makes a moderator rerun for the same
+    trigger idempotent: the second attempt is "already decided", not an
+    error. ON CONFLICT DO NOTHING + a follow-up SELECT is one critical
+    section under the unique index — two concurrent inserts cannot both
+    report won. trigger_seq must already be a committed room seq so a
+    daemon cannot pre-book future keys.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            last_seq = await conn.fetchval(
+                "SELECT last_seq FROM rooms WHERE id = $1 FOR SHARE",
+                room_id,
+            )
+            if last_seq is None:
+                raise NotFoundError(f"room {room_id} not found")
+            if trigger_seq <= 0 or int(trigger_seq) > int(last_seq):
+                raise InvalidTriggerSeqError(
+                    f"trigger_seq {trigger_seq} is outside 1..{int(last_seq)}"
+                )
+            row = await conn.fetchrow(
+                """
+                INSERT INTO moderator_decisions (
+                    id, room_id, moderator_id, trigger_seq, action, target_id
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (room_id, trigger_seq) DO NOTHING
+                RETURNING id, room_id, moderator_id, trigger_seq, action,
+                          target_id, created_at
+                """,
+                uuid4(),
+                room_id,
+                moderator_id,
+                trigger_seq,
+                action,
+                target_id,
+            )
+            if row is not None:
+                return "won", _decision(row)
+            existing = await conn.fetchrow(
+                """
+                SELECT id, room_id, moderator_id, trigger_seq, action,
+                       target_id, created_at
+                FROM moderator_decisions
+                WHERE room_id = $1 AND trigger_seq = $2
+                """,
+                room_id,
+                trigger_seq,
+            )
+    assert existing is not None
+    return "already_decided", _decision(existing)
+
+
+async def get_latest_decision(
+    pool: asyncpg.Pool, room_id: UUID
+) -> DecisionRow | None:
+    row = await pool.fetchrow(
+        """
+        SELECT id, room_id, moderator_id, trigger_seq, action,
+               target_id, created_at
+        FROM moderator_decisions
+        WHERE room_id = $1
+        ORDER BY created_at DESC, trigger_seq DESC
+        LIMIT 1
+        """,
+        room_id,
+    )
+    return None if row is None else _decision(row)
 
 
 async def list_messages(

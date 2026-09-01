@@ -31,7 +31,7 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 
 ## 2. 用例清单
 
-### L0 确定性测试（110 项，全绿）
+### L0 确定性测试（125 项，全绿）
 
 关键套件：
 
@@ -43,6 +43,7 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 | `test_pacer.py` / `test_limiter.py` | 11 | 速率限制、并发上限 |
 | `test_coalesce.py` / `test_daemon_lane.py` | 8 | AgentLane 合并 rerun 指向最新房间 |
 | `test_byoa.py` | 9 | BYOA claim/HTTP/WS 重连替换 |
+| `test_moderated.py` | 15 | moderated 路由、API、decide 工具、幂等、loop cap、BYOA decision |
 | 其余（brain/scheduler/digest/args…） | 25 | 图节点、triage、cursor、参数解析 |
 
 ### L2 真模型协调测试
@@ -61,6 +62,29 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 | `test_dup_bait_agent_cannot_double_post_verbatim` | Polly（复读怪：被指令逐字复述他人消息） | verbatim-dup 门 | 转录中不存在相邻同文 agent 消息；且 parrot 确实醒过（triage ≥ 2 次，证明门被真正锻炼而非模型自觉沉默） |
 | `test_claim_hog_two_agents_one_lock_one_reply` | Bella + Cain（霸锁怪：都强制抢 `t1`） | claim 原子性 | claims 表恰好一行 `t1`；恰好 1 条 hog 回复（赢家独答，输家沉默，无死锁） |
 | `test_preemptive_send_anyway_cannot_skip_freshness` | Racer（抢跑怪：每次首轮回复强制 `send_anyway=true`） | freshness 门不可被 token 旁路 | 报数序列无重复整数、无断号——`send_anyway` 只是确认，不是通行证 |
+
+### Phase 7 moderated（L0 增补）
+
+| 用例 | 场景 | 断言 |
+|---|---|---|
+| `test_moderated_room_wakes_moderator_only` | 人发言、无 `@` | 只叫醒主持，成员不醒 |
+| `test_mention_wakes_only_named_agent` | 正文 `@Iris` | 只叫醒 Iris |
+| `test_author_never_self_wakes_in_moderated_room` | 主持自己发言 / `@Chair` | 零 turn |
+| `test_human_post_wakes_both_agents_…`（既有，未改） | open 房间 fan-out | 两人仍都被叫醒 |
+| `test_second_moderator_is_409` / `test_human_cannot_be_moderator` | API | 第二主持 409；人不能当主持 |
+| `test_call_on_writes_row_wakes_target_skips_triage` | decide(call_on) | 行写入、目标醒、目标 skip triage、`response_mode=me` |
+| `test_say_goes_through_freshness_hold` | decide(say) + 同伴抢插 | HOLD 仍触发 |
+| `test_silence_writes_row_and_no_message` | decide(silence) | 有决策行、无新消息 |
+| `test_invalid_target_is_tool_error_then_retry` | 坏名字再改 Iris | ToolMessage 后同轮重试 |
+| `test_no_tool_call_moderation_is_invalid_…` | 两次纯文本 | `invalid_moderation`、无决策行 |
+| `test_same_trigger_seq_is_idempotent_…` | 两次同一 trigger | 一行、第二次 `decision_replayed`、不双叫醒 |
+| `test_moderator_over_loop_cap_silences_…` | stretch ≥ cap | 零 LLM、`moderated_silence` |
+| `test_http_world_decision_wakes_byoa_…` | HttpWorld + WS | 服务端叫醒、无 server-side turn |
+| `test_nudge_wakes_moderator_who_is_last_author` | 主持刚说过、`seq=None` | 仍叫醒主持（不是自我排除） |
+| `test_nudge_redelivers_lost_call_on_once` | 决策行在、目标未读 | 补投一次；读位追上后再 nudge 叫主持 |
+| `test_crashed_say_leaves_trigger_open` | insert 崩溃再重跑 | 无决策行 → 再 decide → 落地并写行 |
+| `test_mention_earliest_position_wins` / `test_mention_cjk_and_email_boundaries` | `@Bob`+`@Alexander`；CJK / `foo@Bob` | 最早位置；Unicode 边界 |
+| `test_dispatch_call_on_runs_target_via_real_wake` | 人发言 → dispatch → 脚本 `call_on` | 目标经真实 wake 跑完且跳过 triage |
 
 ## 3. 真模型实测记录
 

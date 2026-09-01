@@ -62,8 +62,17 @@ class ScriptedChatModel:
     def __init__(self, responses: Sequence[Response] | None = None) -> None:
         self._responses = list(responses or [])
         self.calls: list[list[Any]] = []
+        self.bound_tools: list[str] = []
 
-    def bind_tools(self, _tools: Any, **_kwargs: Any) -> ScriptedChatModel:
+    def bind_tools(self, tools: Any, **_kwargs: Any) -> ScriptedChatModel:
+        names: list[str] = []
+        for tool in tools or []:
+            name = getattr(tool, "name", None)
+            if name is None and isinstance(tool, dict):
+                name = tool.get("name")
+            if name is not None:
+                names.append(str(name))
+        self.bound_tools = names
         return self
 
     def push(self, response: Response) -> None:

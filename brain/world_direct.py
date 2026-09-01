@@ -6,13 +6,16 @@ by existing tests (construct DirectWorld(pool, redis)).
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 import asyncpg
 import redis.asyncio as redis
 
 from brain.seen import record_seen as redis_record_seen
+from brain.wake_hints import consume_called_on
 from brain.world import (
+    DecisionResult,
     DuplicateReply,
     StaleWrite,
     TurnContext,
@@ -22,6 +25,8 @@ from brain.world import (
 from server import db
 from server.models import MessageRow, ParticipantRow
 
+CallOnFn = Callable[[UUID, UUID], Awaitable[None]]
+
 
 def _participant(row: ParticipantRow) -> WorldParticipant:
     return WorldParticipant(
@@ -30,6 +35,7 @@ def _participant(row: ParticipantRow) -> WorldParticipant:
         persona=row.persona,
         kind=row.kind,
         computer_id=row.computer_id,
+        role=row.role,
     )
 
 
@@ -46,9 +52,18 @@ def _message(row: MessageRow, author_name: str) -> WorldMessage:
 
 
 class DirectWorld:
-    def __init__(self, pool: asyncpg.Pool, redis_client: redis.Redis) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        redis_client: redis.Redis,
+        *,
+        on_call_on: CallOnFn | None = None,
+    ) -> None:
         self.pool = pool
         self.redis = redis_client
+        # Server wires this to Scheduler.wake_one(..., called_on=True).
+        # Tests pass a spy. Absent: call_on still writes the row.
+        self.on_call_on = on_call_on
 
     async def _names(self, room_id: UUID) -> dict[str, str]:
         people = await db.list_participants(self.pool, room_id)
@@ -70,6 +85,12 @@ class DirectWorld:
         inbox = [_message(row, names.get(str(row.author_id), "?")) for row in rows]
         seen_seq = max((m.seq for m in inbox), default=last_read)
         stretch = await db.count_agent_only_stretch(self.pool, room_id)
+        try:
+            room = await db.get_room(self.pool, room_id)
+            room_mode = room.mode
+        except db.NotFoundError:
+            room_mode = "open"
+        called_on = await consume_called_on(self.redis, agent_id, room_id)
         return TurnContext(
             agent=_participant(agent),
             inbox=inbox,
@@ -77,6 +98,8 @@ class DirectWorld:
             last_read_seq=last_read,
             seen_seq=seen_seq,
             agent_only_stretch=stretch,
+            room_mode=room_mode,
+            called_on=called_on,
         )
 
     async def get_last_read(self, agent_id: UUID, room_id: UUID) -> int:
@@ -150,3 +173,28 @@ class DirectWorld:
 
     async def record_seen(self, agent_id: UUID, room_id: UUID, seq: int) -> None:
         await redis_record_seen(self.redis, agent_id, room_id, seq)
+
+    async def record_decision(
+        self,
+        room_id: UUID,
+        moderator_id: UUID,
+        trigger_seq: int,
+        action: str,
+        target_id: UUID | None,
+    ) -> DecisionResult:
+        status, row = await db.record_decision(
+            self.pool, room_id, moderator_id, trigger_seq, action, target_id
+        )
+        result = DecisionResult(
+            status=status, action=row.action, target_id=row.target_id
+        )
+        # Wake only on a freshly won call_on. A replay must not double-wake
+        # (the unique key already decided who was called).
+        if (
+            status == "won"
+            and row.action == "call_on"
+            and row.target_id is not None
+            and self.on_call_on is not None
+        ):
+            await self.on_call_on(room_id, row.target_id)
+        return result

@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 6：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、把 `send_anyway` 当确认而非跳过的 hold token、房间级的 agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），以及 `GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / active claims / 模型花费，纯格式化零模型调用）。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 7：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、把 `send_anyway` 当确认而非跳过的 hold token、房间级的 agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），`GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / active claims / 模型花费，纯格式化零模型调用），以及 **moderated 房间**：指定一名 moderator，落地消息默认只叫醒主持；主持用同一张图上的 `decide` 工具点名 / 开口 / 沉默，`@Name` 是唯一写死的点名协议。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
@@ -10,12 +10,12 @@ flowchart LR
   end
   subgraph server [FastAPI 服务端]
     API[REST + WebSocket]
-    Scheduler[唤醒调度器<br/>per-agent 串行 + 突发合并]
+    Scheduler[唤醒调度器<br/>open 全员 / moderated 主持]
     Ledger[(llm_calls 成本账本)]
   end
   subgraph brain [同一张 LangGraph]
     Triage[triage 节点<br/>小模型: me/each/one-of-us]
-    Loop[工具循环节点<br/>大模型: reply/claim]
+    Loop[工具循环节点<br/>大模型: reply/claim/decide]
     Fresh[freshness 节点<br/>过期则 interrupt-HOLD]
   end
   PG[(Postgres<br/>消息/认领/checkpoint)]
@@ -145,7 +145,11 @@ turn 都是反应式的——叫醒只在新消息落地时发生。但「有人
 
 没人读过最后一条消息的房间（例如唯一的非作者 agent 是离线的 BYOA 宿主，pub/sub wake 丢了）不立即 nudge——wake 可能还在路上；但安静超过 `AGORA_STALL_UNREAD_GRACE_S`（默认 120s，远超一次合法 turn）后晋升为可 nudge，丢失的投递由 sweep 补课，房间不再因「永远等不到已读」而饿死。
 
-被唤醒的 agent 已读全部消息、inbox 为空——这种 **proactive turn** 仍会跑 triage：把房间最近的消息尾巴交给小模型，让它判断「是否仍有人欠话」，沉默是合法答案；agent-only loop cap 照常兜底。资格判定全程是算术（年龄 / 作者 / 读位），不含内容分类。
+被唤醒的 agent 已读全部消息、inbox 为空——这种 **proactive turn** 仍会跑 triage：把房间最近的消息尾巴交给小模型，让它判断「是否仍有人欠话」，沉默是合法答案；agent-only loop cap 照常兜底。资格判定全程是算术（年龄 / 作者 / 读位），不含内容分类。moderated 房间的 nudge 走同一条 `dispatch`：资格判定不变，叫醒只落到主持（没有新的 `@Name` 可解析）。
+
+## Moderated 房间
+
+`POST /rooms` 可带 `mode=moderated`（默认 `open`）。open 房间行为与今天完全一样：新消息叫醒所有非作者 agent。moderated 房间只叫醒主持；正文里出现 `@<参与者名>`（对名单做最长匹配，区分大小写）则只叫醒被点到的 agent——这是从元桌借来的唯一写死交互规则，属于协议解析，不是内容分类。主持跑同一张图，只绑 `decide(call_on|say|silence)`，跳过 triage；`call_on` 之后被点到的成员带着 `response_mode=me` 进工具循环。决策行按 `(room_id, trigger_seq)` 唯一，同一触发的第二次 decide 是 replay，不会双叫醒。freshness / verbatim-dup 已经能裁判 `call_on` 回复和 `@` 回复的碰撞，所以不需要 floor lease。
 
 ## 崩溃自愈：claim 的 TTL 抢占
 
