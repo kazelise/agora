@@ -4,6 +4,7 @@ import asyncio
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 from uuid import UUID
 
 import redis.asyncio as redis
@@ -86,14 +87,24 @@ def create_app(
 
         launcher = job_launcher
         if stub_turns:
-            scheduler = Scheduler(pool, computers=computers)
+            scheduler = Scheduler(
+                pool, computers=computers, redis_client=publisher
+            )
         elif run_turn is not None:
-            scheduler = Scheduler(pool, run_turn=run_turn, computers=computers)
+            scheduler = Scheduler(
+                pool,
+                run_turn=run_turn,
+                computers=computers,
+                redis_client=publisher,
+            )
         elif launcher is not None or cfg.k8s_enabled:
             if launcher is None:
                 launcher = K8sJobLauncher.from_settings(cfg)
             scheduler = Scheduler(
-                pool, run_turn=launcher.run_turn, computers=computers
+                pool,
+                run_turn=launcher.run_turn,
+                computers=computers,
+                redis_client=publisher,
             )
         else:
             from brain.graph import make_turn_fn
@@ -101,13 +112,20 @@ def create_app(
             async def on_brain_committed(row: WorldMessage) -> None:
                 await fanout_with_stall_reset(hub, publisher, row)
 
+            turn_fn = make_turn_fn(
+                pool, publisher, on_committed=on_brain_committed
+            )
             scheduler = Scheduler(
                 pool,
-                run_turn=make_turn_fn(
-                    pool, publisher, on_committed=on_brain_committed
-                ),
+                run_turn=turn_fn,
                 computers=computers,
+                redis_client=publisher,
             )
+
+            async def on_call_on(room_id: UUID, target_id: UUID) -> None:
+                await scheduler.wake_one(room_id, target_id, called_on=True)
+
+            turn_fn.world.on_call_on = on_call_on
 
         stalls.start()
 
@@ -173,8 +191,10 @@ def register_routes(app: FastAPI) -> None:
 
     @app.post("/rooms", response_model=RoomOut)
     async def post_room(body: CreateRoomRequest) -> RoomOut:
-        room = await db.create_room(app.state.pool, body.name)
-        return RoomOut(id=room.id, name=room.name, created_at=room.created_at)
+        room = await db.create_room(app.state.pool, body.name, mode=body.mode)
+        return RoomOut(
+            id=room.id, name=room.name, created_at=room.created_at, mode=room.mode
+        )
 
     @app.post("/rooms/{room_id}/participants", response_model=ParticipantOut)
     async def post_participant(room_id: UUID, body: CreateParticipantRequest) -> ParticipantOut:
@@ -186,9 +206,16 @@ def register_routes(app: FastAPI) -> None:
                 body.name,
                 body.persona,
                 body.computer_id,
+                role=body.role,
             )
         except db.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=exc.detail) from exc
+        except db.InvalidParticipantRoleError as exc:
+            raise HTTPException(status_code=400, detail=exc.detail) from exc
+        except db.DuplicateModeratorError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        except db.DuplicateParticipantNameError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
         return ParticipantOut(
             id=row.id,
             room_id=row.room_id,
@@ -197,6 +224,7 @@ def register_routes(app: FastAPI) -> None:
             persona=row.persona,
             computer_id=row.computer_id,
             created_at=row.created_at,
+            role=row.role,
         )
 
     @app.post("/rooms/{room_id}/messages", response_model=MessageOut)

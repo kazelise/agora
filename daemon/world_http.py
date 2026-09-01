@@ -13,6 +13,7 @@ from uuid import UUID
 import httpx
 
 from brain.world import (
+    DecisionResult,
     DuplicateReply,
     StaleWrite,
     TurnContext,
@@ -51,6 +52,7 @@ def _participant(data: dict[str, Any]) -> WorldParticipant:
         persona=data.get("persona"),
         kind=str(data.get("kind") or "agent"),
         computer_id=_uuid(raw_computer) if raw_computer else None,
+        role=str(data.get("role") or "member"),
     )
 
 
@@ -127,13 +129,16 @@ class HttpWorld:
                 id=agent_id,
                 name=data["agent_name"],
                 persona=data.get("persona") or "",
-                kind="agent",
+                kind=str(data.get("agent_kind") or "agent"),
+                role=str(data.get("agent_role") or "member"),
             ),
             inbox=inbox,
             participants=people,
             last_read_seq=int(data["last_read_seq"]),
             seen_seq=int(data["seen_seq"]),
             agent_only_stretch=int(data.get("agent_only_stretch") or 0),
+            room_mode=str(data.get("room_mode") or "open"),
+            called_on=bool(data.get("called_on")),
         )
 
     async def get_last_read(self, agent_id: UUID, room_id: UUID) -> int:
@@ -280,3 +285,34 @@ class HttpWorld:
             },
         )
         self._raise_for_status(resp)
+
+    async def record_decision(
+        self,
+        room_id: UUID,
+        moderator_id: UUID,
+        trigger_seq: int,
+        action: str,
+        target_id: UUID | None,
+    ) -> DecisionResult:
+        # The server records the row AND performs any call_on wake.
+        # This process must not reach into server lanes.
+        self._actor = moderator_id
+        resp = await self._request(
+            "POST",
+            "/runtime/decision",
+            json={
+                "agent_id": str(moderator_id),
+                "room_id": str(room_id),
+                "trigger_seq": trigger_seq,
+                "action": action,
+                "target_id": str(target_id) if target_id is not None else None,
+            },
+        )
+        self._raise_for_status(resp)
+        data = resp.json()
+        raw_target = data.get("target_id")
+        return DecisionResult(
+            status=data["status"],
+            action=str(data["action"]),
+            target_id=_uuid(raw_target) if raw_target else None,
+        )

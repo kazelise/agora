@@ -8,10 +8,13 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 ParticipantKind = Literal["human", "agent"]
+RoomMode = Literal["open", "moderated"]
+ParticipantRole = Literal["member", "moderator"]
 
 
 class CreateRoomRequest(BaseModel):
     name: str = Field(min_length=1)
+    mode: RoomMode = "open"
 
 
 class CreateComputerRequest(BaseModel):
@@ -23,6 +26,7 @@ class CreateParticipantRequest(BaseModel):
     name: str = Field(min_length=1)
     persona: str | None = None
     computer_id: UUID | None = None
+    role: ParticipantRole = "member"
 
 
 class CreateMessageRequest(BaseModel):
@@ -34,6 +38,7 @@ class RoomOut(BaseModel):
     id: UUID
     name: str
     created_at: datetime
+    mode: RoomMode = "open"
 
 
 class ComputerCreatedOut(BaseModel):
@@ -58,6 +63,7 @@ class ParticipantOut(BaseModel):
     persona: str | None
     computer_id: UUID | None
     created_at: datetime
+    role: ParticipantRole = "member"
 
 
 class MessageOut(BaseModel):
@@ -78,6 +84,7 @@ class RoomRow:
     id: UUID
     name: str
     created_at: datetime
+    mode: str = "open"
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,18 @@ class ParticipantRow:
     persona: str | None
     created_at: datetime
     computer_id: UUID | None = None
+    role: str = "member"
+
+
+@dataclass(frozen=True)
+class DecisionRow:
+    id: UUID
+    room_id: UUID
+    moderator_id: UUID
+    trigger_seq: int
+    action: str
+    target_id: UUID | None
+    created_at: datetime
 
 
 @dataclass(frozen=True)

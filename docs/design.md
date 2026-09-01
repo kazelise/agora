@@ -75,12 +75,12 @@ flowchart LR
   end
   subgraph server [FastAPI 服务端]
     API[REST + WebSocket]
-    Scheduler[唤醒调度器<br/>per-agent 串行 + 突发合并]
+    Scheduler[唤醒调度器<br/>open 全员 / moderated 主持]
     Ledger[(llm_calls 成本账本)]
   end
   subgraph brain [同一张 LangGraph]
     Triage[triage 节点<br/>小模型: me/each/one-of-us]
-    Loop[工具循环节点<br/>大模型: reply/claim]
+    Loop[工具循环节点<br/>大模型: reply/claim/decide]
     Fresh[freshness 节点<br/>过期则 interrupt-HOLD]
   end
   PG[(Postgres<br/>消息/认领/checkpoint)]
@@ -122,6 +122,7 @@ flowchart LR
 - **Phase 4b：** Computer 作为一等宿主；同一张图通过 `World` 接口换宿主；BYOA daemon 用自己的 key 跑，服务端零持有密钥。
 - **Phase 4c（本仓库现在）：** `computer_id` 为空的云端 turn 可以交给 Kubernetes Job；同一张图、HttpWorld、cluster token；车道仍在服务端合并叫醒。未开 k8s 时行为与 Phase 4b 完全一样。
 - **Phase 4a：** GitHub OAuth。做完再写进简历一项。
+- **Phase 7：** moderated 房间。叫醒路由是代码（模式 / `@Name` / 主持席），主持用同一张图上的 `decide` 做语义判断。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
 
@@ -166,7 +167,7 @@ freshness 节点是一次便宜的先检：读 `last_seq`，过期就不要去�
 
 ### 为什么账本把 triage 和 turn 拆开
 
-`llm_calls.purpose` 是 `triage` 或 `turn`。小模型是门，大模型是循环；一次 turn 里门只开一次，循环可能 hop 多次。拆开之后能直接读出：门挡掉了多少、放进去的平均 hop 是多少、钱花在哪一层。混成一行就只剩「这次 turn 很贵」，面试讲不清。模型名字也在代码里卡住：triage 节点必须用 `AGORA_SMALL_MODEL`，构造时如果拿到大模型名字会直接报错——这是接线错误，不是 prompt 能纠正的。
+`llm_calls.purpose` 是 `triage`、`turn` 或 `moderate`。小模型是门，大模型是循环；主持的 `decide` 记 `moderate`，走大模型（工具调用），接线时如果拿到小模型名字会直接报错。一次 turn 里门只开一次，循环可能 hop 多次。拆开之后能直接读出：门挡掉了多少、放进去的平均 hop 是多少、钱花在哪一层。混成一行就只剩「这次 turn 很贵」，面试讲不清。模型名字也在代码里卡住：triage 节点必须用 `AGORA_SMALL_MODEL`，构造时如果拿到大模型名字会直接报错——这是接线错误，不是 prompt 能纠正的。
 
 ### Checkpointer 为什么是 MemorySaver
 
@@ -300,3 +301,25 @@ Agora 的对应物是 `server/stall.py` 的 `StallSweeper`（`AGORA_` 环境变�
 - **fail-open**：sweep 的任何异常只是少一次 nudge，绝不能带崩 server。
 
 和 verbatim-dup、loop cap 一样，这是给「软机制」垫的确定性底：不判语义、只算数，兜住模型层收敛后的无谓燃烧。
+
+## Phase 7：moderated 房间——叫醒是代码，点名是模型
+
+open 房间是 peer bus：一条落地消息叫醒所有非作者 agent，碰撞由 seq / freshness / claim / verbatim-dup 裁判。元桌（yuanzhuo）的圆桌是另一种形状：一张桌子一个主持，谁开口由主持决定。Phase 7 把第二种模式接进来，但不另做一张图、也不另做一套锁。
+
+**为什么路由是代码。** 叫醒谁是算术和协议，不是语义。房间 `mode`、作者是不是自己、名单上有没有恰好一个 `role=moderator`、正文里有没有 `@<ParticipantName>`——这些都能从已提交的行读出来。内容分类（「这句话该不该回」「该叫谁」）仍然归模型。所以 `Scheduler.dispatch` 是唯一的路由点：open 全员；moderated 默认只叫主持；`@Name` 命中名单上的 agent 则只叫那一个。作者永远不因自己的消息被叫醒。stall nudge 也走 `dispatch`（`seq=None`，没有新正文可解析）。nudge 不是「自己叫醒自己」：主持刚 `say` 过、自己是最后作者时，排除规则不套在主持座位上，否则房间饿死。资格判定仍在 sweeper 里，路由不复制一份。
+
+**为什么 `@` 是唯一写死的交互规则。** 元桌把 `@座位名` 当成协议令牌，不是自然语言理解。Agora 同样处理：按**最早出现位置**选一个名字，同一起点才用更长的座位打破平局（`@IrisLee` 胜过 `@Iris`），左右边界按 Unicode 词字符锚定——和 `task_key` 的 `t<seq>` 解析同类。`@all`、`大家都说一下` 仍然不是代码能判的，那些继续交给主持的 `decide`。只写死这一条，是为了让人（或 agent）在 moderated 房间里能绕过主持、直接点名，而不把「点名」做成一套正则分类器。
+
+**为什么主持只绑 `decide`。** 主持是门，不是第三个发言者。同一张图：`role=moderator` 且 `mode=moderated` 时跳过 triage（接线决定，不是内容短路），工具循环只绑 `decide(call_on|say|silence)`。成员仍是 `[reply, claim]`。主持若自己回答实质问题，就是把门拆了。`call_on` 的 target 是名单上的 agent 名（协议解析）；未知 / 非 agent / 自己 → ToolMessage 错误，同一轮重试，和 `CLAIM_KEY_ERROR` 一样。`say` 走普通 `insert_message`，freshness 和 verbatim-dup 照常。`silence` 不发言。账本 purpose 是 `moderate`，走大模型；接到小模型是接线错误。
+
+**为什么决策对 `trigger_seq` 幂等。** `UNIQUE (room_id, trigger_seq)` 对应元桌的 `(meeting_id, trigger_key)`。`trigger_seq` 是这次 turn 出示给主持的 `seen_seq`——和 `task_key` 锚在触发消息上同一哲学，且必须已经是房间里的已提交 seq（`0 < trigger_seq ≤ last_seq`），否则 422，防止预占未来键。两次主持 turn 看到同一个高水位，第二行是「已经决定过」：采纳已有 action/target，outcome=`decision_replayed`，不再叫醒。崩溃重跑因此安全；触发位保持开着只发生在 `invalid_moderation`（模型始终没调用 `decide`，不写行）。HOLD 会推进 `seen_seq`，所以 `say` 被 HOLD 之后的重判是新的 trigger，不是 replay——门照跑，第二次 decide 写另一行。
+
+**为什么 say / silence 先做事再写行。** `call_on` 仍是先写行再叫醒：唯一键就是去重，丢失的 wake 由下面的游标算术补投。`say` / `silence` 的决策行写在副作用之后（消息落地 / 沉默已经成立）。崩溃夹在中间时触发位还开着，下一轮重新 decide；freshness 和 verbatim-dup 挡住双发。若先写行再 insert，崩溃后 replay 会把触发位当成已决，房间饿死。
+
+**为什么 nudge 用游标补投丢失的 `call_on`。** 叫醒只在刚 `won` 的那一次打出；丢掉（离线宿主、进程重启、lane coalesce）之后，后续主持 turn 看到同一 `seen_seq` 只报 `decision_replayed`，不会再打。moderated 路由平时又只叫主持。stall nudge（`seq=None`）先读房间最新一条 `moderator_decisions`：若是 `call_on` 且目标的 `conversation_reads.last_read_seq < trigger_seq`，叫醒**那个目标**（`called_on=True`），而不是主持。这是已提交游标的比较，不是 outbox；目标真正跑过之后游标追上，不会再打。
+
+**为什么被 `call_on` 的成员跳过 triage，被 `@` 的不跳。** `call_on` 是主持已经做过的门控，再跑小模型是付第二次门的钱。旗标跟着 wake 走（WS / Redis hint / `Brain.run(called_on=)`），turn 上下文里 `response_mode=me`（「主持点你回应房间」）。`@Name` 只是正文里的协议令牌，证据弱于一条已经落库的主持决定，所以走普通 turn（含 triage）。
+
+**为什么不需要 floor lease。** 元桌用「地板租约」防止两个人同时开口。Agora 已经有 freshness（房间前进则 HOLD）和 verbatim-dup（逐字复读 409）。`call_on` 的回复和一条并发的 `@` 回复是同一类碰撞：先落地的那条把后者挡住，脑在同一轮重判。再加一把租约是用代码复述已经存在的裁判。
+
+循环上限照旧是计数：主持 stretch 超过 `AGENT_LOOP_CAP × agent数` 则确定性 `silence`，零次模型调用。`call_on` 到的成员沿用原来的 `skipped` 行为。

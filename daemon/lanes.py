@@ -39,16 +39,19 @@ class AgentLane:
         self._pending: tuple[UUID, UUID] | None = None
         self._task: asyncio.Task[None] | None = None
 
-    async def notify(self, room_id: UUID, agent_id: UUID) -> None:
+    async def notify(self, room_id: UUID, agent_id: UUID) -> tuple[UUID, UUID] | None:
+        """Returns the overwritten pending (room, agent), if any."""
         async with self._lock:
             if self._task is not None and not self._task.done():
+                old = self._pending
                 self._pending = (room_id, agent_id)
-                return
+                return old
             self._pending = None
             self._task = asyncio.create_task(
                 self._loop(room_id, agent_id),
                 name=f"agora-byoa-{agent_id}",
             )
+            return None
 
     async def _loop(self, room_id: UUID, agent_id: UUID) -> None:
         while True:

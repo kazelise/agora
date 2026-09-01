@@ -9,11 +9,13 @@ key. Usage lands in the same llm_calls ledger (purpose + tokens + model).
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from brain.wake_hints import consume_called_on
 from server import db
 from server.auth import hosted_agent, require_host
 from server.computers import ComputerHub
@@ -58,11 +60,26 @@ class RuntimeSeenRequest(BaseModel):
     seq: int
 
 
+class RuntimeDecisionRequest(BaseModel):
+    agent_id: UUID
+    room_id: UUID
+    trigger_seq: int
+    action: Literal["call_on", "say", "silence"]
+    target_id: UUID | None = None
+
+
+class RuntimeDecisionOut(BaseModel):
+    status: Literal["won", "already_decided"]
+    action: str
+    target_id: UUID | None = None
+
+
 class RuntimeParticipantOut(BaseModel):
     id: UUID
     name: str
     kind: str
     persona: str | None = None
+    role: str = "member"
 
 
 class RuntimeMessageOut(BaseModel):
@@ -84,6 +101,10 @@ class TurnContextOut(BaseModel):
     participants: list[RuntimeParticipantOut]
     inbox: list[RuntimeMessageOut]
     agent_only_stretch: int = 0
+    room_mode: str = "open"
+    agent_kind: str = "agent"
+    agent_role: str = "member"
+    called_on: bool = False
 
 
 async def named_since(
@@ -119,6 +140,12 @@ async def turn_context(
     people = await db.list_participants(request.app.state.pool, room_id)
     inbox = await named_since(request, room_id, last_read)
     seen_seq = max((m.seq for m in inbox), default=last_read)
+    try:
+        room = await db.get_room(request.app.state.pool, room_id)
+        room_mode = room.mode
+    except db.NotFoundError:
+        room_mode = "open"
+    called_on = await consume_called_on(request.app.state.redis, agent_id, room_id)
     return TurnContextOut(
         agent_id=agent.id,
         agent_name=agent.name,
@@ -126,13 +153,19 @@ async def turn_context(
         last_read_seq=last_read,
         seen_seq=seen_seq,
         participants=[
-            RuntimeParticipantOut(id=p.id, name=p.name, kind=p.kind, persona=p.persona)
+            RuntimeParticipantOut(
+                id=p.id, name=p.name, kind=p.kind, persona=p.persona, role=p.role
+            )
             for p in people
         ],
         inbox=inbox,
         agent_only_stretch=await db.count_agent_only_stretch(
             request.app.state.pool, room_id
         ),
+        room_mode=room_mode,
+        agent_kind=agent.kind,
+        agent_role=agent.role,
+        called_on=called_on,
     )
 
 
@@ -275,6 +308,64 @@ async def put_last_read(
         request.app.state.pool, body.agent_id, body.room_id, body.last_read_seq
     )
     return {"status": "ok"}
+
+
+@router.post("/decision", response_model=RuntimeDecisionOut)
+async def decision(
+    request: Request,
+    body: RuntimeDecisionRequest,
+    host: Host = Depends(require_host),
+) -> RuntimeDecisionOut:
+    """Record a moderator decision. The SERVER owns any call_on wake.
+
+    BYOA must not reach into server lanes: this endpoint writes the
+    unique (room, trigger_seq) row and, on a freshly won call_on,
+    dispatches the target through Scheduler.wake_one.
+    """
+    agent = await hosted_agent(request, host, body.agent_id, body.room_id)
+    if agent.role != "moderator":
+        raise HTTPException(status_code=403, detail="only the moderator can record a decision")
+    try:
+        room = await db.get_room(request.app.state.pool, body.room_id)
+    except db.NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=exc.detail) from exc
+    if room.mode != "moderated":
+        # 409 is reserved for freshness/dup on the daemon client
+        # (_raise_for_status treats any 409 as StaleWrite).
+        raise HTTPException(status_code=400, detail="room is not moderated")
+    if body.action == "call_on":
+        if body.target_id is None:
+            raise HTTPException(status_code=400, detail="call_on requires target_id")
+        try:
+            target = await db.get_participant(request.app.state.pool, body.target_id)
+        except db.NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=exc.detail) from exc
+        if target.room_id != body.room_id or target.kind != "agent":
+            raise HTTPException(
+                status_code=400, detail="call_on target must be an agent in this room"
+            )
+        if target.id == agent.id:
+            raise HTTPException(status_code=400, detail="call_on cannot target the moderator")
+    try:
+        status, row = await db.record_decision(
+            request.app.state.pool,
+            body.room_id,
+            body.agent_id,
+            body.trigger_seq,
+            body.action,
+            body.target_id,
+        )
+    except db.InvalidTriggerSeqError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    except db.NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=exc.detail) from exc
+    if status == "won" and row.action == "call_on" and row.target_id is not None:
+        await request.app.state.scheduler.wake_one(
+            body.room_id, row.target_id, called_on=True
+        )
+    return RuntimeDecisionOut(
+        status=status, action=row.action, target_id=row.target_id
+    )
 
 
 @router.post("/seen")

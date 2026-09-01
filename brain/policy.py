@@ -24,3 +24,13 @@ def assert_triage_model(model_name: str) -> str:
             f"expected AGORA_SMALL_MODEL ({small_model_name()!r})"
         )
     return model_name
+
+
+def assert_moderate_uses_big(model_name: str) -> str:
+    """The decide path is a tool call. Passing it the small model is a wiring bug."""
+    if model_name == small_model_name():
+        raise ValueError(
+            f"moderation must not use the small model ({model_name!r}); "
+            f"expected AGORA_BIG_MODEL ({big_model_name()!r})"
+        )
+    return model_name

@@ -164,6 +164,7 @@ async def test_proactive_turn_triage_yes_replies(
 
     assert result.outcome == "replied"
     assert result.reply_body == "spec: 3 points"
+    assert big.bound_tools == ["reply", "claim"]
     stored = await db.list_messages(pool, room_id)
     assert stored[-1].author_id == iris_id
     assert stored[-1].seq == 2

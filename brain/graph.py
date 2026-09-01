@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from brain import policy
 from brain.holds import clear_hold, consume_hold, record_hold
-from brain.world import DuplicateReply, StaleWrite, World, WorldMessage
+from brain.world import DecisionResult, DuplicateReply, StaleWrite, World, WorldMessage
 
 logger = logging.getLogger("agora.brain")
 
@@ -56,6 +56,16 @@ DUPLICATE_REPLY_ERROR = (
     "reply rejected: it verbatim-duplicates the latest peer message. "
     "Do not restate a peer. Either say something materially different "
     "or stay silent."
+)
+
+DECIDE_TARGET_ERROR = (
+    "decide rejected: target must be the name of an agent member "
+    "in this room other than yourself. Retry with that name."
+)
+
+MODERATION_NOTE = (
+    "A moderation turn must call the decide tool exactly once. "
+    "Free text is not a valid decision."
 )
 
 
@@ -95,6 +105,13 @@ class ClaimRecord(TypedDict):
     result: str
 
 
+class RosterEntry(TypedDict):
+    id: str
+    name: str
+    kind: str
+    role: str
+
+
 class BrainState(TypedDict, total=False):
     agent_id: str
     agent_name: str
@@ -117,6 +134,12 @@ class BrainState(TypedDict, total=False):
     claims: list[ClaimRecord]
     claim_nudged: bool
     send_anyway: bool
+    room_mode: str
+    agent_role: str
+    roster: list[RosterEntry]
+    moderate: bool
+    called_on: bool
+    moderation_nudged: bool
 
 
 @tool
@@ -138,7 +161,23 @@ def claim(task_key: str) -> str:
     return task_key
 
 
+@tool
+def decide(
+    action: Literal["call_on", "say", "silence"],
+    target: str = "",
+    body: str = "",
+) -> str:
+    """Return exactly one moderation decision.
+
+    call_on: target is an agent member's name. say: body is posted to
+    the room through the ordinary reply path. silence: end without a
+    message.
+    """
+    return action
+
+
 TOOLS = [reply, claim]
+MODERATOR_TOOLS = [decide]
 
 
 @dataclass(frozen=True)
@@ -214,8 +253,15 @@ def _format_inbox(items: list[InboxItem]) -> str:
 
 
 def _tool_prompt(state: BrainState) -> str:
+    called = ""
+    if state.get("called_on"):
+        called = (
+            "The moderator called on you to respond to the room. "
+            "response_mode=me.\n\n"
+        )
     return (
         f"You are {state['agent_name']}. {state.get('persona') or ''}\n\n"
+        f"{called}"
         f"Triage: actionable={state.get('triage_actionable')} "
         f"response_mode={state.get('response_mode')} ({state.get('triage_reason')}).\n\n"
         f"Room:\n{_format_inbox(state.get('inbox') or [])}\n\n"
@@ -225,6 +271,27 @@ def _tool_prompt(state: BrainState) -> str:
         "If response_mode is me or each: do not claim; reply.\n"
         "claim task_key must be t<seq> or t<seq>:<slug> "
         "(seq = the message you are responding to)."
+    )
+
+
+def _moderator_prompt(state: BrainState) -> str:
+    # Shape-level: who you are and what one decide call is. No scenario
+    # list — the model picks the seat; code only parses the name.
+    roster = state.get("roster") or []
+    seats = ", ".join(
+        f"{p['name']} ({p['kind']}, {p['role']})" for p in roster
+    )
+    return (
+        f"You are {state['agent_name']}, the moderator of this room. "
+        f"{state.get('persona') or ''}\n\n"
+        "You never answer substantive questions yourself. Each wake you "
+        "return exactly one decision via the decide tool.\n"
+        "call_on the seat best able to advance the discussion; "
+        "say a short line only when the table needs the moderator's own "
+        "voice; silence when nothing is owed.\n"
+        "Free text without a decide call is not a valid moderation turn.\n\n"
+        f"Seats: {seats}\n\n"
+        f"Room:\n{_format_inbox(state.get('inbox') or [])}\n"
     )
 
 
@@ -389,12 +456,23 @@ class Brain:
         graph.add_node("tool_loop", self._tool_loop)
         graph.add_node("freshness", self._freshness)
         graph.add_node("commit", self._commit)
-        graph.add_edge(START, "triage")
+        # Wiring, not content classification: the moderator IS the gate,
+        # and a call_on is a protocol fact on the wake. Both skip triage.
+        graph.add_conditional_edges(
+            START,
+            self._from_start,
+            {"triage": "triage", "tool_loop": "tool_loop"},
+        )
         graph.add_conditional_edges("triage", self._after_triage)
         graph.add_conditional_edges("tool_loop", self._after_tools)
         graph.add_conditional_edges("freshness", self._after_fresh)
         graph.add_conditional_edges("commit", self._after_commit)
         return graph.compile(checkpointer=self.checkpointer)
+
+    def _from_start(self, state: BrainState) -> str:
+        if state.get("moderate") or state.get("called_on"):
+            return "tool_loop"
+        return "triage"
 
     def _after_triage(self, state: BrainState) -> str:
         if state.get("outcome") in {"skipped", "llm_error"}:
@@ -427,6 +505,8 @@ class Brain:
     async def _ledger(self, state: BrainState, purpose: str, message: Any) -> None:
         prompt_tokens, completion_tokens = token_usage(message)
         model = self.small_model_name if purpose == "triage" else self.big_model_name
+        if purpose == "moderate":
+            policy.assert_moderate_uses_big(self.big_model_name)
         await self.world.record_llm_call(
             UUID(state["agent_id"]),
             UUID(state["room_id"]),
@@ -450,27 +530,6 @@ class Brain:
         # cap on a room that was fine one message ago. No humans at all
         # is the MOST loop-prone shape, so the cap arms hardest there;
         # any human's message resets the counter at the source.
-        agent_count = int(state.get("agent_count") or 0)
-        stretch = int(state.get("agent_only_stretch") or 0)
-        if agent_count > 0:
-            cap = AGENT_LOOP_CAP * agent_count
-            if stretch >= cap:
-                logger.info(
-                    "triage %s agent-only run past loop cap (%s >= %s) — staying silent",
-                    state["agent_name"],
-                    stretch,
-                    cap,
-                )
-                return {
-                    "outcome": "skipped",
-                    "triage_actionable": False,
-                    "triage_reason": (
-                        f"agent-only run past loop cap "
-                        f"({stretch} agent messages without a human; "
-                        f"cap {AGENT_LOOP_CAP} x {agent_count} agents)"
-                    ),
-                    "response_mode": "",
-                }
         if state.get("proactive"):
             framing = (
                 "The room has gone quiet after the messages below (you have "
@@ -569,30 +628,198 @@ class Brain:
             "claim_nudged": True,
         }
 
+    def _resolve_call_on_target(self, state: BrainState, name: str) -> UUID | None:
+        me = state["agent_id"]
+        for person in state.get("roster") or []:
+            if (
+                person["name"] == name
+                and person["kind"] == "agent"
+                and person["id"] != me
+            ):
+                return UUID(person["id"])
+        return None
+
+    async def _apply_decision(
+        self,
+        state: BrainState,
+        action: str,
+        target_name: str,
+        body: str,
+        call_id: str,
+        after: list[BaseMessage],
+        hop: int,
+    ) -> dict[str, Any]:
+        trigger_seq = int(state["seen_seq"])
+        room_id = UUID(state["room_id"])
+        moderator_id = UUID(state["agent_id"])
+        target_id: UUID | None = None
+        if action == "call_on":
+            target_id = self._resolve_call_on_target(state, target_name)
+            if target_id is None:
+                after.append(
+                    ToolMessage(content=DECIDE_TARGET_ERROR, tool_call_id=call_id)
+                )
+                logger.info(
+                    "decide %s rejected target %r", state["agent_name"], target_name
+                )
+                return {
+                    "messages": after,
+                    "hop_count": hop,
+                    "pending_reply": "",
+                }
+        elif action == "say" and not body.strip():
+            after.append(
+                ToolMessage(content="empty body ignored", tool_call_id=call_id)
+            )
+            return {
+                "messages": after,
+                "hop_count": hop,
+                "pending_reply": "",
+            }
+        elif action not in {"call_on", "say", "silence"}:
+            after.append(
+                ToolMessage(content=f"unknown action {action}", tool_call_id=call_id)
+            )
+            return {
+                "messages": after,
+                "hop_count": hop,
+                "pending_reply": "",
+            }
+
+        # call_on is row-first: the unique key is the wake-dedup, and a
+        # lost wake is redelivered by cursor arithmetic in _route_wake.
+        # say/silence are row-after-side-effect: a crash before the row
+        # leaves the trigger open so the next wake re-decides. Freshness
+        # and verbatim-dup already block a double post if the message
+        # landed. Recording say here would starve the room on replay.
+        if action == "say":
+            after.append(ToolMessage(content="say", tool_call_id=call_id))
+            return {
+                "messages": after,
+                "hop_count": hop,
+                "pending_reply": body.strip(),
+                "send_anyway": False,
+            }
+
+        recorded: DecisionResult = await self.world.record_decision(
+            room_id, moderator_id, trigger_seq, action, target_id
+        )
+        if recorded.status == "already_decided":
+            after.append(ToolMessage(content="already_decided", tool_call_id=call_id))
+            logger.info(
+                "decide %s trigger=%s replayed action=%s",
+                state["agent_name"],
+                trigger_seq,
+                recorded.action,
+            )
+            return {
+                "messages": after,
+                "hop_count": hop,
+                "pending_reply": "",
+                "outcome": "decision_replayed",
+            }
+
+        after.append(ToolMessage(content=recorded.action, tool_call_id=call_id))
+        if action == "call_on":
+            return {
+                "messages": after,
+                "hop_count": hop,
+                "pending_reply": "",
+                "outcome": "moderated_call",
+            }
+        return {
+            "messages": after,
+            "hop_count": hop,
+            "pending_reply": "",
+            "outcome": "moderated_silence",
+        }
+
     async def _tool_loop(self, state: BrainState) -> dict[str, Any]:
         hop = int(state.get("hop_count") or 0)
         budget = self._hop_budget(state)
         if hop >= budget:
             return {"outcome": "hop_exhausted"}
 
+        moderate = bool(state.get("moderate"))
         history = list(state.get("messages") or [])
         if not history:
-            history = [SystemMessage(content=_tool_prompt(state))]
+            prompt = _moderator_prompt(state) if moderate else _tool_prompt(state)
+            history = [SystemMessage(content=prompt)]
 
-        bound = self.big.bind_tools(TOOLS) if hasattr(self.big, "bind_tools") else self.big
+        tools = MODERATOR_TOOLS if moderate else TOOLS
+        if moderate:
+            # Decide is a tool call on the big model — never the triage wiring.
+            policy.assert_moderate_uses_big(self.big_model_name)
+        bound = self.big.bind_tools(tools) if hasattr(self.big, "bind_tools") else self.big
         ai = await invoke_model(
             bound, history, label="tool_loop", pacer=self._pacer, limiter=self._limiter
         )
         if ai is None:
             return {"outcome": "llm_error"}
-        await self._ledger(state, "turn", ai)
+        await self._ledger(state, "moderate" if moderate else "turn", ai)
         hop += 1
 
         after: list[BaseMessage] = [*history, ai]
         claims = list(state.get("claims") or [])
         pending = ""
         send_anyway = False
-        for tc in getattr(ai, "tool_calls", None) or []:
+        calls = getattr(ai, "tool_calls", None) or []
+
+        if moderate:
+            decide_calls = [tc for tc in calls if _tc_get(tc, "name") == "decide"]
+            chosen_id = (
+                str(_tc_get(decide_calls[0], "id") or "call") if decide_calls else None
+            )
+            # Every unanswered tool_call must get a ToolMessage before any
+            # HumanMessage. OpenAI-compatible backends 400 on a corrective
+            # note that skips the tool-result turn (the member loop already
+            # does this; the same rule applies to extra calls beside a
+            # valid decide — say can re-enter via HOLD).
+            for tc in calls:
+                name = str(_tc_get(tc, "name") or "")
+                call_id = str(_tc_get(tc, "id") or "call")
+                if chosen_id is not None and call_id == chosen_id:
+                    continue
+                if name == "decide":
+                    after.append(
+                        ToolMessage(
+                            content="only one decide per turn", tool_call_id=call_id
+                        )
+                    )
+                else:
+                    after.append(
+                        ToolMessage(
+                            content=f"unknown tool {name}", tool_call_id=call_id
+                        )
+                    )
+            if not decide_calls:
+                if not state.get("moderation_nudged") and hop < budget:
+                    after.append(HumanMessage(content=MODERATION_NOTE))
+                    return {
+                        "messages": after,
+                        "hop_count": hop,
+                        "moderation_nudged": True,
+                        "pending_reply": "",
+                    }
+                return {
+                    "messages": after,
+                    "hop_count": hop,
+                    "pending_reply": "",
+                    "outcome": "invalid_moderation",
+                }
+            tc = decide_calls[0]
+            args = _tc_get(tc, "args") or {}
+            return await self._apply_decision(
+                state,
+                str(args.get("action") or ""),
+                str(args.get("target") or ""),
+                str(args.get("body") or ""),
+                str(_tc_get(tc, "id") or "call"),
+                after,
+                hop,
+            )
+
+        for tc in calls:
             name = _tc_get(tc, "name")
             args = _tc_get(tc, "args") or {}
             call_id = str(_tc_get(tc, "id") or "call")
@@ -641,7 +868,7 @@ class Brain:
         }
         if pending:
             return update
-        if not getattr(ai, "tool_calls", None) or hop >= budget:
+        if not calls or hop >= budget:
             nudged = self._claim_nudge(state, after, claims, hop)
             if nudged is not None:
                 return nudged
@@ -807,6 +1034,16 @@ class Brain:
             }
         if self.on_committed is not None:
             await self.on_committed(row)
+        if state.get("moderate"):
+            # Row after the message: the trigger stays open if we crash
+            # between insert and here; the next wake re-decides.
+            await self.world.record_decision(
+                UUID(state["room_id"]),
+                UUID(state["agent_id"]),
+                int(state["seen_seq"]),
+                "say",
+                None,
+            )
         if self._hold_redis is not None:
             await clear_hold(
                 self._hold_redis, UUID(state["agent_id"]), UUID(state["room_id"])
@@ -841,7 +1078,43 @@ class Brain:
                     agent_name,
                 )
 
-    async def run(self, agent_id: UUID, room_id: UUID) -> TurnResult:
+    def _loop_cap_reason(self, stretch: int, agent_count: int) -> str:
+        return (
+            f"agent-only run past loop cap "
+            f"({stretch} agent messages without a human; "
+            f"cap {AGENT_LOOP_CAP} x {agent_count} agents)"
+        )
+
+    def _empty_result(
+        self,
+        agent_id: UUID,
+        agent_name: str,
+        room_id: UUID,
+        seen_seq: int,
+        *,
+        outcome: str,
+        inbox_count: int = 0,
+        triage_reason: str | None = None,
+    ) -> TurnResult:
+        return TurnResult(
+            agent_id=agent_id,
+            agent_name=agent_name,
+            room_id=room_id,
+            outcome=outcome,
+            hold_count=0,
+            hop_count=0,
+            seen_seq=seen_seq,
+            inbox_count=inbox_count,
+            triage_actionable=None if outcome == "empty" else False,
+            triage_reason=triage_reason,
+            response_mode=None,
+            claims=(),
+            reply_body=None,
+        )
+
+    async def run(
+        self, agent_id: UUID, room_id: UUID, *, called_on: bool = False
+    ) -> TurnResult:
         ctx = await self.world.load_turn(agent_id, room_id)
         names = {str(p.id): p.name for p in ctx.participants}
         inbox: list[InboxItem] = [
@@ -898,6 +1171,49 @@ class Brain:
         # Inbox is about to be shown to the model — high-water goes to Redis.
         await self.world.record_seen(agent_id, room_id, seen_seq)
         agent_count = sum(1 for p in ctx.participants if p.kind == "agent")
+        stretch = int(ctx.agent_only_stretch)
+        is_moderator = (
+            ctx.room_mode == "moderated" and ctx.agent.role == "moderator"
+        )
+        called_on = bool(called_on or ctx.called_on)
+        # Counting, not classification: the same stretch cap as triage,
+        # applied here so skip-triage paths (moderator / call_on) still
+        # hit the floor without a model call.
+        if agent_count > 0 and stretch >= AGENT_LOOP_CAP * agent_count:
+            reason = self._loop_cap_reason(stretch, agent_count)
+            logger.info(
+                "loop cap %s (%s >= %s) — staying silent",
+                ctx.agent.name,
+                stretch,
+                AGENT_LOOP_CAP * agent_count,
+            )
+            outcome = "moderated_silence" if is_moderator else "skipped"
+            if is_moderator:
+                await self.world.record_decision(
+                    room_id, agent_id, seen_seq, "silence", None
+                )
+            await self.world.set_last_read(agent_id, room_id, seen_seq)
+            if self._hold_redis is not None:
+                await clear_hold(self._hold_redis, agent_id, room_id)
+            return self._empty_result(
+                agent_id,
+                ctx.agent.name,
+                room_id,
+                seen_seq,
+                outcome=outcome,
+                inbox_count=len(inbox),
+                triage_reason=reason,
+            )
+
+        roster: list[RosterEntry] = [
+            {
+                "id": str(p.id),
+                "name": p.name,
+                "kind": p.kind,
+                "role": p.role,
+            }
+            for p in ctx.participants
+        ]
         initial: BrainState = {
             "agent_id": str(agent_id),
             "agent_name": ctx.agent.name,
@@ -906,12 +1222,14 @@ class Brain:
             "inbox": inbox,
             "author_names": names,
             "agent_count": agent_count,
-            "agent_only_stretch": int(ctx.agent_only_stretch),
+            "agent_only_stretch": stretch,
             "proactive": proactive,
             "seen_seq": seen_seq,
-            "triage_actionable": False,
-            "triage_reason": "",
-            "response_mode": "",
+            "triage_actionable": True if (is_moderator or called_on) else False,
+            "triage_reason": (
+                "moderator called on you" if called_on else ""
+            ),
+            "response_mode": "me" if called_on else "",
             "messages": [],
             "hold_count": 0,
             "hop_count": 0,
@@ -920,6 +1238,12 @@ class Brain:
             "claims": [],
             "claim_nudged": False,
             "send_anyway": False,
+            "room_mode": ctx.room_mode,
+            "agent_role": ctx.agent.role,
+            "roster": roster,
+            "moderate": is_moderator,
+            "called_on": called_on,
+            "moderation_nudged": False,
         }
         final: dict[str, Any]
         try:
@@ -988,14 +1312,24 @@ def make_turn_fn(
     pool: Any,
     redis_client: Any,
     **kwargs: Any,
-) -> Callable[[UUID, UUID], Awaitable[TurnResult]]:
+) -> Callable[..., Awaitable[TurnResult]]:
     # Lazy import: DirectWorld pulls asyncpg/redis. The daemon constructs
     # Brain(HttpWorld, ...) and must not load the cloud host's drivers.
     from brain.world_direct import DirectWorld
 
+    on_call_on = kwargs.pop("on_call_on", None)
+    world = DirectWorld(pool, redis_client, on_call_on=on_call_on)
     brain = Brain(
-        DirectWorld(pool, redis_client),
+        world,
         hold_redis=redis_client,
         **kwargs,
     )
-    return brain.run
+
+    async def run(
+        agent_id: UUID, room_id: UUID, *, called_on: bool = False
+    ) -> TurnResult:
+        return await brain.run(agent_id, room_id, called_on=called_on)
+
+    run.world = world  # type: ignore[attr-defined]
+    run.brain = brain  # type: ignore[attr-defined]
+    return run
