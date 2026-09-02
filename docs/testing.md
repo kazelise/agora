@@ -112,7 +112,7 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 
 ## 3. 真模型实测记录
 
-各次运行的「N passed in Xs」当时没有记下来；下面两节里的成绩单和 token 数是当时留下的，墙钟没有。CI 只跑 mock。两条 moderated 真模型用例（`test_moderated_one_call_one_answer`、`test_moderated_mention_bypasses_moderator`）还没对过真模型——写它们的时候中继是关的。
+运行 #1、#2 的「N passed in Xs」当时没有记下来；那两节里的成绩单和 token 数是当时留下的，墙钟没有。运行 #3 是第一次有完整 pytest 输出的记录，也是两条 moderated 真模型用例第一次对真模型。CI 只跑 mock。
 
 ### 3.1 运行 #1（2026-08-29，GLM-5.3-Flash @ Modal 端点）
 
@@ -180,7 +180,31 @@ claim t1 -> Cain
 
 Racer 每轮首轮都强传 `send_anyway=true`，但序列仍无重复、无断号——freshness 门 + 409 重赛把抢跑消化掉了。LLM 经济：triage 8 次 / turn 9 次。
 
-### 3.3 结果判读
+### 3.3 运行 #3（2026-09-02，Cerebras `api.cerebras.ai/v1`：triage `gemma-4-31b`，回复/主持 `gpt-oss-120b`）
+
+命令：`uv run pytest -m llm -q -rA --durations=0`，Phase 7c 合并后（main `67379ca`）。全部 7 条 llm 用例：
+
+```
+7 passed, 160 deselected in 173.92s (0:02:53)
+
+122.09s  test_preemptive_send_anyway_cannot_skip_freshness
+ 12.30s  test_counting_game_no_dup_no_gap
+ 11.13s  test_moderated_one_call_one_answer
+  6.46s  test_dup_bait_agent_cannot_double_post_verbatim
+  6.03s  test_one_of_us_exactly_one_agent_reply
+  6.03s  test_moderated_mention_bypasses_moderator
+  6.02s  test_claim_hog_two_agents_one_lock_one_reply
+```
+
+两条 moderated 用例首次对真模型通过：每条成员消息都对应一次 `call_on`；`@Name` 触发的 `trigger_seq` 上零决策行。
+
+两条观察：
+
+- `AGORA_SMALL_MODEL` 与 `AGORA_BIG_MODEL` 不能相同——`brain/policy.py` 的 `assert_triage_model` 会在启动时拒绝（第一次尝试两边都填 `gpt-oss-120b`，7 个用例全部在 lifespan 报 `ValueError`）。这是有意的接线保护，不是 bug。
+- `gemma-4-31b` 做 triage 时，在「不该回复」的场景会输出 `response_mode: "none"`，而 `TriageVerdict` 只接受 `me / each / one-of-us`，解析失败后按 fail-safe 跳过。结果与预期一致（该沉默的确沉默），但走的是 warning 路径而非正常路径；preempt 用例的 122s 主要是等这类跳过后的 stall。schema 上让 `actionable=false` 时 `response_mode` 可缺省，会让小模型的输出更容易落进正常路径。
+- `gpt-oss-120b` 在 moderated 用例里有一次 `Connection error` 触发了单次重试后成功；重试路径在真模型下被走过一次。
+
+### 3.4 结果判读
 
 - 三条不变量在真模型主动攻击下全部成立：**同文不落库、锁只有一把、抢跑不越门**。
 - 对抗用例的成本与正常用例同量级（triage 5–12 次/回合），门电路没有引入显著的额外模型调用放大。
