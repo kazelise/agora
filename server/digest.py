@@ -19,7 +19,9 @@ from server.db import CLAIM_TTL_S
 
 
 def _esc(text: str) -> str:
-    return text.replace("\r\n", "\n").strip()
+    return (
+        text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ").strip()
+    )
 
 
 def _cell(text: str) -> str:
@@ -33,15 +35,18 @@ def render_digest(data: dict[str, Any]) -> str:
     messages = data["messages"]
     claims = data["claims"]
     usage = data["usage"]
+    decisions = data.get("decisions")
 
     humans = [p for p in people if p["kind"] == "human"]
     agents = [p for p in people if p["kind"] == "agent"]
     names = {p["id"]: p["name"] for p in people}
+    mode = room["mode"] if "mode" in room else "open"
 
     lines: list[str] = []
     lines.append(f"# {_esc(room['name'])}")
     lines.append("")
     lines.append(f"- Room id: `{room['id']}`")
+    lines.append(f"- Mode: `{mode}`")
     lines.append(f"- Started: {room['created_at'].isoformat(timespec='seconds')}")
     lines.append(
         f"- Participants: {len(humans)} human(s), {len(agents)} agent(s)"
@@ -64,6 +69,34 @@ def render_digest(data: dict[str, Any]) -> str:
                 f"| {m['seq']} | {_cell(m['author_name'])} | {_cell(m['body'])} |"
             )
     lines.append("")
+
+    if decisions is not None:
+        moderator_name = next(
+            (p["name"] for p in people if "role" in p and p["role"] == "moderator"),
+            None,
+        )
+        heading = (
+            f"## 决策 — {_esc(moderator_name)}" if moderator_name else "## 决策"
+        )
+        lines.append(heading)
+        lines.append("")
+        if not decisions:
+            lines.append("_(no decisions)_")
+        else:
+            lines.append("| trigger_seq | action | target | created_at |")
+            lines.append("|---|---|---|---|")
+            for d in decisions:
+                target_id = d.target_id
+                if target_id is None:
+                    target = "—"
+                else:
+                    known = names.get(target_id)
+                    target = _cell(known if known is not None else str(target_id))
+                created_s = d.created_at.isoformat(timespec="seconds")
+                lines.append(
+                    f"| {d.trigger_seq} | {_cell(d.action)} | {target} | {created_s} |"
+                )
+        lines.append("")
 
     lines.append("## Action items (claims)")
     lines.append("")

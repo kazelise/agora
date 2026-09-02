@@ -1,6 +1,6 @@
 # 测试文档（Testing)
 
-本文档记录 agora 的测试体系、验证方法与真模型实测结果。所有确定性测试随仓库 CI 跑；真模型测试（`@pytest.mark.llm`）需要真实 LLM 端点，按需运行。
+本文档记录 agora 的测试体系、验证方法与真模型实测结果。所有确定性测试随仓库 GitHub Actions（`.github/workflows/test.yml`，push `main` / pull_request）跑；真模型测试（`@pytest.mark.llm`）需要真实 LLM 端点，按需运行。
 
 ## 1. 测试体系总览
 
@@ -31,20 +31,20 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 
 ## 2. 用例清单
 
-### L0 确定性测试（125 项，全绿）
+### L0 确定性测试（140 项，全绿）
 
-关键套件：
+数量按 `pytest --collect-only -q <file>` 实测。关键套件：
 
 | 套件 | 数量 | 覆盖 |
 |---|---|---|
-| `test_hardening.py` | 40 | hold token 端到端、verbatim-dup 门、agent-only loop cap、digest 转义、崩溃回收 |
+| `test_hardening.py` | 30 | hold token 端到端、verbatim-dup 门、agent-only loop cap、digest 转义 / 决策时间线、崩溃回收 |
 | `test_claims.py` | 5 | claim 抢占、TTL 过期原子偷取、竞态安全 |
-| `test_stall.py` | 12 | stall 判定、nudge 派发、unread grace、proactive turn |
-| `test_pacer.py` / `test_limiter.py` | 11 | 速率限制、并发上限 |
-| `test_coalesce.py` / `test_daemon_lane.py` | 8 | AgentLane 合并 rerun 指向最新房间 |
+| `test_stall.py` | 11 | stall 判定、nudge 派发、unread grace、proactive turn |
+| `test_pacer.py` / `test_limiter.py` | 12 | 速率限制、并发上限 |
+| `test_coalesce.py` / `test_daemon_lane.py` | 5 | AgentLane 合并 rerun 指向最新房间 |
 | `test_byoa.py` | 9 | BYOA claim/HTTP/WS 重连替换 |
-| `test_moderated.py` | 15 | moderated 路由、API、decide 工具、幂等、loop cap、BYOA decision |
-| 其余（brain/scheduler/digest/args…） | 25 | 图节点、triage、cursor、参数解析 |
+| `test_moderated.py` | 26 | moderated 路由、API、decide 工具、幂等、loop cap、BYOA decision |
+| 其余（`test_brain` 17 / `test_k8s` 18 / `test_daemon_args` 3 / `test_seen` 2 / `test_wake` 1 / `test_seq` 1） | 42 | 图节点、triage、cursor、参数解析、Job 宿主 |
 
 ### L2 真模型协调测试
 
@@ -52,6 +52,8 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 |---|---|---|
 | `test_counting_game_no_dup_no_gap` | 3 agent 报数 1→6 | 数字不重不漏、连续、恰好 6 条 |
 | `test_one_of_us_exactly_one_agent_reply` | "恰好一人回答" | 恰好 1 条 agent 回复 + t1 claim 归属 |
+| `test_moderated_one_call_one_answer` | moderated 房间，主持 + 3 成员，一问只该一人答 | 恰好 1 条成员消息；至少一行 `call_on`；每条成员消息的作者是某次 `call_on` 的 target（主持 `say` 不计数） |
+| `test_moderated_mention_bypasses_moderator` | moderated 房间 `@Name` | 被点名成员至少 1 条消息；其他成员 0 条；该 `trigger_seq` 的 `moderator_decisions` 为零行 |
 
 ### L3 对抗角色测试（2026-08-29 新增）
 
@@ -85,6 +87,10 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 | `test_crashed_say_leaves_trigger_open` | insert 崩溃再重跑 | 无决策行 → 再 decide → 落地并写行 |
 | `test_mention_earliest_position_wins` / `test_mention_cjk_and_email_boundaries` | `@Bob`+`@Alexander`；CJK / `foo@Bob` | 最早位置；Unicode 边界 |
 | `test_dispatch_call_on_runs_target_via_real_wake` | 人发言 → dispatch → 脚本 `call_on` | 目标经真实 wake 跑完且跳过 triage |
+| `test_digest_moderated_renders_decisions_in_seq_order` | moderated digest | 决策表按 trigger_seq；名字转义与 transcript 相同 |
+| `test_digest_open_room_omits_decisions_section` | open digest | 正文不含「决策」（不是空表） |
+| `test_digest_flattens_newline_in_moderator_name` | 主持名含 `\\n## …` | 决策标题压成一行；恰好一个 `## Action items (claims)` |
+| `test_digest_moderated_empty_decisions_is_placeholder` | moderated、零决策 | 有 `## 决策` 与 `_(no decisions)_`，无表头 |
 
 ## 3. 真模型实测记录
 
@@ -179,9 +185,12 @@ Racer 每轮首轮都强传 `send_anyway=true`，但序列仍无重复、无断�
 # 全量确定性测试（不花 token）
 pytest -m "not llm" -q
 
-# 真模型 + 对抗角色（花 token，约 7 分钟）
+# 真模型 + 对抗角色 + moderated 点名/@ 直通（花 token，约 7 分钟）
 source .env 或手动 export（见 §1）
 pytest tests/test_coordination_llm.py -m llm -q
+
+# moderated 房间现场叙事（进程内拉起应用，同样要中继）
+uv run python scripts/demo_phase7.py
 
 # 查看某房间转录与 LLM 经济（psql）
 #   messages / claims / llm_calls 三表按 room_id 过滤即可

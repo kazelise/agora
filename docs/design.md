@@ -323,3 +323,5 @@ open 房间是 peer bus：一条落地消息叫醒所有非作者 agent，碰撞
 **为什么不需要 floor lease。** 元桌用「地板租约」防止两个人同时开口。Agora 已经有 freshness（房间前进则 HOLD）和 verbatim-dup（逐字复读 409）。`call_on` 的回复和一条并发的 `@` 回复是同一类碰撞：先落地的那条把后者挡住，脑在同一轮重判。再加一把租约是用代码复述已经存在的裁判。
 
 循环上限照旧是计数：主持 stretch 超过 `AGENT_LOOP_CAP × agent数` 则确定性 `silence`，零次模型调用。`call_on` 到的成员沿用原来的 `skipped` 行为。
+
+digest 补上决策时间线：moderated 房间在 transcript 和 claims 之间渲染 `moderator_decisions`（trigger_seq / action / target / created_at），仍是零模型调用的纯格式化；open 房间整节省略。真模型测试把「恰好一人被点名作答」和「@ 直通」钉成不变量——算术对成绩单和决策表，不分类措辞。
