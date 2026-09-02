@@ -69,7 +69,7 @@ export OPENAI_API_BASE=$OPENAI_BASE_URL
 export AGORA_SMALL_MODEL=gpt-5.6-luna          # triage，默认即此
 export AGORA_BIG_MODEL=gpt-5.6-terra           # 工具循环，默认即此
 uv run python scripts/demo_phase2.py           # one-of-us 介绍房间
-uv run python scripts/demo_phase7.py           # moderated 房间：主持点名 + @ 直通
+uv run python scripts/demo_phase7.py           # moderated 房间：主持点名 + @ 直通 + 拒答 pass 再点名
 uv run python scripts/demo_byoa.py             # 云端 + 本地 daemon，然后把 daemon 杀掉
 ```
 

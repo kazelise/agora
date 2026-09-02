@@ -378,7 +378,6 @@ async def decision(
             await request.app.state.scheduler.wake_one(
                 body.room_id,
                 row.target_id,
-                called_on=True,
                 called_on_seq=row.trigger_seq,
             )
         except Exception:

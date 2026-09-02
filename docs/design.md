@@ -2,25 +2,32 @@
 
 面向面试讲稿的底本。实现以本仓库代码为准；这里只写「为什么这样拆」，不写接口清单。
 
+## 一分钟讲法
+
+多个 Agent 和人共用一块黑板：每人独立读房间、独立决定开不开口，于是撞在同一条内容上。房间内单调无洞的 `seq` 是尺子；INSERT 在房间行锁里比 `seen_seq` 和 `last_seq`；「选一个人」靠 `claims` 的 `UNIQUE(room_id, task_key)`；主持决定靠 `UNIQUE(room_id, trigger_seq)`。看过的状态和落地之间的竞态，代码看得见，用算术拦。读对了仍说错，是模型的事，代码不分类内容。moderated 房间把叫醒改成算术（模式 / `@Name` / 主持席），点名仍是模型的 `decide`。被点名成员沉默就落地 `{name} passes.`，seq 前进，主持拿到新 trigger 再 decide。
+
 ## 这是什么 / 不是什么
 
-这是一个多 Agent 协调内核：共享房间当黑板，房间内单调无洞的 `seq`，原子 claim，事务内新鲜度（HOLD），逐字复读门，以及 moderated 房间里主持用 `decide` 点名 / 开口 / 沉默。它要证明的分层是——时间窗上的竞态交给代码算术，语义上的对错交给模型；失败模式必须 fail-open、有界、一眼能看懂。
+多 Agent 协调内核。共享房间当黑板；seq、事务内新鲜度、原子 claim、decide 幂等、moderated 点名。要证明的只有一句：时间窗上的竞态交给代码，语义上的对错交给模型。失败必须 fail-open、有界、能从行上看出来。
 
-它不是一个带登录的产品，不是一个有真实工作负载的 Agent 运行时，也不是一份可水平扩展的多副本服务。没有前端；演示靠 CLI、日志和测试。OAuth、把 `reply` 换成「去查库 / 写代码」、两个 API 副本，都还没做，也不假装做了。
+不是带登录的产品，不是有真实工作负载的 Agent 运行时，也不是可水平扩展的多副本服务。没有前端。OAuth、把 `reply` 换成查库 / 写代码、两个 API 副本，都没做。
 
-## 四个会被问到的问题
+## 五个会被问到的问题
 
 **为什么消息没有身份、`author_id` 是自报的？**
-当前任何知道房间 UUID 的调用都能填一个 `author_id` 发消息。这是单实例演示的边界，不是「忘了做自报校验」。真要做认证，门的是「这个凭证能不能用这个 `author_id` 发言 / 这台 Computer 能不能替这个 agent 跑 turn」，不是在正文里再签一次名。seq 和 claim 已经按行上的 `author_id` 裁判；公开 `POST /rooms/{id}/messages` 不带 `not_after_seq` 时完全绕过 freshness（自报身份的人帖没有 compose 窗口）。假身份是授权问题，不是协调问题——但 freshness 只约束带了 `not_after_seq` 的写（brain / `/runtime/reply`）。
+知道房间 UUID 就能在 `POST /rooms/{id}/messages` 里填任意 `author_id`，没有凭证绑定。seq / claim / freshness 裁判的是行上的 `author_id`；假身份是授权问题，公开人帖又不带 `not_after_seq`，本来就没有 compose 窗口。要改：在 `server/main.py` 的 `post_message` 把门做成「这个凭证能不能用这个 author_id」；Computer 替 agent 跑 turn 的门已经在 `server/auth.py` 的 `hosted_agent`。
 
 **为什么 agent 只有 `reply` / `claim` / `decide`，没有真实工作？**
-Agora 先把「谁该开口」做对。工具集是协调协议，不是 Agent 的工作本身。查数据库、写代码、调外部 API 可以接在同一张图后面，不必改 seq / claim / HOLD。这是内核加一份参考实现，不是「通用 Agent 框架」。
+成员工具就是 `reply` 和 `claim`，主持就是 `decide`，没有查库、写代码、调外部 API。先把「谁该开口」做成协议；工作工具接在同一张图后面，不必改 seq / claim / HOLD。要改：往 `brain/graph.py` 的 `TOOLS` 加工具，在 `_tool_loop` 里分发，不要动 `server/db.py` 的 `insert_message` / `try_claim`。
 
 **为什么用 LangGraph，而不是一个 while 循环？**
-图把 triage / tool_loop / freshness / commit 拆成可测节点，HOLD 是回边，账本按 `purpose` 拆得开。代价是真的：LangGraph 在节点间拷贝 channel 状态，曾经让 hold-token 的原地写变成死代码（flag 必须写进返回的 update 才看得到）。如果重来，一个显式的 async while 加上同样的四步会少一个框架陷阱，也会少掉 checkpointer 和递归上限这些现成轮子。留下图，是因为节点边界对测试和成本账仍然值回票价——同时把这个坑写在这里，不装没发生过。
+LangGraph 在节点间拷贝 channel，hold-token 的原地写曾经是死代码，flag 必须写进返回的 update 才看得到。图把 triage / tool_loop / freshness / commit 拆成可测节点，HOLD 是回边，账本按 `purpose` 拆得开。要改：把 `brain/graph.py` 的 `_compile` + `ainvoke` 换成对这四个方法的 async while；`_freshness` / `_commit` 留下。
 
 **为什么是单实例？两个 replica 会怎样？**
-四个状态活在进程里：Scheduler 的 per-agent lane 字典、`_called_on` 字典、ComputerHub 的 websocket presence、StallSweeper 的 `_declines`。两个副本会各跑各的车道、各记各的点名、各扫各的 stall，在线状态也对不上。要双副本，lane 合并和 called_on 得上 Redis（hint 已经覆盖了远端宿主那一半）、presence 上 Redis、declines 上 Redis，或者接受重复 nudge（decline cap 会偏松）。现在没做，是因为单进程已经能把协调不变量讲清楚。
+`_lanes`、`_called_on`、ComputerHub 的 websocket、`_declines` 都在进程里，两个副本会各跑各的车道、各记各的点名、各扫各的 stall。单进程已经能把协调不变量讲清楚；Redis hint 只覆盖了远端宿主那一半 `called_on`。要改：`server/scheduler.py` 的 lane 合并和 `_called_on` 上 Redis，`server/computers.py` 的 presence 上 Redis，`server/stall.py` 的 `_declines` 上 Redis。
+
+**为什么 pass 是一条消息而不是一列 attempt 计数？**
+在决策行上加一列 attempt 更干净，房间少一条协议废话。只有被点名的人知道自己拒了，主持侧从「没回」推断是慢 turn 下的 TOCTOU；必须落地消息才能推进 seq、排除作者后叫醒主持；名字写进正文是给 verbatim-dup 用的（光写 `(pass)`，第二个弃权者会被 409）；这条 agent 消息计入 loop cap，主持轮询人人弃权必须有界。不会改成列——要让成绩单好读，在 `server/digest.py` 标注 `{name} passes.`；落地仍是 `brain/graph.py` 的 `_post_called_on_pass`（`run` 收束），dup 门在 `server/db.py` 的 `insert_message`。
 
 ## 问题是什么
 

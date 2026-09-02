@@ -181,17 +181,17 @@ class Scheduler:
         room_id: UUID,
         agent_id: UUID,
         *,
-        called_on: bool = False,
         called_on_seq: int | None = None,
     ) -> None:
-        """Targeted wake (moderator call_on). Same host routing as dispatch."""
+        """Targeted wake (moderator call_on). Same host routing as dispatch.
+
+        `called_on_seq` is the only marker: an int is a call_on at that
+        trigger; None is an ordinary targeted wake.
+        """
         agent = await db.get_participant(self._pool, agent_id)
         if agent.kind != "agent":
             return
-        seq = called_on_seq
-        if seq is None and called_on:
-            seq = 1
-        await self._wake_agent(room_id, agent, called_on_seq=seq)
+        await self._wake_agent(room_id, agent, called_on_seq=called_on_seq)
 
     async def _route_wake(
         self, room_id: UUID, author_id: UUID, seq: int | None
