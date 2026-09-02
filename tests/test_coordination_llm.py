@@ -73,11 +73,16 @@ async def live(
 
 
 async def _add_agent(
-    client: httpx.AsyncClient, room_id: str, name: str, persona: str
+    client: httpx.AsyncClient,
+    room_id: str,
+    name: str,
+    persona: str,
+    *,
+    role: str = "member",
 ) -> dict[str, Any]:
     resp = await client.post(
         f"/rooms/{room_id}/participants",
-        json={"kind": "agent", "name": name, "persona": persona},
+        json={"kind": "agent", "name": name, "persona": persona, "role": role},
     )
     resp.raise_for_status()
     return resp.json()
@@ -230,6 +235,161 @@ async def test_one_of_us_exactly_one_agent_reply(
     keys = [r["task_key"] for r in rows]
     assert any(k.startswith("t1") for k in keys), (
         f"no claim key starts with t1: {keys!r} transcript={transcript!r}"
+    )
+
+
+CHAIR_PERSONA = (
+    "You are a terse Chinese-speaking moderator. "
+    "Use the decide tool: call_on the one member whose specialty matches "
+    "the question. Do not answer the substance yourself. "
+    "say only for procedure; silence if nothing is needed."
+)
+
+IRIS_BACKEND = (
+    "You are a backend engineer. Answer only implementation, database, "
+    "and API questions, in Chinese. Stay silent on product or design."
+)
+
+MARCUS_PRODUCT = (
+    "You are a product manager. Answer only product, priority, and user "
+    "questions, in Chinese. Stay silent on backend or design."
+)
+
+JULES_DESIGN = (
+    "You are a designer. Answer only interaction and visual-design "
+    "questions, in Chinese. Stay silent on backend or product."
+)
+
+
+@pytest.mark.llm
+@pytest.mark.asyncio
+async def test_moderated_one_call_one_answer(
+    live: tuple[FastAPI, httpx.AsyncClient],
+) -> None:
+    """Moderated room: exactly one member replies, and that member was
+    called on. Moderator say is unbounded; we never classify wording."""
+    app, client = live
+    room = (
+        await client.post("/rooms", json={"name": "moderated-one", "mode": "moderated"})
+    ).json()
+    room_id = room["id"]
+    human = (
+        await client.post(
+            f"/rooms/{room_id}/participants",
+            json={"kind": "human", "name": "Ada"},
+        )
+    ).json()
+    await _add_agent(client, room_id, "Chair", CHAIR_PERSONA, role="moderator")
+    members = [
+        await _add_agent(client, room_id, name, persona)
+        for name, persona in (
+            ("Iris", IRIS_BACKEND),
+            ("Marcus", MARCUS_PRODUCT),
+            ("Jules", JULES_DESIGN),
+        )
+    ]
+    member_ids = {a["id"] for a in members}
+
+    posted = await client.post(
+        f"/rooms/{room_id}/messages",
+        json={
+            "author_id": human["id"],
+            "body": (
+                "PostgreSQL 的房间序号为什么用行上的计数器而不是 SEQUENCE？"
+                "请恰好一个人回答。"
+            ),
+        },
+    )
+    posted.raise_for_status()
+
+    listed = await _wait_quiescent(app, client, room_id)
+    member_msgs = [m for m in listed if m["author_id"] in member_ids]
+    transcript = [(m["seq"], m["author_id"][:8], m["body"]) for m in listed]
+    assert len(member_msgs) == 1, (
+        f"expected exactly one member message, got {len(member_msgs)}: "
+        f"{transcript!r}"
+    )
+
+    rows = await app.state.pool.fetch(
+        """
+        SELECT action, target_id FROM moderator_decisions
+        WHERE room_id = $1
+        """,
+        UUID(room_id),
+    )
+    call_ons = [r for r in rows if r["action"] == "call_on"]
+    assert call_ons, (
+        f"expected at least one call_on row, got {[(r['action'], r['target_id']) for r in rows]!r} "
+        f"transcript={transcript!r}"
+    )
+    called = {str(r["target_id"]) for r in call_ons if r["target_id"] is not None}
+    for message in member_msgs:
+        assert message["author_id"] in called, (
+            f"member {message['author_id'][:8]} posted without a matching "
+            f"call_on target; called={called!r} transcript={transcript!r}"
+        )
+
+
+@pytest.mark.llm
+@pytest.mark.asyncio
+async def test_moderated_mention_bypasses_moderator(
+    live: tuple[FastAPI, httpx.AsyncClient],
+) -> None:
+    """@Name in a moderated room wakes that member directly. The named
+    member replies; no other member does. The mention path writes no
+    decision for that trigger_seq — if the chair was woken and call_on'd
+    Marcus, routing is dead and this must fail."""
+    app, client = live
+    room = (
+        await client.post(
+            "/rooms", json={"name": "moderated-mention", "mode": "moderated"}
+        )
+    ).json()
+    room_id = room["id"]
+    human = (
+        await client.post(
+            f"/rooms/{room_id}/participants",
+            json={"kind": "human", "name": "Ada"},
+        )
+    ).json()
+    await _add_agent(client, room_id, "Chair", CHAIR_PERSONA, role="moderator")
+    iris = await _add_agent(client, room_id, "Iris", IRIS_BACKEND)
+    marcus = await _add_agent(client, room_id, "Marcus", MARCUS_PRODUCT)
+    jules = await _add_agent(client, room_id, "Jules", JULES_DESIGN)
+    other_ids = {iris["id"], jules["id"]}
+
+    posted = await client.post(
+        f"/rooms/{room_id}/messages",
+        json={
+            "author_id": human["id"],
+            "body": "@Marcus 请用一句话说明产品侧怎么看这个房间。",
+        },
+    )
+    posted.raise_for_status()
+    mention_seq = posted.json()["seq"]
+
+    listed = await _wait_quiescent(app, client, room_id)
+    marcus_msgs = [m for m in listed if m["author_id"] == marcus["id"]]
+    other_msgs = [m for m in listed if m["author_id"] in other_ids]
+    transcript = [(m["seq"], m["author_id"][:8], m["body"]) for m in listed]
+    assert len(marcus_msgs) >= 1, (
+        f"mentioned member Marcus did not reply: {transcript!r}"
+    )
+    assert other_msgs == [], (
+        f"a member who was not mentioned replied: {transcript!r}"
+    )
+    rows = await app.state.pool.fetch(
+        """
+        SELECT action, target_id FROM moderator_decisions
+        WHERE room_id = $1 AND trigger_seq = $2
+        """,
+        UUID(room_id),
+        mention_seq,
+    )
+    assert rows == [], (
+        f"mention path is decision-free; trigger_seq={mention_seq} has "
+        f"{[(r['action'], r['target_id']) for r in rows]!r} "
+        f"transcript={transcript!r}"
     )
 
 

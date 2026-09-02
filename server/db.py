@@ -597,6 +597,20 @@ async def get_latest_decision(
     return None if row is None else _decision(row)
 
 
+async def list_decisions(pool: asyncpg.Pool, room_id: UUID) -> list[DecisionRow]:
+    rows = await pool.fetch(
+        """
+        SELECT id, room_id, moderator_id, trigger_seq, action,
+               target_id, created_at
+        FROM moderator_decisions
+        WHERE room_id = $1
+        ORDER BY trigger_seq ASC
+        """,
+        room_id,
+    )
+    return [_decision(r) for r in rows]
+
+
 async def list_messages(
     pool: asyncpg.Pool,
     room_id: UUID,
@@ -755,20 +769,18 @@ async def room_digest(
     pool: asyncpg.Pool,
     room_id: UUID,
 ) -> dict | None:
-    """Everything the markdown digest needs, in three queries.
-
-    Active claims are the action items (Cumora: claims are for real shared
-    work, so an unclaimed task_key here means an obligation nobody is
-    currently holding); the llm_calls rollup is the cost of the room.
+    """Everything the markdown digest needs, in a handful of independent
+    queries (room + roster, transcript, claims, spend; decisions only
+    when the room is moderated). No shared snapshot — same as before.
     """
     room = await pool.fetchrow(
-        "SELECT id, name, created_at FROM rooms WHERE id = $1", room_id
+        "SELECT id, name, created_at, mode FROM rooms WHERE id = $1", room_id
     )
     if room is None:
         return None
     people = await pool.fetch(
         """
-        SELECT id, kind, name FROM participants
+        SELECT id, kind, name, role FROM participants
         WHERE room_id = $1
         ORDER BY created_at
         """,
@@ -807,10 +819,15 @@ async def room_digest(
         """,
         room_id,
     )
+    mode = room["mode"] if "mode" in room.keys() else "open"
+    decisions = (
+        await list_decisions(pool, room_id) if str(mode or "open") == "moderated" else None
+    )
     return {
         "room": room,
         "participants": people,
         "messages": messages,
         "claims": claims,
         "usage": usage,
+        "decisions": decisions,
     }

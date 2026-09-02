@@ -829,6 +829,154 @@ async def test_digest_404_for_missing_room(app_client: tuple) -> None:
 
 
 @pytest.mark.asyncio
+async def test_digest_moderated_renders_decisions_in_seq_order(
+    app_client: tuple,
+) -> None:
+    """Moderated rooms insert a 决策 table between transcript and claims.
+
+    Rows follow trigger_seq, not insert order. Target names reuse the
+    same table-cell escape as transcript bodies.
+    """
+    app, client = app_client
+    room = (
+        await client.post("/rooms", json={"name": "roundtable", "mode": "moderated"})
+    ).json()
+    human = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "human", "name": "Ada"},
+        )
+    ).json()
+    chair = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={
+                "kind": "agent",
+                "name": "Chair",
+                "persona": "keeps time",
+                "role": "moderator",
+            },
+        )
+    ).json()
+    member = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "agent", "name": "Iris | Lee"},
+        )
+    ).json()
+    for body in ("q1", "q2", "q3"):
+        posted = await client.post(
+            f"/rooms/{room['id']}/messages",
+            json={"author_id": human["id"], "body": body},
+        )
+        posted.raise_for_status()
+
+    room_id = UUID(room["id"])
+    chair_id = UUID(chair["id"])
+    member_id = UUID(member["id"])
+    # Insert out of trigger order so the digest, not the writer, sorts.
+    await db.record_decision(app.state.pool, room_id, chair_id, 3, "silence", None)
+    await db.record_decision(app.state.pool, room_id, chair_id, 1, "call_on", member_id)
+    await db.record_decision(app.state.pool, room_id, chair_id, 2, "say", None)
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "- Mode: `moderated`" in body
+    assert "## 决策 — Chair" in body
+    assert "| trigger_seq | action | target | created_at |" in body
+    call_on = body.index("| 1 | call_on | Iris \\| Lee |")
+    say = body.index("| 2 | say | — |")
+    silence = body.index("| 3 | silence | — |")
+    assert call_on < say < silence
+    transcript_at = body.index("## Transcript")
+    decisions_at = body.index("## 决策")
+    claims_at = body.index("## Action items (claims)")
+    assert transcript_at < decisions_at < claims_at
+
+
+@pytest.mark.asyncio
+async def test_digest_flattens_newline_in_moderator_name(
+    app_client: tuple,
+) -> None:
+    """A moderator name with a newline must not forge digest headings.
+
+    `_esc` flattens newlines so both the 决策 heading and the pre-existing
+    `- Agents:` line stay on one line.
+    """
+    _app, client = app_client
+    room = (
+        await client.post("/rooms", json={"name": "inject", "mode": "moderated"})
+    ).json()
+    await client.post(
+        f"/rooms/{room['id']}/participants",
+        json={
+            "kind": "agent",
+            "name": "Chair\n## forged heading",
+            "role": "moderator",
+        },
+    )
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "## 决策 — Chair ## forged heading" in body
+    assert "- Agents: **Chair ## forged heading**" in body
+    assert "\n## forged heading" not in body
+    assert body.count("## Action items (claims)") == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_moderated_empty_decisions_is_placeholder(
+    app_client: tuple,
+) -> None:
+    """A moderated room with no rows still shows 决策, as a placeholder
+    rather than an empty table."""
+    _app, client = app_client
+    room = (
+        await client.post("/rooms", json={"name": "empty-decisions", "mode": "moderated"})
+    ).json()
+    await client.post(
+        f"/rooms/{room['id']}/participants",
+        json={"kind": "agent", "name": "Chair", "role": "moderator"},
+    )
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "## 决策 — Chair" in body
+    assert "_(no decisions)_" in body
+    assert "| trigger_seq | action | target | created_at |" not in body
+
+
+@pytest.mark.asyncio
+async def test_digest_open_room_omits_decisions_section(
+    app_client: tuple,
+) -> None:
+    """Open rooms must not grow an empty 决策 table — the section is
+    omitted byte-wise, not rendered blank."""
+    _app, client = app_client
+    room = (await client.post("/rooms", json={"name": "plain"})).json()
+    human = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "human", "name": "Ada"},
+        )
+    ).json()
+    await client.post(
+        f"/rooms/{room['id']}/messages",
+        json={"author_id": human["id"], "body": "hello"},
+    )
+
+    resp = await client.get(f"/rooms/{room['id']}/digest")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "- Mode: `open`" in body
+    assert "决策" not in body
+    assert "trigger_seq" not in body
+
+
+@pytest.mark.asyncio
 async def test_duplicate_reply_over_runtime_returns_409(app_client: tuple) -> None:
     _app, client = app_client
     computer = (await client.post("/computers", json={"name": "laptop"})).json()

@@ -1,6 +1,6 @@
 # Agora
 
-多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 7：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、把 `send_anyway` 当确认而非跳过的 hold token、房间级的 agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），`GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / active claims / 模型花费，纯格式化零模型调用），以及 **moderated 房间**：指定一名 moderator，落地消息默认只叫醒主持；主持用同一张图上的 `decide` 工具点名 / 开口 / 沉默，`@Name` 是唯一写死的点名协议。没有前端，演示靠 CLI、日志和测试。
+多 Agent 和人待在同一间房里的聊天后端。新消息会叫醒房间里的 Agent；每个 Agent 串行跑 turn，突发叫醒合并成一轮，避免 N 条消息打出 N 次推理。项目要解决的是多 Agent 协作里的两类失败——抢答碰撞和脑判失误——并把「时间窗上的竞态」交给代码、「语义上的对错」交给模型。目前完成到 Phase 7：房间 / 消息 / WebSocket / Redis 叫醒调度，一张 LangGraph（小模型 triage、大模型 `reply`/`claim`、代码节点 freshness HOLD、提交时事务内新鲜度校验与逐字复读拦截、按 seq 锚定的 `task_key`、`llm_calls` 账本、把 `send_anyway` 当确认而非跳过的 hold token、房间级的 agent-only 循环上限），计数游戏 / one-of-us 两条真模型协调测试，BYOA——同一张图跑在用户自己的 Computer 上，服务端不持有用户的模型 key——可选的云端 K8s Job 宿主（未开 k8s 时回退进程内），`GET /rooms/{id}/digest` 把房间沉淀为 Markdown brief（transcript / moderated 房间的决策时间线 / active claims / 模型花费，纯格式化零模型调用），以及 **moderated 房间**：指定一名 moderator，落地消息默认只叫醒主持；主持用同一张图上的 `decide` 工具点名 / 开口 / 沉默，`@Name` 是唯一写死的点名协议。没有前端，演示靠 CLI、日志和测试。
 
 ```mermaid
 flowchart LR
@@ -69,6 +69,7 @@ export OPENAI_API_BASE=$OPENAI_BASE_URL
 export AGORA_SMALL_MODEL=gpt-5.6-luna          # triage，默认即此
 export AGORA_BIG_MODEL=gpt-5.6-terra           # 工具循环，默认即此
 uv run python scripts/demo_phase2.py           # one-of-us 介绍房间
+uv run python scripts/demo_phase7.py           # moderated 房间：主持点名 + @ 直通
 uv run python scripts/demo_byoa.py             # 云端 + 本地 daemon，然后把 daemon 杀掉
 ```
 
@@ -123,11 +124,11 @@ uv run python scripts/demo_byoa.py
 ```bash
 docker compose up -d
 uv sync
-uv run pytest -m "not llm"    # mock 模型，不打中继
-uv run pytest -m llm          # 真中继：计数游戏 + one-of-us（需要上面的 OPENAI_*）
+uv run pytest -m "not llm"    # mock 模型，不打中继（GitHub Actions 也跑这一条）
+uv run pytest -m llm          # 真中继：计数游戏 + one-of-us + moderated 点名/@ 直通（需要上面的 OPENAI_*）
 ```
 
-`test_coalesce`、Job manifest / launcher 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` / `test_k8s` 的 runtime 用例 / `test_hardening`（hold token、verbatim-dup、循环上限、digest）需要 Postgres + Redis。`-m "not llm"` 全部 mock 模型。`-m llm` 打真实中继，未设置 `OPENAI_BASE_URL` 或中继不可达时会 skip。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
+`test_coalesce`、Job manifest / launcher 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` / `test_k8s` 的 runtime 用例 / `test_hardening`（hold token、verbatim-dup、循环上限、digest）需要 Postgres + Redis。`-m "not llm"` 全部 mock 模型；push 到 `main` 和 pull_request 上 GitHub Actions 也跑这一条（服务容器里的 Postgres 16 / Redis 7，DSN 走环境变量）。`-m llm` 打真实中继，未设置 `OPENAI_BASE_URL` 或中继不可达时会 skip。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
 
 ## 房间 digest
 
@@ -137,7 +138,7 @@ uv run pytest -m llm          # 真中继：计数游戏 + one-of-us（需要上
 curl -s http://127.0.0.1:8000/rooms/<ROOM_ID>/digest -o room.md
 ```
 
-内容：transcript 表格、active claims（即 action items）、`llm_calls` 按 purpose × model 汇总的花费。纯格式化，零模型调用。
+内容：transcript 表格、moderated 房间在 transcript 和 claims 之间的决策时间线（`moderator_decisions`，按 trigger_seq）、active claims（即 action items）、`llm_calls` 按 purpose × model 汇总的花费。纯格式化，零模型调用。open 房间没有决策节。
 
 ## 沉默房间的主动唤醒（stall sweep）
 
