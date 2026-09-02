@@ -331,7 +331,7 @@ async def _run(app: FastAPI, client: httpx.AsyncClient) -> None:
         f"/rooms/{room_id}/messages",
         json={
             "author_id": human["id"],
-            "body": "请合规官 Lex 先表态：这个功能下个迭代做还是砍掉？",
+            "body": "请 Lex 先说：消息表的 seq 列该用 BIGINT 还是 INTEGER？给个实现建议。",
         },
     )
     third.raise_for_status()

@@ -31,7 +31,7 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 
 ## 2. 用例清单
 
-### L0 确定性测试（160 项，全绿）
+### L0 确定性测试（168 项，全绿）
 
 数量按 `pytest --collect-only -q <file>` 实测。关键套件：
 
@@ -43,9 +43,9 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 | `test_pacer.py` / `test_limiter.py` | 12 | 速率限制、并发上限 |
 | `test_coalesce.py` / `test_daemon_lane.py` | 5 | AgentLane 合并 rerun 指向最新房间 |
 | `test_byoa.py` | 9 | BYOA claim/HTTP/WS 重连替换 |
-| `test_moderated.py` | 42 | moderated 路由、API、decide 工具、幂等、loop cap、BYOA decision、called-on pass、say 非终结、trigger_seq pass 门、in-process 不写 Redis hint、silence 钉 last_seq 不 nudge |
+| `test_moderated.py` | 46 | moderated 路由、API、decide 工具、幂等、loop cap、BYOA decision、called-on pass、say 非终结、trigger_seq pass 门、in-process 不写 Redis hint、silence 钉 last_seq 不 nudge、每条人类消息 3 次 call_on 封顶 |
 | `test_liveness.py` | 6 | subscriber 首次订阅失败即抛 / 重连 / dispatch 隔离、lane 吞异常、done-callback、call_on wake fail-open |
-| 其余（`test_brain` 17 / `test_k8s` 18 / `test_daemon_args` 3 / `test_wake` 1 / `test_seq` 1） | 40 | 图节点、triage、参数解析、Job 宿主 |
+| 其余（`test_brain` 21 / `test_k8s` 18 / `test_daemon_args` 3 / `test_wake` 1 / `test_seq` 1） | 44 | 图节点、triage（含 `response_mode=none`）、参数解析、Job 宿主 |
 
 ### L2 真模型协调测试
 
@@ -109,6 +109,12 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 | `test_nudge_skips_moderator_after_silence_at_last_seq` | silence 钉在 last_seq 再 `seq=None` | `_route_wake` 返回 `[]`，零 turn |
 | `test_duplicate_called_on_pass_is_dropped` | 最新他人消息已是 `Iris passes.` | pass 被 DuplicateReply 丢弃，last_read 仍推进 |
 | `test_say_logs_when_decision_row_blocked` | 已有 say 行再落地一条 say | info 日志；消息落地 |
+| `test_call_on_budget_fourth_is_rejected` | 人类开口后 3 次 call_on | 第 4 次 ToolMessage 拒绝、无第 4 行 |
+| `test_call_on_budget_resets_on_new_human` | 封顶后再来一条人类消息 | 计数清零，下一次 call_on 成功 |
+| `test_call_on_budget_does_not_block_say_or_silence` | 3 次 call_on 之后 | `say` / `silence` 仍写行 |
+| `test_http_world_call_ons_since_human` | HttpWorld + `/runtime/call-ons-since-human` | 计数与人类重置经 runtime GET |
+| `test_triage_none_mode_skips_without_warning`（`test_brain`） | `actionable=false, response_mode=none` | 正常 skipped，无 warning |
+| `test_triage_actionable_without_response_mode_is_invalid`（`test_brain`） | `actionable=true` 无 mode | 仍走 invalid / warning |
 
 ## 3. 真模型实测记录
 
@@ -203,6 +209,10 @@ Racer 每轮首轮都强传 `send_anyway=true`，但序列仍无重复、无断�
 - `AGORA_SMALL_MODEL` 与 `AGORA_BIG_MODEL` 不能相同——`brain/policy.py` 的 `assert_triage_model` 会在启动时拒绝（第一次尝试两边都填 `gpt-oss-120b`，7 个用例全部在 lifespan 报 `ValueError`）。这是有意的接线保护，不是 bug。
 - `gemma-4-31b` 做 triage 时，在「不该回复」的场景会输出 `response_mode: "none"`，而 `TriageVerdict` 只接受 `me / each / one-of-us`，解析失败后按 fail-safe 跳过。结果与预期一致（该沉默的确沉默），但走的是 warning 路径而非正常路径；preempt 用例的 122s 主要是等这类跳过后的 stall。schema 上让 `actionable=false` 时 `response_mode` 可缺省，会让小模型的输出更容易落进正常路径。
 - `gpt-oss-120b` 在 moderated 用例里有一次 `Connection error` 触发了单次重试后成功；重试路径在真模型下被走过一次。
+
+同日第一次真模型现场 `scripts/demo_phase7.py`（同一对模型）：协调不变量都成立（pass → 换人、`@` 直通、loop cap 开火），但主持行为差——人说「请恰好一个人回答」后，Chair 点 Iris，然后每条成员回复都 `say("感谢 X")` + `call_on(next)`，Iris/Marcus 交替 8 轮直到 `AGENT_LOOP_CAP` 把房间静音；内容漂到无关设计。Chair 还对 Ada（人）`call_on` 了 8 次，每次被 `DECIDE_TARGET_ERROR` 拒。gemma triage 在 `actionable=false` 时吐 `response_mode: "none"`，校验失败走 warning/skip。Phase 7d 用 `MODERATED_CALLS_PER_HUMAN` 在决策层封轮询、错误文案列出可点名成员、主持 prompt 默认 silence、triage 在不可行动时接受 `"none"`。
+
+Phase 7d 改完同日重跑（同一对模型）：`-m llm` 7 passed in 98.36s（#3 是 173.92s，差的 76s 就是 preempt 用例里 triage `"none"` 走 warning 路径后等 stall 的时间）。`demo_phase7.py` 三幕合计 8 行决策：第一幕 `call_on Iris → say → silence`；`@Marcus` 直通、Chair 只写 silence；第三幕 `call_on Lex → Lex passes. → call_on Iris → Iris 作答 → silence`。#3 那次同样三幕是 27 行决策外加 loop cap 开火、8 次 `call_on(Ada)`；这次零次点人类。主持 prompt 额外加了一句「`<Name> passes.` 表示该成员弃权、问题仍未回答，改点能答的人」——没有这句，Chair 在 pass 之后会把「默认 silence」也套上去。demo 第三幕的问题改成了对 Lex 明显跨界的技术问题（BIGINT 还是 INTEGER），合规话题 Lex 会正常回答，触发不了拒答。
 
 ### 3.4 结果判读
 

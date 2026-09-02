@@ -14,6 +14,7 @@ import redis.asyncio as redis
 
 import brain.graph as graph_mod
 from brain.graph import (
+    DECIDE_CALLS_EXHAUSTED,
     DECIDE_TARGET_ERROR,
     MODERATION_NOTE,
     MODERATOR_SAY_ERROR,
@@ -88,6 +89,23 @@ async def _decisions(pool: asyncpg.Pool, room_id: UUID) -> list[asyncpg.Record]:
         """,
         room_id,
     )
+
+
+async def _chair_call_on(
+    pool: asyncpg.Pool,
+    redis_client: redis.Redis,
+    room_id: UUID,
+    chair_id: UUID,
+    target: str,
+) -> object:
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel(
+            [tool_call("decide", {"action": "call_on", "target": target})]
+        ),
+    )
+    return await brain.run(chair_id, room_id)
 
 
 async def _wait_turns(
@@ -436,7 +454,7 @@ async def test_invalid_target_is_tool_error_then_retry(
     small = ScriptedChatModel()
     big = ScriptedChatModel(
         [
-            tool_call("decide", {"action": "call_on", "target": "Nobody"}),
+            tool_call("decide", {"action": "call_on", "target": "Ada"}),
             tool_call("decide", {"action": "call_on", "target": "Iris"}),
         ]
     )
@@ -456,6 +474,12 @@ async def test_invalid_target_is_tool_error_then_retry(
     assert wakes == [iris_id]
     told = [getattr(m, "content", "") for m in big.calls[1]]
     assert any(DECIDE_TARGET_ERROR in str(t) for t in told)
+    assert any(
+        "unknown or non-callable target 'Ada'" in str(t)
+        and "call_on accepts one of: Iris" in str(t)
+        and "humans cannot be called on" in str(t)
+        for t in told
+    )
     rows = await _decisions(pool, room_id)
     assert [r["target_id"] for r in rows] == [iris_id]
 
@@ -1756,3 +1780,199 @@ async def test_say_logs_when_decision_row_blocked(
     assert result.outcome == "moderated_silence"
     assert "welcome" in [m.body for m in await db.list_messages(pool, room_id)]
     assert "decision row blocked" in caplog.text
+
+
+# ── Phase 7d: call_on budget per human message ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_call_on_budget_fourth_is_rejected(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, chair_id, member_ids = await _moderated_room(
+        pool, members=2
+    )
+    iris_id, marcus_id = member_ids
+    await db.insert_message(pool, room_id, human_id, "exactly one answer")
+    world = DirectWorld(pool, redis_client)
+
+    targets = ["Iris", "Marcus", "Iris"]
+    speakers = [iris_id, marcus_id, iris_id]
+    for i, (target, speaker) in enumerate(zip(targets, speakers, strict=True)):
+        result = await _chair_call_on(
+            pool, redis_client, room_id, chair_id, target
+        )
+        assert result.outcome == "moderated_call", i
+        await db.insert_message(pool, room_id, speaker, f"answer {i}")
+
+    assert await world.call_ons_since_human(room_id) == 3
+    big = ScriptedChatModel(
+        [
+            tool_call("decide", {"action": "call_on", "target": "Marcus"}),
+            tool_call("decide", {"action": "silence"}),
+        ]
+    )
+    brain = Brain(
+        DirectWorld(pool, redis_client), small_model=ScriptedChatModel(), big_model=big
+    )
+    fourth = await brain.run(chair_id, room_id)
+    assert fourth.outcome == "moderated_silence"
+    told = [str(getattr(m, "content", "")) for m in big.calls[1]]
+    assert any(DECIDE_CALLS_EXHAUSTED in t for t in told)
+    rows = await _decisions(pool, room_id)
+    assert [r["action"] for r in rows] == ["call_on", "call_on", "call_on", "silence"]
+    assert await world.call_ons_since_human(room_id) == 3
+
+
+@pytest.mark.asyncio
+async def test_call_on_budget_resets_on_new_human(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, chair_id, member_ids = await _moderated_room(
+        pool, members=2
+    )
+    iris_id, marcus_id = member_ids
+    await db.insert_message(pool, room_id, human_id, "first ask")
+    for target, speaker in (
+        ("Iris", iris_id),
+        ("Marcus", marcus_id),
+        ("Iris", iris_id),
+    ):
+        result = await _chair_call_on(
+            pool, redis_client, room_id, chair_id, target
+        )
+        assert result.outcome == "moderated_call"
+        await db.insert_message(pool, room_id, speaker, f"done {target}")
+
+    await db.insert_message(pool, room_id, human_id, "new question")
+    world = DirectWorld(pool, redis_client)
+    assert await world.call_ons_since_human(room_id) == 0
+    again = await _chair_call_on(pool, redis_client, room_id, chair_id, "Marcus")
+    assert again.outcome == "moderated_call"
+    assert await world.call_ons_since_human(room_id) == 1
+    rows = await _decisions(pool, room_id)
+    assert [r["action"] for r in rows] == ["call_on"] * 4
+
+
+@pytest.mark.asyncio
+async def test_call_on_budget_does_not_block_say_or_silence(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, chair_id, member_ids = await _moderated_room(
+        pool, members=2
+    )
+    iris_id, marcus_id = member_ids
+    await db.insert_message(pool, room_id, human_id, "ask")
+    for target, speaker in (
+        ("Iris", iris_id),
+        ("Marcus", marcus_id),
+        ("Iris", iris_id),
+    ):
+        result = await _chair_call_on(
+            pool, redis_client, room_id, chair_id, target
+        )
+        assert result.outcome == "moderated_call"
+        await db.insert_message(pool, room_id, speaker, f"heard {target}")
+
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel(
+            [
+                tool_call("decide", {"action": "say", "body": "closing"}),
+                tool_call("decide", {"action": "silence"}),
+            ]
+        ),
+    )
+    result = await brain.run(chair_id, room_id)
+    assert result.outcome == "moderated_silence"
+    assert result.reply_body == "closing"
+    assert "closing" in [m.body for m in await db.list_messages(pool, room_id)]
+    actions = [r["action"] for r in await _decisions(pool, room_id)]
+    assert actions == ["call_on", "call_on", "call_on", "say", "silence"]
+
+
+@pytest.mark.asyncio
+async def test_http_world_call_ons_since_human(app_client: tuple) -> None:
+    from daemon.world_http import HttpWorld
+
+    _app, client = app_client
+    computer = (await client.post("/computers", json={"name": "laptop"})).json()
+    room = (
+        await client.post("/rooms", json={"name": "cap-rt", "mode": "moderated"})
+    ).json()
+    human = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "human", "name": "Ada"},
+        )
+    ).json()
+    chair = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={
+                "kind": "agent",
+                "name": "Chair",
+                "role": "moderator",
+                "computer_id": computer["id"],
+            },
+        )
+    ).json()
+    iris = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "agent", "name": "Iris"},
+        )
+    ).json()
+    marcus = (
+        await client.post(
+            f"/rooms/{room['id']}/participants",
+            json={"kind": "agent", "name": "Marcus"},
+        )
+    ).json()
+    posted = await client.post(
+        f"/rooms/{room['id']}/messages",
+        json={"author_id": human["id"], "body": "begin"},
+    )
+    posted.raise_for_status()
+    assert posted.json()["seq"] == 1
+
+    world = HttpWorld(client, computer["token"])
+    world.bind_actor(UUID(chair["id"]))
+    room_id = UUID(room["id"])
+    chair_id = UUID(chair["id"])
+    targets = [UUID(iris["id"]), UUID(marcus["id"]), UUID(iris["id"])]
+    speakers = [iris, marcus, iris]
+    for i, (target_id, speaker) in enumerate(zip(targets, speakers, strict=True)):
+        recorded = await world.record_decision(
+            room_id, chair_id, trigger_seq=i + 1, action="call_on", target_id=target_id
+        )
+        assert recorded.status == "won"
+        follow = await client.post(
+            f"/rooms/{room['id']}/messages",
+            json={"author_id": speaker["id"], "body": f"answer {i}"},
+        )
+        follow.raise_for_status()
+
+    assert await world.call_ons_since_human(room_id) == 3
+    raw = await client.get(
+        "/runtime/call-ons-since-human",
+        params={"agent_id": chair["id"], "room_id": room["id"]},
+        headers={"Authorization": f"Bearer {computer['token']}"},
+    )
+    assert raw.status_code == 200
+    assert raw.json() == {"count": 3}
+
+    reset = await client.post(
+        f"/rooms/{room['id']}/messages",
+        json={"author_id": human["id"], "body": "new ask"},
+    )
+    reset.raise_for_status()
+    assert await world.call_ons_since_human(room_id) == 0
+    assert (
+        await client.get(
+            "/runtime/call-ons-since-human",
+            params={"agent_id": chair["id"], "room_id": room["id"]},
+            headers={"Authorization": f"Bearer {computer['token']}"},
+        )
+    ).json() == {"count": 0}

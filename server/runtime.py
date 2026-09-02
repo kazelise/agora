@@ -299,6 +299,18 @@ async def authored_since(
     return {"authored": found}
 
 
+@router.get("/call-ons-since-human")
+async def call_ons_since_human(
+    request: Request,
+    agent_id: UUID,
+    room_id: UUID,
+    host: Host = Depends(require_host),
+) -> dict[str, int]:
+    await hosted_agent(request, host, agent_id, room_id)
+    n = await db.count_call_ons_since_human(request.app.state.pool, room_id)
+    return {"count": n}
+
+
 @router.get("/last-read")
 async def get_last_read(
     request: Request,

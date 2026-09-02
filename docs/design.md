@@ -143,6 +143,7 @@ flowchart LR
 - **Phase 4a：** GitHub OAuth。做完再写进简历一项。
 - **Phase 7：** moderated 房间。叫醒路由是代码（模式 / `@Name` / 主持席），主持用同一张图上的 `decide` 做语义判断。
 - **Phase 7c：** 被点名成员的显式 pass、主持 `say` 非终结、subscriber / lane 崩溃约束、删掉无读者的 Redis seen-cursor。
+- **Phase 7d：** 主持 `call_on` 按人类消息封顶、错误文案列出可点名成员、答完默认 silence、triage 在不可行动时接受缺省 / `"none"`。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
 
@@ -344,6 +345,14 @@ open 房间是 peer bus：一条落地消息叫醒所有非作者 agent，碰撞
 
 循环上限照旧是计数：主持 stretch 超过 `AGENT_LOOP_CAP × agent数` 则确定性 `silence`，零次模型调用。`call_on` 到的成员沿用原来的 `skipped` 行为。
 
+**`MODERATED_CALLS_PER_HUMAN = 3`。** 消息层 loop cap 的决策层对应物：自人类最后一条消息以来的 `call_on` 行数（`trigger_seq` 大于该消息 seq − 1，没有人类消息则从 0 计，所以回应那条人类消息的第一次点名也算）。到顶则 ToolMessage 拒绝、不写行，只剩 `silence` 或一次 `say`。先于 `AGENT_LOOP_CAP` 开火，拦住「主持轮询人人」。`@Name` 不是 call_on，不受影响。人类再开口计数清零。
+
+**`DECIDE_TARGET_ERROR` 列出可点名成员。** 解析失败时 ToolMessage 写出名单上的 member agent，并写明人不能被 `call_on`。
+
+**主持默认沉默。** 被点名成员答完人类的问题之后选 `silence`：不感谢、不总结、不再点下一个人（除非人类要讨论或答案明显没完）。`call_on` 只点名单上的 agent；`say` 一轮最多一次。这是模型的事，上面的封顶是代码的事。
+
+**Triage `response_mode` 在不可行动时可选。** `actionable=false` 时缺省或 `"none"` 都算正常跳过，不走 warning；`actionable=true` 仍必须带 `me|each|one-of-us`。
+
 digest 补上决策时间线：moderated 房间在 transcript 和 claims 之间渲染 `moderator_decisions`（trigger_seq / action / target / created_at），仍是零模型调用的纯格式化；open 房间整节省略。真模型测试把「成员消息对应某次 call_on 或 @mention」和「@ 直通」钉成机制不变量——人数是模型行为，不是代码保证。
 
 ### Phase 7c：活性与崩溃约束
@@ -355,3 +364,7 @@ digest 补上决策时间线：moderated 房间在 transcript 和 claims 之间�
 **`say` 非终结。** 主持的 `say` 落地后回到工具循环，同一轮只在 `call_on` 或 `silence` 结束。`_commit` 已在原 trigger N 写下 say 行并把 `seen_seq` 推到 say 自己的 seq，随后的 `call_on` 自然记在 N+1，不要回写 N（唯一键冲突会变成 `already_decided`）。`MODERATOR_SAY_BUDGET = 1`：第二次 say 是 ToolMessage，不是再发一条。不靠 hop 预算——HOLD 会把 `hop_count` 清零，有效上限会变成 18 跳；dup 门也不拦同作者重复。作者仍不会被自己的消息叫醒。
 
 **崩溃约束。** `run_subscriber` 第一次 subscribe 失败直接抛，启动失败而不是挂在 `ready.wait()`；成功之后才外层重连（重建 pubsub、再订阅；每次成功订阅后 delay 归零，再指数退避封顶几秒）。`finally` 只 `aclose()` pubsub，不 `unsubscribe`（死连接上那一下会卡住停机）。单条 dispatch 异常打日志、继续听。`AgentLane._loop` 吞掉单轮异常，继续消费 `_pending`（原有的至多一次合并语义）。lifespan 给 subscriber 和 stall sweeper 各挂一个 done-callback：异常退出（不是 CancelledError、不是干净停）打 `critical`。`record_decision` 的 `on_call_on` wake fail-open——行已经提交，叫醒失败由 `_undelivered_call_on` 在下次 nudge 补投。
+
+### Phase 7d：主持边界
+
+算术拦轮询，prompt 拦措辞。`MODERATED_CALLS_PER_HUMAN` 在决策行上封顶；`DECIDE_TARGET_ERROR` 点名可叫的座位；主持答完就 `silence`；小模型 `actionable=false` 时 `response_mode` 可缺省。详见上一节四条。

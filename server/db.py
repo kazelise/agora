@@ -645,6 +645,35 @@ async def get_last_read(pool: asyncpg.Pool, agent_id: UUID, room_id: UUID) -> in
     return int(value) if value is not None else 0
 
 
+async def count_call_ons_since_human(pool: asyncpg.Pool, room_id: UUID) -> int:
+    """call_on rows since the last human message (decision-layer poll cap).
+
+    Floor is last human seq minus one so the call_on that answers that
+    message (trigger_seq == human seq) counts; no human yet counts from
+    seq 0, matching count_agent_only_stretch. Mentions are not rows.
+    """
+    return int(
+        await pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM moderator_decisions d
+            WHERE d.room_id = $1
+              AND d.action = 'call_on'
+              AND d.trigger_seq > COALESCE((
+                    SELECT m.seq - 1
+                    FROM messages m
+                    JOIN participants p ON p.id = m.author_id
+                    WHERE m.room_id = $1 AND p.kind = 'human'
+                    ORDER BY m.seq DESC
+                    LIMIT 1
+              ), 0)
+            """,
+            room_id,
+        )
+        or 0
+    )
+
+
 async def has_authored_since(
     pool: asyncpg.Pool, author_id: UUID, room_id: UUID, since_seq: int
 ) -> bool:

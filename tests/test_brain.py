@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from uuid import UUID
 
@@ -9,7 +10,7 @@ import pytest
 import redis.asyncio as redis
 
 import brain.graph as graph_mod
-from brain.graph import CLAIM_KEY_ERROR, Brain, claim_obligation_text
+from brain.graph import CLAIM_KEY_ERROR, Brain, claim_obligation_text, _parse_triage
 from brain.policy import big_model_name
 from brain.world_direct import DirectWorld
 from server import db
@@ -596,3 +597,68 @@ async def test_commit_advances_cursor_no_self_re_serve(
     # The tail shown to proactive triage still includes the room context.
     tail_prompt = " ".join(str(getattr(m, "content", "")) for m in small2.calls[0])
     assert "7" in tail_prompt
+
+
+def test_parse_triage_none_mode_when_not_actionable() -> None:
+    none = _parse_triage(
+        '{"actionable": false, "reason": "idle", "response_mode": "none"}'
+    )
+    assert none.actionable is False
+    assert none.response_mode is None
+    missing = _parse_triage('{"actionable": false, "reason": "idle"}')
+    assert missing.actionable is False
+    assert missing.response_mode is None
+
+
+def test_parse_triage_actionable_requires_response_mode() -> None:
+    with pytest.raises(Exception):
+        _parse_triage('{"actionable": true, "reason": "go"}')
+
+
+@pytest.mark.asyncio
+async def test_triage_none_mode_skips_without_warning(
+    pool: asyncpg.Pool, redis_client: redis.Redis, caplog: pytest.LogCaptureFixture
+) -> None:
+    room_id, human_id, agent_ids = await _room(pool)
+    await db.insert_message(pool, room_id, human_id, "just chatting")
+    small = ScriptedChatModel(
+        [
+            text_message(
+                '{"actionable": false, "reason": "small talk", "response_mode": "none"}'
+            )
+        ]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    with caplog.at_level(logging.WARNING, logger="agora.brain"):
+        result = await brain.run(agent_ids[0], room_id)
+
+    assert result.outcome == "skipped"
+    assert result.triage_reason == "small talk"
+    assert result.response_mode is None
+    assert big.calls == []
+    assert "not valid JSON" not in caplog.text
+    prompt = " ".join(str(getattr(m, "content", "")) for m in small.calls[0])
+    assert "Omit response_mode when actionable is false" in prompt
+
+
+@pytest.mark.asyncio
+async def test_triage_actionable_without_response_mode_is_invalid(
+    pool: asyncpg.Pool, redis_client: redis.Redis, caplog: pytest.LogCaptureFixture
+) -> None:
+    room_id, human_id, agent_ids = await _room(pool)
+    await db.insert_message(pool, room_id, human_id, "please answer")
+    small = ScriptedChatModel(
+        [text_message('{"actionable": true, "reason": "addressed"}')]
+    )
+    big = ScriptedChatModel()
+    brain = Brain(DirectWorld(pool, redis_client), small_model=small, big_model=big)
+
+    with caplog.at_level(logging.WARNING, logger="agora.brain"):
+        result = await brain.run(agent_ids[0], room_id)
+
+    assert result.outcome == "skipped"
+    assert result.triage_reason == "invalid triage output"
+    assert big.calls == []
+    assert "not valid JSON" in caplog.text
