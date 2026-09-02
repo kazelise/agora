@@ -6,14 +6,13 @@ by existing tests (construct DirectWorld(pool, redis)).
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 import asyncpg
 import redis.asyncio as redis
 
-from brain.seen import record_seen as redis_record_seen
-from brain.wake_hints import consume_called_on
 from brain.world import (
     DecisionResult,
     DuplicateReply,
@@ -25,7 +24,10 @@ from brain.world import (
 from server import db
 from server.models import MessageRow, ParticipantRow
 
-CallOnFn = Callable[[UUID, UUID], Awaitable[None]]
+logger = logging.getLogger("agora.world")
+
+# (room_id, target_id) or (room_id, target_id, trigger_seq).
+CallOnFn = Callable[..., Awaitable[None]]
 
 
 def _participant(row: ParticipantRow) -> WorldParticipant:
@@ -61,7 +63,7 @@ class DirectWorld:
     ) -> None:
         self.pool = pool
         self.redis = redis_client
-        # Server wires this to Scheduler.wake_one(..., called_on=True).
+        # Server wires this to Scheduler.wake_one(..., called_on_seq=).
         # Tests pass a spy. Absent: call_on still writes the row.
         self.on_call_on = on_call_on
 
@@ -76,7 +78,13 @@ class DirectWorld:
         names = await self._names(room_id)
         return [_message(row, names.get(str(row.author_id), "?")) for row in rows]
 
-    async def load_turn(self, agent_id: UUID, room_id: UUID) -> TurnContext:
+    async def load_turn(
+        self,
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on_seq: int | None = None,
+    ) -> TurnContext:
         agent = await db.get_participant(self.pool, agent_id)
         last_read = await db.get_last_read(self.pool, agent_id, room_id)
         people = await db.list_participants(self.pool, room_id)
@@ -90,7 +98,9 @@ class DirectWorld:
             room_mode = room.mode
         except db.NotFoundError:
             room_mode = "open"
-        called_on = await consume_called_on(self.redis, agent_id, room_id)
+        # In-process lanes pass the dict value here. Never read Redis:
+        # that hint is for hosts that cannot receive the in-process
+        # value (BYOA / K8s Jobs via /runtime/turn-context).
         return TurnContext(
             agent=_participant(agent),
             inbox=inbox,
@@ -99,7 +109,8 @@ class DirectWorld:
             seen_seq=seen_seq,
             agent_only_stretch=stretch,
             room_mode=room_mode,
-            called_on=called_on,
+            called_on=called_on_seq is not None,
+            called_on_seq=called_on_seq,
         )
 
     async def get_last_read(self, agent_id: UUID, room_id: UUID) -> int:
@@ -171,9 +182,6 @@ class DirectWorld:
             purpose,
         )
 
-    async def record_seen(self, agent_id: UUID, room_id: UUID, seq: int) -> None:
-        await redis_record_seen(self.redis, agent_id, room_id, seq)
-
     async def record_decision(
         self,
         room_id: UUID,
@@ -189,12 +197,38 @@ class DirectWorld:
             status=status, action=row.action, target_id=row.target_id
         )
         # Wake only on a freshly won call_on. A replay must not double-wake
-        # (the unique key already decided who was called).
+        # (the unique key already decided who was called). The row is
+        # already committed: a wake failure is a missed coordination
+        # signal, same class as publish_wake. _undelivered_call_on
+        # redelivers this call_on on the next stall nudge if the
+        # target's last_read still trails trigger_seq.
         if (
             status == "won"
             and row.action == "call_on"
             and row.target_id is not None
             and self.on_call_on is not None
         ):
-            await self.on_call_on(room_id, row.target_id)
+            try:
+                await self._invoke_on_call_on(room_id, row.target_id, row.trigger_seq)
+            except Exception:
+                logger.warning(
+                    "on_call_on wake failed room=%s target=%s — fail-open",
+                    room_id,
+                    row.target_id,
+                    exc_info=True,
+                )
         return result
+
+    async def _invoke_on_call_on(
+        self, room_id: UUID, target_id: UUID, trigger_seq: int
+    ) -> None:
+        assert self.on_call_on is not None
+        try:
+            await self.on_call_on(room_id, target_id, trigger_seq)
+        except TypeError:
+            await self.on_call_on(room_id, target_id)
+
+    async def has_authored_since(
+        self, agent_id: UUID, room_id: UUID, since_seq: int
+    ) -> bool:
+        return await db.has_authored_since(self.pool, agent_id, room_id, since_seq)

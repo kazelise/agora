@@ -8,6 +8,7 @@ key. Usage lands in the same llm_calls ledger (purpose + tokens + model).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
@@ -22,6 +23,8 @@ from server.computers import ComputerHub
 from server.models import MessageOut
 from server.runtime_types import Host
 from server.scheduler import fanout_message  # noqa: F401 (re-exported for tests)
+
+logger = logging.getLogger("agora.runtime")
 
 router = APIRouter(prefix="/runtime", tags=["runtime"])
 
@@ -52,12 +55,6 @@ class RuntimeLastReadRequest(BaseModel):
     agent_id: UUID
     room_id: UUID
     last_read_seq: int
-
-
-class RuntimeSeenRequest(BaseModel):
-    agent_id: UUID
-    room_id: UUID
-    seq: int
 
 
 class RuntimeDecisionRequest(BaseModel):
@@ -105,6 +102,7 @@ class TurnContextOut(BaseModel):
     agent_kind: str = "agent"
     agent_role: str = "member"
     called_on: bool = False
+    called_on_seq: int | None = None
 
 
 async def named_since(
@@ -145,7 +143,7 @@ async def turn_context(
         room_mode = room.mode
     except db.NotFoundError:
         room_mode = "open"
-    called_on = await consume_called_on(request.app.state.redis, agent_id, room_id)
+    hint = await consume_called_on(request.app.state.redis, agent_id, room_id)
     return TurnContextOut(
         agent_id=agent.id,
         agent_name=agent.name,
@@ -165,7 +163,8 @@ async def turn_context(
         room_mode=room_mode,
         agent_kind=agent.kind,
         agent_role=agent.role,
-        called_on=called_on,
+        called_on=hint is not None,
+        called_on_seq=hint,
     )
 
 
@@ -285,6 +284,21 @@ async def llm_call(
     return {"status": "ok"}
 
 
+@router.get("/authored-since")
+async def authored_since(
+    request: Request,
+    agent_id: UUID,
+    room_id: UUID,
+    host: Host = Depends(require_host),
+    since_seq: int = Query(default=0, ge=0),
+) -> dict[str, bool]:
+    await hosted_agent(request, host, agent_id, room_id)
+    found = await db.has_authored_since(
+        request.app.state.pool, agent_id, room_id, since_seq
+    )
+    return {"authored": found}
+
+
 @router.get("/last-read")
 async def get_last_read(
     request: Request,
@@ -360,25 +374,25 @@ async def decision(
     except db.NotFoundError as exc:
         raise HTTPException(status_code=404, detail=exc.detail) from exc
     if status == "won" and row.action == "call_on" and row.target_id is not None:
-        await request.app.state.scheduler.wake_one(
-            body.room_id, row.target_id, called_on=True
-        )
+        try:
+            await request.app.state.scheduler.wake_one(
+                body.room_id,
+                row.target_id,
+                called_on=True,
+                called_on_seq=row.trigger_seq,
+            )
+        except Exception:
+            # Row is committed; _undelivered_call_on redelivers on the
+            # next stall nudge if the target's last_read still trails.
+            logger.warning(
+                "on_call_on wake failed room=%s target=%s — fail-open",
+                body.room_id,
+                row.target_id,
+                exc_info=True,
+            )
     return RuntimeDecisionOut(
         status=status, action=row.action, target_id=row.target_id
     )
-
-
-@router.post("/seen")
-async def seen(
-    request: Request,
-    body: RuntimeSeenRequest,
-    host: Host = Depends(require_host),
-) -> dict[str, str]:
-    await hosted_agent(request, host, body.agent_id, body.room_id)
-    from brain.seen import record_seen
-
-    await record_seen(request.app.state.redis, body.agent_id, body.room_id, body.seq)
-    return {"status": "ok"}
 
 
 async def computer_ws(websocket: WebSocket, computer_id: UUID, token: str) -> None:

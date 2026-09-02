@@ -98,8 +98,8 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Inbox cursor for the Phase 1 turn stub. This is NOT the Redis
--- seen-cursor used later for freshness HOLD — do not merge the two.
+-- Inbox cursor. Freshness compares in-state seen_seq to rooms.last_seq;
+-- do not reuse this column as that high-water (it would drain the inbox).
 CREATE TABLE IF NOT EXISTS conversation_reads (
     agent_id UUID NOT NULL REFERENCES participants (id) ON DELETE CASCADE,
     room_id UUID NOT NULL REFERENCES rooms (id) ON DELETE CASCADE,

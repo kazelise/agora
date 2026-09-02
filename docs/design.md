@@ -2,6 +2,26 @@
 
 面向面试讲稿的底本。实现以本仓库代码为准；这里只写「为什么这样拆」，不写接口清单。
 
+## 这是什么 / 不是什么
+
+这是一个多 Agent 协调内核：共享房间当黑板，房间内单调无洞的 `seq`，原子 claim，事务内新鲜度（HOLD），逐字复读门，以及 moderated 房间里主持用 `decide` 点名 / 开口 / 沉默。它要证明的分层是——时间窗上的竞态交给代码算术，语义上的对错交给模型；失败模式必须 fail-open、有界、一眼能看懂。
+
+它不是一个带登录的产品，不是一个有真实工作负载的 Agent 运行时，也不是一份可水平扩展的多副本服务。没有前端；演示靠 CLI、日志和测试。OAuth、把 `reply` 换成「去查库 / 写代码」、两个 API 副本，都还没做，也不假装做了。
+
+## 四个会被问到的问题
+
+**为什么消息没有身份、`author_id` 是自报的？**
+当前任何知道房间 UUID 的调用都能填一个 `author_id` 发消息。这是单实例演示的边界，不是「忘了做自报校验」。真要做认证，门的是「这个凭证能不能用这个 `author_id` 发言 / 这台 Computer 能不能替这个 agent 跑 turn」，不是在正文里再签一次名。seq 和 claim 已经按行上的 `author_id` 裁判；公开 `POST /rooms/{id}/messages` 不带 `not_after_seq` 时完全绕过 freshness（自报身份的人帖没有 compose 窗口）。假身份是授权问题，不是协调问题——但 freshness 只约束带了 `not_after_seq` 的写（brain / `/runtime/reply`）。
+
+**为什么 agent 只有 `reply` / `claim` / `decide`，没有真实工作？**
+Agora 先把「谁该开口」做对。工具集是协调协议，不是 Agent 的工作本身。查数据库、写代码、调外部 API 可以接在同一张图后面，不必改 seq / claim / HOLD。这是内核加一份参考实现，不是「通用 Agent 框架」。
+
+**为什么用 LangGraph，而不是一个 while 循环？**
+图把 triage / tool_loop / freshness / commit 拆成可测节点，HOLD 是回边，账本按 `purpose` 拆得开。代价是真的：LangGraph 在节点间拷贝 channel 状态，曾经让 hold-token 的原地写变成死代码（flag 必须写进返回的 update 才看得到）。如果重来，一个显式的 async while 加上同样的四步会少一个框架陷阱，也会少掉 checkpointer 和递归上限这些现成轮子。留下图，是因为节点边界对测试和成本账仍然值回票价——同时把这个坑写在这里，不装没发生过。
+
+**为什么是单实例？两个 replica 会怎样？**
+四个状态活在进程里：Scheduler 的 per-agent lane 字典、`_called_on` 字典、ComputerHub 的 websocket presence、StallSweeper 的 `_declines`。两个副本会各跑各的车道、各记各的点名、各扫各的 stall，在线状态也对不上。要双副本，lane 合并和 called_on 得上 Redis（hint 已经覆盖了远端宿主那一半）、presence 上 Redis、declines 上 Redis，或者接受重复 nudge（decline cap 会偏松）。现在没做，是因为单进程已经能把协调不变量讲清楚。
+
 ## 问题是什么
 
 多个 Agent 和人待在同一间房里，每条新消息会叫醒一批 Agent。每个 Agent 独立读房间、独立决定要不要说话。失败只有两类，必须分开治：
@@ -29,21 +49,13 @@ UPDATE rooms SET last_seq = last_seq + 1 WHERE id = $1 RETURNING last_seq
 
 `UPDATE` 会锁住房间那一行，同一房间的并发插入被串行化；事务失败回滚时，`last_seq` 的加一也被撤掉，所以不会出现「占了号却没行」的空洞。这是后面 freshness 比较「我上次看到的 seq」和「现在房间最新 seq」的前提。
 
-## seen-cursor 为什么放 Redis，而且必须 fail-open
+## 新鲜度高水位为什么不能写进 conversation_reads
 
 Phase 2 的新鲜度门要用一个「这个 Agent 已经被出示到哪条 seq」的高水位，在它 compose 的窗口里如果有同伴抢先落地，INSERT 前把这次发送 HOLD 住。这个高水位 **不** 能写成 `conversation_reads` 上的一列。
 
-`conversation_reads.last_read_seq` 是 inbox 查询的游标（Phase 1 的 turn stub 已经在用）。如果 freshness 门也去改同一列，下一次拉 inbox 会把还没处理完的未读扫空——Agent 表面上在忙，实际上每次醒来都是空收件箱。任何和 inbox 游标共享状态的写法，结构上都不安全。
+`conversation_reads.last_read_seq` 是 inbox 查询的游标。如果 freshness 门也去改同一列，下一次拉 inbox 会把还没处理完的未读扫空——Agent 表面上在忙，实际上每次醒来都是空收件箱。任何和 inbox 游标共享状态的写法，结构上都不安全。权威在 Postgres：图状态里的 `seen_seq` 对 `rooms.last_seq`，事务内再比一次。
 
-Redis 在 Postgres 的事务图外面：
-
-- 不跟 inbox 那条 `SELECT` 抢同一行锁，热路径不会被协调信号堵住。
-- 单调写入用一段 Lua：`GET` + 仅当新值更大时 `SET`，并刷新 TTL。两个并发 `recordSeen` 一定收敛到较大的那个，不会回退。
-- TTL（分钟级，覆盖一次 compose 窗口即可）到期自动消失，不用扫表、不用迁移。
-
-它必须 **fail-open**：这是协调信号，不是正确性不变量。Redis 挂了或超时，最坏情况是少一次 HOLD、出现一次重复发言——那是我们想 *减少* 而不是 *保证消灭* 的故障。绝不能变成消息写不进去，或 turn 卡死等 Redis。上一种把游标放进 Postgres 的设计，失败模式是同步锁把 turn 堵住（fail-closed），比撞车更糟。
-
-Phase 1 里 Redis 只承担 pub/sub 叫醒。发布失败同样 fail-open：消息已经提交，丢一次叫醒只是少跑一轮 stub，不是丢数据。
+曾经在 Redis 另写一份 compose-window cursor（`agora:seen`），预留给「别的进程来问出示到哪」。落地之后零读者：本进程 freshness 不读它，BYOA / Job 走 `/runtime/reply` 的 409 也不读它。写而不读的协调信号是噪音，已经删掉。Redis 仍承担 pub/sub 叫醒、hold token、跨宿主的 `called_on` hint——那些是有读者的协调信号。pub/sub 和 hint 挂了是 fail-open（少一次叫醒或一次点名跳过 triage）；hold token 读不到是 fail-closed（确认作废，多一次 HOLD），和下面 freshness 一节一致。不是消息写不进去。
 
 ## 为什么 triage 必须交给小模型，而不是正则
 
@@ -84,7 +96,7 @@ flowchart LR
     Fresh[freshness 节点<br/>过期则 interrupt-HOLD]
   end
   PG[(Postgres<br/>消息/认领/checkpoint)]
-  RD[(Redis<br/>pub/sub + seen cursor)]
+  RD[(Redis<br/>pub/sub + hold token)]
   subgraph hosts [两种 Computer]
     K8sJob[云端: K8s Job]
     Daemon[BYOA daemon<br/>用户自己的 key]
@@ -110,19 +122,20 @@ flowchart LR
 |---|---|---|
 | `messages.seq` + `rooms.last_seq` | 房间内无洞序号 | 新鲜度比较的尺子 |
 | `conversation_reads` | Phase 1 inbox 游标 | **只** 服务「读到哪」；禁止拿去当 freshness 高水位 |
-| Redis seen-cursor（Phase 2） | compose 窗口高水位 | 抓抢答碰撞 |
+| Redis hold token / `called_on` hint | 确认 HOLD（fail-closed）；跨宿主点名 `trigger_seq`（fail-open） | 协调信号，失败模式见上 |
 | `claims`（Phase 2 写入） | `UNIQUE(room_id, task_key)` 原子认领 | 「选一个人」用数据库，不用 prompt |
 | `llm_calls`（Phase 2 写入） | 每次模型调用入账 | 面试能讲清成本，不是协调机制 |
 
 ## 阶段
 
 - **Phase 0–1：** 地基、设计文档、消息流、叫醒调度、测试。
-- **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；Redis seen-cursor + 代码节点 HOLD。
+- **Phase 2：** 同一张 LangGraph；小模型 triage；大模型 `reply` / `claim`；代码节点 HOLD（`seen_seq` 对 Postgres `last_seq`）。
 - **Phase 3（本仓库现在）：** 提交时事务内新鲜度校验；`task_key` 锚定到触发消息的 seq；计数游戏 / one-of-us 两条真模型协调测试。
 - **Phase 4b：** Computer 作为一等宿主；同一张图通过 `World` 接口换宿主；BYOA daemon 用自己的 key 跑，服务端零持有密钥。
 - **Phase 4c（本仓库现在）：** `computer_id` 为空的云端 turn 可以交给 Kubernetes Job；同一张图、HttpWorld、cluster token；车道仍在服务端合并叫醒。未开 k8s 时行为与 Phase 4b 完全一样。
 - **Phase 4a：** GitHub OAuth。做完再写进简历一项。
 - **Phase 7：** moderated 房间。叫醒路由是代码（模式 / `@Name` / 主持席），主持用同一张图上的 `decide` 做语义判断。
+- **Phase 7c：** 被点名成员的显式 pass、主持 `say` 非终结、subscriber / lane 崩溃约束、删掉无读者的 Redis seen-cursor。
 
 ## Phase 2：图怎么长，以及几件故意不放进 prompt 的事
 
@@ -157,7 +170,7 @@ HOLD 要拦的是「看过的状态」和「INSERT 成功」之间的时间窗�
 
 HOLD 时往对话里塞一条 **user-role** note（「你在写的时候房间里多了这些」）再回 tool_loop，让模型重新判。这是把 *新事实* 交给脑，不是用 prompt 去补锁。不用 system：有的 OpenAI 兼容后端不允许 system 出现在第 0 条以外，中间插入会 400。claim 的格式错误仍走 ToolMessage——那是协议上的工具回执，不能改角色。
 
-权威在 Postgres，不在 Redis。Redis 那份 seen-cursor 是给 *别的进程*（以后的 BYOA daemon）问「这个 agent 已经被出示到哪」用的；本进程的 freshness 节点不读它。Redis 挂了走 fail-open：当没这回事，最多少一次 HOLD，turn 照跑。
+权威在 Postgres，不在 Redis。本进程 freshness 比的是图状态里的 `seen_seq` 和 `rooms.last_seq`。Redis 挂了不影响这条比较；hold token 读不到则 fail-closed（确认作废，退回普通 HOLD）。
 
 freshness 节点是一次便宜的先检：读 `last_seq`，过期就不要去撞 commit。它不是不变量。先检和 INSERT 曾经是两步，中间留着一个窗口——同伴的行可以在「节点说还新鲜」之后、「INSERT 拿到行锁」之前落地。Phase 3 把检查收进 `insert_message` 同一段事务：先 `SELECT last_seq … FOR UPDATE`（锁住房间行），再比 `not_after_seq`（这次 turn 的 `seen_seq`），过期就抛 `StaleWriteError`、不插入；新鲜才加一并 INSERT。图的 commit 节点接到这个错，走和 freshness 同一条 HOLD 回边（`hold_count+1`，把新消息塞进对话，回 tool_loop；满 `MAX_HOLDS` 则 `held_exhausted`）。先检还在，用来少付一次注定要失败的提交；事务内那一次才是「窗口为零」的保证。
 
@@ -187,7 +200,7 @@ LLM 调用失败按 fail-open 处理：`triage` / `tool_loop` 里模型抛错就
 
 ## Phase 4b：World 是解耦缝，不是第二张图
 
-云端 turn 和 BYOA turn 必须是同一张 LangGraph。差别只在副作用从哪走、模型 key 谁拿。所以 Phase 4b 的承重重构是 `World`：图不再碰 asyncpg / Redis，只调用协议上的 `load_turn` / `insert_message` / `try_claim` / `record_llm_call` / `record_seen`。云端宿主给 `DirectWorld`（进程内池子，行为与 Phase 3 完全一样）；本地 daemon 给 `HttpWorld`（带着 pairing token 打 `/runtime/*`）。换宿主 = 换运输层，不换脑。
+云端 turn 和 BYOA turn 必须是同一张 LangGraph。差别只在副作用从哪走、模型 key 谁拿。所以 Phase 4b 的承重重构是 `World`：图不再碰 asyncpg / Redis，只调用协议上的 `load_turn` / `insert_message` / `try_claim` / `record_llm_call` / `record_decision`。云端宿主给 `DirectWorld`（进程内池子，行为与 Phase 3 完全一样）；本地 daemon 给 `HttpWorld`（带着 pairing token 打 `/runtime/*`）。换宿主 = 换运输层，不换脑。
 
 密钥不能过服务端。daemon 在自己的进程里用自己的 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 构造 `ChatOpenAI`。服务端 runtime 只收「用了哪个模型、多少 token、purpose 是 triage 还是 turn」——账本还是那一张 `llm_calls`，但行里没有 key。这是单账本不变量能同时罩住两种宿主的原因：usage 上报，凭据不上报。
 
@@ -318,10 +331,20 @@ open 房间是 peer bus：一条落地消息叫醒所有非作者 agent，碰撞
 
 **为什么 nudge 用游标补投丢失的 `call_on`。** 叫醒只在刚 `won` 的那一次打出；丢掉（离线宿主、进程重启、lane coalesce）之后，后续主持 turn 看到同一 `seen_seq` 只报 `decision_replayed`，不会再打。moderated 路由平时又只叫主持。stall nudge（`seq=None`）先读房间最新一条 `moderator_decisions`：若是 `call_on` 且目标的 `conversation_reads.last_read_seq < trigger_seq`，叫醒**那个目标**（`called_on=True`），而不是主持。这是已提交游标的比较，不是 outbox；目标真正跑过之后游标追上，不会再打。
 
-**为什么被 `call_on` 的成员跳过 triage，被 `@` 的不跳。** `call_on` 是主持已经做过的门控，再跑小模型是付第二次门的钱。旗标跟着 wake 走（WS / Redis hint / `Brain.run(called_on=)`），turn 上下文里 `response_mode=me`（「主持点你回应房间」）。`@Name` 只是正文里的协议令牌，证据弱于一条已经落库的主持决定，所以走普通 turn（含 triage）。
+**为什么被 `call_on` 的成员跳过 triage，被 `@` 的不跳。** `call_on` 是主持已经做过的门控，再跑小模型是付第二次门的钱。旗标跟着 wake 走，值是决策行的 `trigger_seq`（不是光 True）：进程内 `_called_on` 字典按 `(agent, room)` **取 max** 合并，由本机 lane 消费，DirectWorld **不读** Redis。Redis hint 只写给收不到进程内值的宿主——`computer_id` 有值走 Redis + WS（BYOA）；K8s Job 的 `run_turn` 也收不到字典（容器里 HttpWorld），所以 launcher 带 `remote_called_on_hint`，同样写 Redis，由 `/runtime/turn-context` 消费。同一条 in-process 叫醒不写 Redis，避免 coalesce 只弹出字典、留下 600s 的陈旧 hint，把下一轮普通 turn 误判成点名。`@Name` 只是正文里的协议令牌，证据弱于一条已经落库的主持决定，所以走普通 turn（含 triage）。
 
 **为什么不需要 floor lease。** 元桌用「地板租约」防止两个人同时开口。Agora 已经有 freshness（房间前进则 HOLD）和 verbatim-dup（逐字复读 409）。`call_on` 的回复和一条并发的 `@` 回复是同一类碰撞：先落地的那条把后者挡住，脑在同一轮重判。再加一把租约是用代码复述已经存在的裁判。
 
 循环上限照旧是计数：主持 stretch 超过 `AGENT_LOOP_CAP × agent数` 则确定性 `silence`，零次模型调用。`call_on` 到的成员沿用原来的 `skipped` 行为。
 
-digest 补上决策时间线：moderated 房间在 transcript 和 claims 之间渲染 `moderator_decisions`（trigger_seq / action / target / created_at），仍是零模型调用的纯格式化；open 房间整节省略。真模型测试把「恰好一人被点名作答」和「@ 直通」钉成不变量——算术对成绩单和决策表，不分类措辞。
+digest 补上决策时间线：moderated 房间在 transcript 和 claims 之间渲染 `moderator_decisions`（trigger_seq / action / target / created_at），仍是零模型调用的纯格式化；open 房间整节省略。真模型测试把「成员消息对应某次 call_on 或 @mention」和「@ 直通」钉成机制不变量——人数是模型行为，不是代码保证。
+
+### Phase 7c：活性与崩溃约束
+
+**Pass 协议。** 被 `call_on` 的成员若模型选择不说（`skipped` 或 `hop_exhausted`），**且** 该成员没有 `seq > trigger_seq` 的已落库消息，宿主代发一条 `{agent_name} passes.`。必须是消息：要推进 seq、排除作者后叫醒主持、让 digest 看见谁弃权。名字写进正文，因为 verbatim-dup 只跟最新 *他人* 消息比——光写 `(pass)`，第二个弃权者会被 409，死锁重来。已经在 trigger 之后说过的（慢 turn 被 stall 补投、或同一轮 `say @Name` 再 `call_on`）不发 pass。`llm_error` 不是弃权：游标不推进，下一次 stall nudge 的 `_undelivered_call_on` 按已有算术补投。loop-cap 的 `skipped` 走 `run()` 早退，不发 pass（整屋静音，不是这一轮的模型拒绝）。pass 计入 agent-only 循环上限——主持轮询、人人弃权，必须有界。
+
+**silence 钉在 last_seq 则不再 nudge 主持。** stall 的 `seq=None` 路径：最新决策是 `silence` 且 `trigger_seq == rooms.last_seq` 时，没人欠一句，返回 `[]`。否则会把主持叫醒，`call_on` 撞 already_decided，`say` 的决策行被 silence 挡住，空烧三次 nudge。
+
+**`say` 非终结。** 主持的 `say` 落地后回到工具循环，同一轮只在 `call_on` 或 `silence` 结束。`_commit` 已在原 trigger N 写下 say 行并把 `seen_seq` 推到 say 自己的 seq，随后的 `call_on` 自然记在 N+1，不要回写 N（唯一键冲突会变成 `already_decided`）。`MODERATOR_SAY_BUDGET = 1`：第二次 say 是 ToolMessage，不是再发一条。不靠 hop 预算——HOLD 会把 `hop_count` 清零，有效上限会变成 18 跳；dup 门也不拦同作者重复。作者仍不会被自己的消息叫醒。
+
+**崩溃约束。** `run_subscriber` 第一次 subscribe 失败直接抛，启动失败而不是挂在 `ready.wait()`；成功之后才外层重连（重建 pubsub、再订阅；每次成功订阅后 delay 归零，再指数退避封顶几秒）。`finally` 只 `aclose()` pubsub，不 `unsubscribe`（死连接上那一下会卡住停机）。单条 dispatch 异常打日志、继续听。`AgentLane._loop` 吞掉单轮异常，继续消费 `_pending`（原有的至多一次合并语义）。lifespan 给 subscriber 和 stall sweeper 各挂一个 done-callback：异常退出（不是 CancelledError、不是干净停）打 `critical`。`record_decision` 的 `on_call_on` wake fail-open——行已经提交，叫醒失败由 `_undelivered_call_on` 在下次 nudge 补投。

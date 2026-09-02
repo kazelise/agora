@@ -266,8 +266,12 @@ JULES_DESIGN = (
 async def test_moderated_one_call_one_answer(
     live: tuple[FastAPI, httpx.AsyncClient],
 ) -> None:
-    """Moderated room: exactly one member replies, and that member was
-    called on. Moderator say is unbounded; we never classify wording."""
+    """Moderated room: every member message corresponds to a call_on.
+
+    The correspondence is a code invariant (routing). The count is
+    model behavior: the Chair may legitimately call on a second member,
+    so we require at least one member message, not exactly one.
+    """
     app, client = live
     room = (
         await client.post("/rooms", json={"name": "moderated-one", "mode": "moderated"})
@@ -305,8 +309,10 @@ async def test_moderated_one_call_one_answer(
     listed = await _wait_quiescent(app, client, room_id)
     member_msgs = [m for m in listed if m["author_id"] in member_ids]
     transcript = [(m["seq"], m["author_id"][:8], m["body"]) for m in listed]
-    assert len(member_msgs) == 1, (
-        f"expected exactly one member message, got {len(member_msgs)}: "
+    # Mechanism: >= 1 member post. Count beyond that is the Chair's
+    # choice, not a kernel invariant.
+    assert len(member_msgs) >= 1, (
+        f"expected at least one member message, got {len(member_msgs)}: "
         f"{transcript!r}"
     )
 

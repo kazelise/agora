@@ -645,6 +645,25 @@ async def get_last_read(pool: asyncpg.Pool, agent_id: UUID, room_id: UUID) -> in
     return int(value) if value is not None else 0
 
 
+async def has_authored_since(
+    pool: asyncpg.Pool, author_id: UUID, room_id: UUID, since_seq: int
+) -> bool:
+    """True if this author has a committed message with seq > since_seq."""
+    return bool(
+        await pool.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM messages
+                WHERE room_id = $1 AND author_id = $2 AND seq > $3
+            )
+            """,
+            room_id,
+            author_id,
+            since_seq,
+        )
+    )
+
+
 async def get_room_last_seq(pool: asyncpg.Pool, room_id: UUID) -> int:
     value = await pool.fetchval("SELECT last_seq FROM rooms WHERE id = $1", room_id)
     if value is None:

@@ -19,7 +19,7 @@ flowchart LR
     Fresh[freshness 节点<br/>过期则 interrupt-HOLD]
   end
   PG[(Postgres<br/>消息/认领/checkpoint)]
-  RD[(Redis<br/>pub/sub + seen cursor)]
+  RD[(Redis<br/>pub/sub + hold token)]
   subgraph hosts [两种 Computer]
     K8sJob[云端: K8s Job]
     Daemon[BYOA daemon<br/>用户自己的 key]
@@ -128,7 +128,7 @@ uv run pytest -m "not llm"    # mock 模型，不打中继（GitHub Actions 也�
 uv run pytest -m llm          # 真中继：计数游戏 + one-of-us + moderated 点名/@ 直通（需要上面的 OPENAI_*）
 ```
 
-`test_coalesce`、Job manifest / launcher 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_seen` / `test_k8s` 的 runtime 用例 / `test_hardening`（hold token、verbatim-dup、循环上限、digest）需要 Postgres + Redis。`-m "not llm"` 全部 mock 模型；push 到 `main` 和 pull_request 上 GitHub Actions 也跑这一条（服务容器里的 Postgres 16 / Redis 7，DSN 走环境变量）。`-m llm` 打真实中继，未设置 `OPENAI_BASE_URL` 或中继不可达时会 skip。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
+`test_coalesce`、Job manifest / launcher 和模型策略测试不需要外部服务。`test_seq` 需要 Postgres；`test_wake` / `test_brain` / `test_k8s` 的 runtime 用例 / `test_hardening`（hold token、verbatim-dup、循环上限、digest）需要 Postgres + Redis。`-m "not llm"` 全部 mock 模型；push 到 `main` 和 pull_request 上 GitHub Actions 也跑这一条（服务容器里的 Postgres 16 / Redis 7，DSN 走环境变量）。`-m llm` 打真实中继，未设置 `OPENAI_BASE_URL` 或中继不可达时会 skip。conftest 在连不上时会尝试 `docker compose up`；若 Docker 也不可用，集成测试会被 skip。
 
 ## 房间 digest
 

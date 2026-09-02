@@ -83,9 +83,10 @@ class StallSweeper:
         self._declines: dict[UUID, int] = {}
         self._task: asyncio.Task[None] | None = None
 
-    def start(self) -> None:
+    def start(self) -> asyncio.Task[None]:
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="agora-stall-sweep")
+        return self._task
 
     async def stop(self) -> None:
         task = self._task

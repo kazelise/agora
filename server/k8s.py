@@ -193,6 +193,9 @@ def job_finished(status: dict[str, Any] | None) -> str | None:
 
 
 class K8sJobLauncher:
+    # Job process talks HttpWorld and cannot see Scheduler's dict.
+    remote_called_on_hint = True
+
     def __init__(
         self,
         settings: Settings,

@@ -103,7 +103,7 @@ class Daemon:
         self._pacer = pacer
         self._limiter = limiter
         self._lanes: dict[UUID, AgentLane] = {}
-        self._called_on: dict[tuple[UUID, UUID], bool] = {}
+        self._called_on: dict[tuple[UUID, UUID], int] = {}
         self._owns_http = http is None
 
     def _lane(self, agent_id: UUID) -> AgentLane:
@@ -115,9 +115,14 @@ class Daemon:
 
     async def _run_turn(self, agent_id: UUID, room_id: UUID) -> None:
         assert self._brain is not None
-        called_on = self._called_on.pop((agent_id, room_id), False)
+        called_on_seq = self._called_on.pop((agent_id, room_id), None)
         try:
-            result = await self._brain.run(agent_id, room_id, called_on=called_on)
+            result = await self._brain.run(
+                agent_id,
+                room_id,
+                called_on=called_on_seq is not None,
+                called_on_seq=called_on_seq,
+            )
         except Exception:
             logger.exception("turn failed agent=%s room=%s", agent_id, room_id)
             return
@@ -133,14 +138,20 @@ class Daemon:
             agent_id = UUID(data["agent_id"])
             room_id = UUID(data["room_id"])
             key = (agent_id, room_id)
-            self._called_on[key] = self._called_on.get(key, False) or bool(
-                data.get("called_on")
-            )
+            raw_seq = data.get("called_on_seq")
+            if raw_seq is not None:
+                incoming = int(raw_seq)
+            elif data.get("called_on"):
+                incoming = 1
+            else:
+                incoming = None
+            if incoming is not None:
+                self._called_on[key] = max(self._called_on.get(key, 0), incoming)
             logger.info(
-                "wake agent=%s room=%s called_on=%s",
+                "wake agent=%s room=%s called_on_seq=%s",
                 agent_id,
                 room_id,
-                self._called_on[key],
+                self._called_on.get(key),
             )
             overwritten = await self._lane(agent_id).notify(room_id, agent_id)
             if overwritten is not None:
