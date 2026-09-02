@@ -30,7 +30,13 @@ from server.models import (
     RoomOut,
 )
 from server.runtime import computer_ws, router as runtime_router
-from server.scheduler import Scheduler, TurnFn, fanout_message, run_subscriber
+from server.scheduler import (
+    Scheduler,
+    TurnFn,
+    fanout_message,
+    log_unexpected_task_exit,
+    run_subscriber,
+)
 from server.stall import StallSweeper
 
 
@@ -122,17 +128,41 @@ def create_app(
                 redis_client=publisher,
             )
 
-            async def on_call_on(room_id: UUID, target_id: UUID) -> None:
-                await scheduler.wake_one(room_id, target_id, called_on=True)
+            async def on_call_on(
+                room_id: UUID, target_id: UUID, trigger_seq: int = 0
+            ) -> None:
+                await scheduler.wake_one(
+                    room_id,
+                    target_id,
+                    called_on=True,
+                    called_on_seq=trigger_seq or None,
+                )
 
             turn_fn.world.on_call_on = on_call_on
 
-        stalls.start()
+        sweep_task = stalls.start()
 
         ready = asyncio.Event()
         stop = asyncio.Event()
-        task = asyncio.create_task(run_subscriber(subscriber, scheduler, ready, stop))
-        await ready.wait()
+        task = asyncio.create_task(
+            run_subscriber(subscriber, scheduler, ready, stop),
+            name="agora-wake-subscriber",
+        )
+        task.add_done_callback(log_unexpected_task_exit)
+        sweep_task.add_done_callback(log_unexpected_task_exit)
+        ready_wait = asyncio.create_task(ready.wait())
+        done, _pending = await asyncio.wait(
+            {ready_wait, task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if not ready.is_set():
+            ready_wait.cancel()
+            if task.done() and not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+            raise RuntimeError("wake subscriber exited before ready")
+        if not ready_wait.done():
+            ready_wait.cancel()
 
         app.state.settings = cfg
         app.state.pool = pool

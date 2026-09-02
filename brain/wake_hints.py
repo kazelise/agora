@@ -1,9 +1,12 @@
 """Per-wake `called_on` hint: a call_on is a protocol fact, not inbox mail.
 
-A member woken by the moderator's decide(call_on) must skip triage. The
-flag rides the wake (WS payload / in-process lane) and is also parked
-in Redis so a host that only calls `Brain.run(agent, room)` — K8s Job,
-a daemon that missed the frame field — still sees it on load_turn.
+A member woken by the moderator's decide(call_on) must skip triage.
+The hint carries the decision's trigger_seq so a later turn can tell
+whether this agent has already spoken since being called.
+
+It is parked in Redis only for hosts that cannot receive the in-process
+value — BYOA daemons and K8s Jobs. In-process lanes use Scheduler's
+dict and never write or read this key.
 
 Fail-open: Redis down means the hint is lost and the member runs a
 normal turn (triage included). That is a weaker skip, not a blocked
@@ -23,28 +26,44 @@ TTL_SECONDS = 600
 KEY_PREFIX = "agora:called_on"
 
 
-def _key(agent_id: UUID, room_id: UUID) -> str:
+def hint_key(agent_id: UUID, room_id: UUID) -> str:
     return f"{KEY_PREFIX}:{agent_id}:{room_id}"
 
 
-async def set_called_on(redis: object, agent_id: UUID, room_id: UUID, called_on: bool) -> None:
-    # False must not erase a pending True (OR-merge with the in-process
-    # flag). Only a consume after the turn, or TTL, drops the hint.
-    if redis is None or not called_on:
+async def set_called_on(
+    redis: object, agent_id: UUID, room_id: UUID, trigger_seq: int
+) -> None:
+    # Max-merge: a later call_on must not be erased by an earlier one.
+    # Only a consume after the turn, or TTL, drops the hint.
+    if redis is None or trigger_seq <= 0:
         return
-    key = _key(agent_id, room_id)
+    key = hint_key(agent_id, room_id)
     try:
-        await redis.set(key, "1", ex=TTL_SECONDS)  # type: ignore[union-attr]
+        raw = await redis.get(key)  # type: ignore[union-attr]
+        current = int(raw) if raw is not None else 0
+        if trigger_seq > current:
+            await redis.set(key, str(trigger_seq), ex=TTL_SECONDS)  # type: ignore[union-attr]
+        elif current > 0:
+            await redis.expire(key, TTL_SECONDS)  # type: ignore[union-attr]
     except Exception:
         logger.warning("called_on hint write failed — fail-open", exc_info=True)
 
 
-async def consume_called_on(redis: object, agent_id: UUID, room_id: UUID) -> bool:
+async def consume_called_on(
+    redis: object, agent_id: UUID, room_id: UUID
+) -> int | None:
+    """Return the parked trigger_seq, or None if unset / Redis failed."""
     if redis is None:
-        return False
+        return None
     try:
-        value = await redis.getdel(_key(agent_id, room_id))  # type: ignore[union-attr]
-        return bool(value)
+        value = await redis.getdel(hint_key(agent_id, room_id))  # type: ignore[union-attr]
     except Exception:
         logger.warning("called_on hint read failed — fail-open", exc_info=True)
-        return False
+        return None
+    if value is None:
+        return None
+    try:
+        seq = int(value)
+    except (TypeError, ValueError):
+        return None
+    return seq if seq > 0 else None

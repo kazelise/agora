@@ -38,6 +38,10 @@ CLAIM_OBLIGATION_HOPS = 1
 # rounds (x agent count) without a human is stale by count. The small
 # model is still the primary wind-down; this is the deterministic floor.
 AGENT_LOOP_CAP = 4
+# One say per moderator turn. HOLD resets hop_count, so hop budget
+# cannot bound repeated says; the verbatim-dup gate also ignores
+# same-author repeats. A second say is a ToolMessage, not a post.
+MODERATOR_SAY_BUDGET = 1
 # Messages of recent room history shown to triage on a PROACTIVE turn
 # (stall nudge: the inbox itself is empty — the agent already read
 # everything). A bounded tail, not the whole room, keeps the prompt small.
@@ -61,6 +65,11 @@ DUPLICATE_REPLY_ERROR = (
 DECIDE_TARGET_ERROR = (
     "decide rejected: target must be the name of an agent member "
     "in this room other than yourself. Retry with that name."
+)
+
+MODERATOR_SAY_ERROR = (
+    "decide rejected: say already used this turn. "
+    "call_on a member or silence."
 )
 
 MODERATION_NOTE = (
@@ -140,6 +149,8 @@ class BrainState(TypedDict, total=False):
     moderate: bool
     called_on: bool
     moderation_nudged: bool
+    moderator_says: int
+    said_body: str
 
 
 @tool
@@ -167,11 +178,12 @@ def decide(
     target: str = "",
     body: str = "",
 ) -> str:
-    """Return exactly one moderation decision.
+    """Return a moderation decision.
 
-    call_on: target is an agent member's name. say: body is posted to
-    the room through the ordinary reply path. silence: end without a
-    message.
+    call_on: target is an agent member's name; ends the turn.
+    say: body is posted through the ordinary reply path and does not
+    end the turn — follow with call_on or silence. One say per turn.
+    silence: end without calling on anyone.
     """
     return action
 
@@ -182,6 +194,16 @@ MODERATOR_TOOLS = [decide]
 
 @dataclass(frozen=True)
 class TurnResult:
+    """Result of one brain turn.
+
+    `outcome` is why the turn ended. A moderator turn that posted a
+    `say` mid-turn still reports the *final* decision (`moderated_call`
+    / `moderated_silence` / ...) and puts the said text in `reply_body`
+    (or None if the moderator never said). A member who did not reply
+    also has `reply_body` None. A member reply keeps
+    `outcome="replied"` and `reply_body` the post.
+    """
+
     agent_id: UUID
     agent_name: str
     room_id: UUID
@@ -284,11 +306,11 @@ def _moderator_prompt(state: BrainState) -> str:
     return (
         f"You are {state['agent_name']}, the moderator of this room. "
         f"{state.get('persona') or ''}\n\n"
-        "You never answer substantive questions yourself. Each wake you "
-        "return exactly one decision via the decide tool.\n"
+        "You never answer substantive questions yourself. "
+        "say posts one short line and does not end the turn; "
+        "then you must call_on or silence. A second say is rejected.\n"
         "call_on the seat best able to advance the discussion; "
-        "say a short line only when the table needs the moderator's own "
-        "voice; silence when nothing is owed.\n"
+        "silence when nothing is owed.\n"
         "Free text without a decide call is not a valid moderation turn.\n\n"
         f"Seats: {seats}\n\n"
         f"Room:\n{_format_inbox(state.get('inbox') or [])}\n"
@@ -498,7 +520,11 @@ class Brain:
         return "tool_loop"
 
     def _after_commit(self, state: BrainState) -> str:
-        if state.get("outcome") in {"held_exhausted", "replied"}:
+        if state.get("outcome") == "held_exhausted":
+            return END
+        # A member reply ends the turn. A moderator say does not: the
+        # same turn continues until call_on or silence.
+        if state.get("outcome") == "replied" and not state.get("moderate"):
             return END
         return "tool_loop"
 
@@ -670,6 +696,18 @@ class Brain:
         elif action == "say" and not body.strip():
             after.append(
                 ToolMessage(content="empty body ignored", tool_call_id=call_id)
+            )
+            return {
+                "messages": after,
+                "hop_count": hop,
+                "pending_reply": "",
+            }
+        elif (
+            action == "say"
+            and int(state.get("moderator_says") or 0) >= MODERATOR_SAY_BUDGET
+        ):
+            after.append(
+                ToolMessage(content=MODERATOR_SAY_ERROR, tool_call_id=call_id)
             )
             return {
                 "messages": after,
@@ -922,7 +960,6 @@ class Brain:
                 + "\n".join(lines)
             )
         )
-        await self.world.record_seen(UUID(state["agent_id"]), room_id, latest)
         # Arm the hold token: the HELD envelope showed this agent state up
         # to `latest`, so a later send_anyway THIS TURN may ack exactly that.
         if self._hold_redis is not None:
@@ -1036,14 +1073,33 @@ class Brain:
             await self.on_committed(row)
         if state.get("moderate"):
             # Row after the message: the trigger stays open if we crash
-            # between insert and here; the next wake re-decides.
-            await self.world.record_decision(
+            # between insert and here; the next wake re-decides. seen_seq
+            # advances to the say, so a later call_on records at N+1.
+            recorded = await self.world.record_decision(
                 UUID(state["room_id"]),
                 UUID(state["agent_id"]),
                 int(state["seen_seq"]),
                 "say",
                 None,
             )
+            if recorded.status == "already_decided":
+                logger.info(
+                    "say landed but decision row blocked room=%s trigger=%s",
+                    state["room_id"],
+                    state["seen_seq"],
+                )
+            if self._hold_redis is not None:
+                await clear_hold(
+                    self._hold_redis, UUID(state["agent_id"]), UUID(state["room_id"])
+                )
+            logger.info("commit %s seq=%s", state["agent_name"], row.seq)
+            return {
+                "outcome": "",
+                "pending_reply": "",
+                "seen_seq": int(row.seq),
+                "said_body": body,
+                "moderator_says": int(state.get("moderator_says") or 0) + 1,
+            }
         if self._hold_redis is not None:
             await clear_hold(
                 self._hold_redis, UUID(state["agent_id"]), UUID(state["room_id"])
@@ -1077,6 +1133,38 @@ class Brain:
                     key,
                     agent_name,
                 )
+
+    async def _post_called_on_pass(
+        self,
+        agent_id: UUID,
+        agent_name: str,
+        room_id: UUID,
+        seen_seq: int,
+    ) -> WorldMessage | None:
+        """Land an explicit pass so a silent called-on member advances seq.
+
+        The body includes the author name because the verbatim-dup gate
+        compares against the latest other-author message: a bare pass
+        from a second member would collide and recreate the deadlock.
+        DirectWorld has no server-side fan-out, so a landed pass must
+        fire on_committed exactly like _commit; HttpWorld's /runtime/reply
+        already fans out. A stale pass (room moved past seen_seq) or a
+        verbatim-dup against the latest peer drops silently — the
+        moderator is woken by whatever landed.
+        """
+        try:
+            row = await self.world.insert_message(
+                room_id,
+                agent_id,
+                f"{agent_name} passes.",
+                not_after_seq=seen_seq,
+            )
+        except (StaleWrite, DuplicateReply):
+            return None
+        if self.on_committed is not None:
+            await self.on_committed(row)
+        logger.info("pass %s seq=%s (called-on decline)", agent_name, row.seq)
+        return row
 
     def _loop_cap_reason(self, stretch: int, agent_count: int) -> str:
         return (
@@ -1113,9 +1201,16 @@ class Brain:
         )
 
     async def run(
-        self, agent_id: UUID, room_id: UUID, *, called_on: bool = False
+        self,
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
     ) -> TurnResult:
-        ctx = await self.world.load_turn(agent_id, room_id)
+        ctx = await self.world.load_turn(
+            agent_id, room_id, called_on_seq=called_on_seq
+        )
         names = {str(p.id): p.name for p in ctx.participants}
         inbox: list[InboxItem] = [
             {
@@ -1168,14 +1263,15 @@ class Brain:
                     reply_body=None,
                 )
 
-        # Inbox is about to be shown to the model — high-water goes to Redis.
-        await self.world.record_seen(agent_id, room_id, seen_seq)
         agent_count = sum(1 for p in ctx.participants if p.kind == "agent")
         stretch = int(ctx.agent_only_stretch)
         is_moderator = (
             ctx.room_mode == "moderated" and ctx.agent.role == "moderator"
         )
-        called_on = bool(called_on or ctx.called_on)
+        trigger = (
+            called_on_seq if called_on_seq is not None else ctx.called_on_seq
+        )
+        called_on = bool(called_on or trigger is not None)
         # Counting, not classification: the same stretch cap as triage,
         # applied here so skip-triage paths (moderator / call_on) still
         # hit the floor without a model call.
@@ -1244,6 +1340,8 @@ class Brain:
             "moderate": is_moderator,
             "called_on": called_on,
             "moderation_nudged": False,
+            "moderator_says": 0,
+            "said_body": "",
         }
         final: dict[str, Any]
         try:
@@ -1267,17 +1365,45 @@ class Brain:
                 await clear_hold(self._hold_redis, agent_id, room_id)
             raise
         last_read = int(final.get("seen_seq") or seen_seq)
-        await self.world.set_last_read(agent_id, room_id, last_read)
         claims = tuple(
             (item["task_key"], item["result"]) for item in (final.get("claims") or [])
         )
         outcome = str(final.get("outcome") or "skipped")
-        reply = final.get("pending_reply") or None
-        if outcome != "replied":
+        said = str(final.get("said_body") or "")
+        if outcome == "replied":
+            reply = final.get("pending_reply") or None
+        elif is_moderator:
+            reply = said or None
+        else:
             reply = None
             await self._release_unfulfilled(
                 agent_id, room_id, ctx.agent.name, final.get("claims") or []
             )
+        # A called-on llm_error is not a decline: leave last_read behind
+        # so _undelivered_call_on redelivers on the next stall nudge.
+        # Loop-cap mute returns earlier and never reaches this wrap-up,
+        # so it cannot be confused with a model skip.
+        if called_on and outcome == "llm_error":
+            pass
+        else:
+            if called_on and outcome in {"skipped", "hop_exhausted"}:
+                floor = trigger if trigger is not None else 0
+                already = await self.world.has_authored_since(
+                    agent_id, room_id, floor
+                )
+                if already:
+                    logger.info(
+                        "skip pass %s — already spoken since trigger %s",
+                        ctx.agent.name,
+                        floor,
+                    )
+                else:
+                    landed = await self._post_called_on_pass(
+                        agent_id, ctx.agent.name, room_id, last_read
+                    )
+                    if landed is not None:
+                        last_read = landed.seq
+            await self.world.set_last_read(agent_id, room_id, last_read)
         # A token outlives only a COMMITTED send (which cleared it in
         # _commit). Any other ending — skipped, held_exhausted, llm_error,
         # crash — must drop it, or the 2-minute TTL window lets a future
@@ -1326,9 +1452,18 @@ def make_turn_fn(
     )
 
     async def run(
-        agent_id: UUID, room_id: UUID, *, called_on: bool = False
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
     ) -> TurnResult:
-        return await brain.run(agent_id, room_id, called_on=called_on)
+        return await brain.run(
+            agent_id,
+            room_id,
+            called_on=called_on,
+            called_on_seq=called_on_seq,
+        )
 
     run.world = world  # type: ignore[attr-defined]
     run.brain = brain  # type: ignore[attr-defined]

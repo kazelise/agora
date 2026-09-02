@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from uuid import UUID, uuid4
 
@@ -11,14 +12,22 @@ import httpx
 import pytest
 import redis.asyncio as redis
 
-from brain.graph import DECIDE_TARGET_ERROR, MODERATION_NOTE, Brain
+import brain.graph as graph_mod
+from brain.graph import (
+    DECIDE_TARGET_ERROR,
+    MODERATION_NOTE,
+    MODERATOR_SAY_ERROR,
+    Brain,
+)
+from brain.wake_hints import consume_called_on, hint_key
 from brain.world_direct import DirectWorld
 from server import db
+from server.digest import build_room_digest
 from server.main import create_app
 from server.mentions import mentioned_name
 from server.scheduler import Scheduler
 from tests.conftest import DSN, REDIS_URL
-from tests.fakes import ScriptedChatModel, text_message, tool_call
+from tests.fakes import ScriptedChatModel, text_message, tool_call, triage_message
 
 
 @pytest.fixture
@@ -368,6 +377,7 @@ async def test_say_goes_through_freshness_hold(
         [
             first_say,
             tool_call("decide", {"action": "say", "body": "welcome, after hold"}),
+            tool_call("decide", {"action": "silence"}),
         ]
     )
     brain = Brain(
@@ -377,8 +387,9 @@ async def test_say_goes_through_freshness_hold(
 
     assert result.hold_count == 1
     # HOLD advances seen_seq, so the retry is a new trigger — the gate
-    # still fired, and the first raced body never landed.
-    assert result.outcome == "replied"
+    # still fired, and the first raced body never landed. say is
+    # non-terminal: the turn ends on silence, reply_body is the said text.
+    assert result.outcome == "moderated_silence"
     assert result.reply_body == "welcome, after hold"
     second_prompt = " ".join(
         str(getattr(m, "content", "")) for m in big.calls[1]
@@ -389,8 +400,8 @@ async def test_say_goes_through_freshness_hold(
     assert "welcome, after hold" in stored
     assert "Iris slipped in" in stored
     rows = await _decisions(pool, room_id)
-    assert len(rows) == 1
-    assert rows[0]["action"] == "say"
+    assert [r["action"] for r in rows] == ["say", "silence"]
+    assert rows[0]["trigger_seq"] < rows[1]["trigger_seq"]
 
 
 @pytest.mark.asyncio
@@ -611,6 +622,7 @@ async def test_http_world_decision_wakes_byoa_target_over_ws(
             "agent_id": iris["id"],
             "room_id": room["id"],
             "called_on": True,
+            "called_on_seq": 1,
         }
         await app.state.scheduler.wait_idle()
         assert all(
@@ -815,6 +827,7 @@ async def test_crashed_say_leaves_trigger_open(
         [
             tool_call("decide", {"action": "say", "body": "welcome everyone"}),
             tool_call("decide", {"action": "say", "body": "welcome everyone"}),
+            tool_call("decide", {"action": "silence"}),
         ]
     )
     brain = Brain(world, small_model=ScriptedChatModel(), big_model=big)
@@ -823,10 +836,10 @@ async def test_crashed_say_leaves_trigger_open(
     assert await _decisions(pool, room_id) == []
 
     result = await brain.run(chair_id, room_id)
-    assert result.outcome == "replied"
+    assert result.outcome == "moderated_silence"
+    assert result.reply_body == "welcome everyone"
     rows = await _decisions(pool, room_id)
-    assert len(rows) == 1
-    assert rows[0]["action"] == "say"
+    assert [r["action"] for r in rows] == ["say", "silence"]
     stored = [m.body for m in await db.list_messages(pool, room_id)]
     assert stored.count("welcome everyone") == 1
 
@@ -886,9 +899,18 @@ async def test_dispatch_call_on_runs_target_via_real_wake(
     brains: dict[UUID, Brain] = {}
 
     async def run_turn(
-        agent_id: UUID, room_id: UUID, *, called_on: bool = False
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
     ) -> object:
-        return await brains[agent_id].run(agent_id, room_id, called_on=called_on)
+        return await brains[agent_id].run(
+            agent_id,
+            room_id,
+            called_on=called_on,
+            called_on_seq=called_on_seq,
+        )
 
     app = create_app(run_turn=run_turn)
     async with app.router.lifespan_context(app):
@@ -929,8 +951,12 @@ async def test_dispatch_call_on_runs_target_via_real_wake(
             iris_id = UUID(iris["id"])
             room_id = UUID(room["id"])
 
-            async def on_call_on(rid: UUID, tid: UUID) -> None:
-                await app.state.scheduler.wake_one(rid, tid, called_on=True)
+            async def on_call_on(
+                rid: UUID, tid: UUID, trigger_seq: int = 0
+            ) -> None:
+                await app.state.scheduler.wake_one(
+                    rid, tid, called_on=True, called_on_seq=trigger_seq or None
+                )
 
             chair_small = ScriptedChatModel()
             chair_big = ScriptedChatModel(
@@ -981,3 +1007,752 @@ async def test_dispatch_call_on_runs_target_via_real_wake(
             assert iris_big.bound_tools == ["reply", "claim"]
             stored = await db.list_messages(app.state.pool, room_id)
             assert any(m.body == "Iris via wake" for m in stored)
+
+
+# ── Phase 7c: called-on decline is an explicit pass ──────────────────────
+
+
+class _BoomModel:
+    def __init__(self) -> None:
+        self.calls: list[list] = []
+        self.bound_tools: list[str] = []
+
+    def bind_tools(self, _tools: object, **_kwargs: object) -> _BoomModel:
+        return self
+
+    async def ainvoke(self, messages: list, **_kwargs: object) -> object:
+        self.calls.append(list(messages))
+        raise RuntimeError("relay 400: Bad Request")
+
+
+@pytest.mark.asyncio
+async def test_called_on_decline_posts_pass_and_moderator_redirects(
+    require_services: None,
+) -> None:
+    """call_on Iris → Iris declines → `Iris passes.` lands → Chair is
+    woken on the new seq and can call_on Marcus. Scheduler/lane path,
+    not a manual Brain.run for the redirect."""
+    brains: dict[UUID, Brain] = {}
+
+    async def run_turn(
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
+    ) -> object:
+        return await brains[agent_id].run(
+            agent_id,
+            room_id,
+            called_on=called_on,
+            called_on_seq=called_on_seq,
+        )
+
+    app = create_app(run_turn=run_turn)
+    async with app.router.lifespan_context(app):
+        await db.truncate_all(app.state.pool)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            room = (
+                await client.post(
+                    "/rooms", json={"name": "pass-rt", "mode": "moderated"}
+                )
+            ).json()
+            human = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={"kind": "human", "name": "Ada"},
+                )
+            ).json()
+            chair = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={
+                        "kind": "agent",
+                        "name": "Chair",
+                        "role": "moderator",
+                    },
+                )
+            ).json()
+            iris = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={"kind": "agent", "name": "Iris"},
+                )
+            ).json()
+            marcus = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={"kind": "agent", "name": "Marcus"},
+                )
+            ).json()
+            chair_id = UUID(chair["id"])
+            iris_id = UUID(iris["id"])
+            marcus_id = UUID(marcus["id"])
+            room_id = UUID(room["id"])
+
+            async def on_call_on(
+                rid: UUID, tid: UUID, trigger_seq: int = 0
+            ) -> None:
+                await app.state.scheduler.wake_one(
+                    rid, tid, called_on=True, called_on_seq=trigger_seq or None
+                )
+
+            async def on_committed(row: object) -> None:
+                await app.state.fanout_with_stall_reset(
+                    app.state.hub, app.state.redis, row
+                )
+
+            brains[chair_id] = Brain(
+                DirectWorld(
+                    app.state.pool, app.state.redis, on_call_on=on_call_on
+                ),
+                small_model=ScriptedChatModel(),
+                big_model=ScriptedChatModel(
+                    [
+                        tool_call("decide", {"action": "call_on", "target": "Iris"}),
+                        tool_call(
+                            "decide", {"action": "call_on", "target": "Marcus"}
+                        ),
+                    ]
+                ),
+                on_committed=on_committed,
+            )
+            brains[iris_id] = Brain(
+                DirectWorld(app.state.pool, app.state.redis),
+                small_model=ScriptedChatModel(),
+                big_model=ScriptedChatModel(
+                    [text_message("I'll sit this out")]
+                ),
+                on_committed=on_committed,
+            )
+            brains[marcus_id] = Brain(
+                DirectWorld(app.state.pool, app.state.redis),
+                small_model=ScriptedChatModel(),
+                big_model=ScriptedChatModel(
+                    [tool_call("reply", {"body": "Marcus after redirect"})]
+                ),
+                on_committed=on_committed,
+            )
+
+            posted = await client.post(
+                f"/rooms/{room['id']}/messages",
+                json={"author_id": human["id"], "body": "who speaks?"},
+            )
+            assert posted.status_code == 200
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 4.0
+            while loop.time() < deadline:
+                stored = await db.list_messages(app.state.pool, room_id)
+                decisions = await _decisions(app.state.pool, room_id)
+                if (
+                    any(m.body == "Iris passes." for m in stored)
+                    and any(m.body == "Marcus after redirect" for m in stored)
+                    and [r["action"] for r in decisions] == ["call_on", "call_on"]
+                ):
+                    await app.state.scheduler.wait_idle()
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError(
+                    f"timed out: messages={[m.body for m in await db.list_messages(app.state.pool, room_id)]}"
+                    f" decisions={await _decisions(app.state.pool, room_id)}"
+                    f" results={app.state.scheduler.brain_results}"
+                )
+
+            stored = await db.list_messages(app.state.pool, room_id)
+            bodies = [m.body for m in stored]
+            assert "Iris passes." in bodies
+            assert "Marcus after redirect" in bodies
+            decisions = await _decisions(app.state.pool, room_id)
+            assert [r["action"] for r in decisions] == ["call_on", "call_on"]
+            assert [r["target_id"] for r in decisions] == [iris_id, marcus_id]
+            assert decisions[1]["trigger_seq"] > decisions[0]["trigger_seq"]
+
+
+@pytest.mark.asyncio
+async def test_two_member_passes_both_land(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, _chair_id, member_ids = await _moderated_room(
+        pool, members=2
+    )
+    iris_id, marcus_id = member_ids
+    await db.insert_message(pool, room_id, human_id, "who speaks?")
+
+    iris = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel([text_message("no")]),
+    )
+    marcus = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel([text_message("no")]),
+    )
+    first = await iris.run(iris_id, room_id, called_on=True)
+    second = await marcus.run(marcus_id, room_id, called_on=True)
+    assert first.outcome == "skipped"
+    assert second.outcome == "skipped"
+    bodies = [m.body for m in await db.list_messages(pool, room_id)]
+    assert bodies.count("Iris passes.") == 1
+    assert bodies.count("Marcus passes.") == 1
+
+
+@pytest.mark.asyncio
+async def test_called_on_llm_error_leaves_last_read_for_redelivery(
+    pool: asyncpg.Pool,
+    redis_client: redis.Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(graph_mod, "LLM_RETRY_BACKOFF_S", 0)
+    room_id, human_id, chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    await db.insert_message(pool, room_id, human_id, "pick a speaker")
+    status, _ = await db.record_decision(
+        pool, room_id, chair_id, 1, "call_on", iris_id
+    )
+    assert status == "won"
+    assert await db.get_last_read(pool, iris_id, room_id) == 0
+
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=_BoomModel(),
+    )
+    result = await brain.run(iris_id, room_id, called_on=True)
+    assert result.outcome == "llm_error"
+    assert await db.get_last_read(pool, iris_id, room_id) == 0
+    assert "Iris passes." not in [m.body for m in await db.list_messages(pool, room_id)]
+
+    scheduler = Scheduler(pool)
+    targets = await scheduler._route_wake(room_id, human_id, None)
+    assert [(t.id, seq) for t, seq in targets] == [(iris_id, 1)]
+
+
+@pytest.mark.asyncio
+async def test_loop_cap_skip_does_not_post_pass(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, _human_id, _chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    # 2 agents → cap 8. Stretch is room-level since the last human.
+    for i in range(8):
+        await db.insert_message(pool, room_id, iris_id, f"circle {i}")
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel(),
+    )
+    result = await brain.run(iris_id, room_id, called_on=True)
+    assert result.outcome == "skipped"
+    assert "loop cap" in (result.triage_reason or "")
+    bodies = [m.body for m in await db.list_messages(pool, room_id)]
+    assert "Iris passes." not in bodies
+
+
+@pytest.mark.asyncio
+async def test_stale_called_on_pass_is_dropped(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, _chair_id, member_ids = await _moderated_room(
+        pool, members=2
+    )
+    iris_id, marcus_id = member_ids
+    await db.insert_message(pool, room_id, human_id, "pick a speaker")
+
+    async def decline_after_race(_messages: list) -> object:
+        await db.insert_message(pool, room_id, marcus_id, "Marcus already spoke")
+        return text_message("I'll sit this out")
+
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel([decline_after_race]),
+    )
+    result = await brain.run(iris_id, room_id, called_on=True)
+    assert result.outcome == "skipped"
+    bodies = [m.body for m in await db.list_messages(pool, room_id)]
+    assert "Iris passes." not in bodies
+    assert "Marcus already spoke" in bodies
+
+
+@pytest.mark.asyncio
+async def test_digest_shows_pass_as_transcript_row(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, _chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    await db.insert_message(pool, room_id, human_id, "pick a speaker")
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel([text_message("no")]),
+    )
+    await brain.run(iris_id, room_id, called_on=True)
+    markdown = await build_room_digest(pool, room_id)
+    assert markdown is not None
+    assert "| Iris | Iris passes. |" in markdown
+
+
+# ── Phase 7c: moderator say is non-terminal ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_say_then_call_on_in_one_turn(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    await db.insert_message(pool, room_id, human_id, "open the table")
+    wakes: list[UUID] = []
+
+    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+        wakes.append(tid)
+
+    brain = Brain(
+        DirectWorld(pool, redis_client, on_call_on=on_call_on),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel(
+            [
+                tool_call("decide", {"action": "say", "body": "welcome"}),
+                tool_call("decide", {"action": "call_on", "target": "Iris"}),
+            ]
+        ),
+    )
+    result = await brain.run(chair_id, room_id)
+    assert result.outcome == "moderated_call"
+    assert result.reply_body == "welcome"
+    assert wakes == [iris_id]
+    stored = [m.body for m in await db.list_messages(pool, room_id)]
+    assert "welcome" in stored
+    rows = await _decisions(pool, room_id)
+    assert [r["action"] for r in rows] == ["say", "call_on"]
+    assert rows[0]["trigger_seq"] == 1
+    assert rows[1]["trigger_seq"] == 2
+    assert rows[1]["target_id"] == iris_id
+
+
+@pytest.mark.asyncio
+async def test_say_budget_second_say_errors_then_call_on(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    await db.insert_message(pool, room_id, human_id, "open the table")
+    wakes: list[UUID] = []
+
+    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+        wakes.append(tid)
+
+    big = ScriptedChatModel(
+        [
+            tool_call("decide", {"action": "say", "body": "first"}),
+            tool_call("decide", {"action": "say", "body": "second"}),
+            tool_call("decide", {"action": "call_on", "target": "Iris"}),
+        ]
+    )
+    brain = Brain(
+        DirectWorld(pool, redis_client, on_call_on=on_call_on),
+        small_model=ScriptedChatModel(),
+        big_model=big,
+    )
+    result = await brain.run(chair_id, room_id)
+    assert result.outcome == "moderated_call"
+    assert result.reply_body == "first"
+    assert wakes == [iris_id]
+    # The error ToolMessage is on the hop after the rejected second say.
+    told = [str(getattr(m, "content", "")) for m in big.calls[2]]
+    assert any(MODERATOR_SAY_ERROR in t for t in told)
+    stored = [m.body for m in await db.list_messages(pool, room_id)]
+    assert stored.count("first") == 1
+    assert "second" not in stored
+    assert [r["action"] for r in await _decisions(pool, room_id)] == [
+        "say",
+        "call_on",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_say_then_silence_ends_with_no_wake(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, chair_id, _members = await _moderated_room(pool)
+    await db.insert_message(pool, room_id, human_id, "carry on")
+    wakes: list[UUID] = []
+
+    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+        wakes.append(tid)
+
+    brain = Brain(
+        DirectWorld(pool, redis_client, on_call_on=on_call_on),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel(
+            [
+                tool_call("decide", {"action": "say", "body": "noted"}),
+                tool_call("decide", {"action": "silence"}),
+            ]
+        ),
+    )
+    result = await brain.run(chair_id, room_id)
+    assert result.outcome == "moderated_silence"
+    assert result.reply_body == "noted"
+    assert wakes == []
+    assert [r["action"] for r in await _decisions(pool, room_id)] == [
+        "say",
+        "silence",
+    ]
+
+
+# ── review follow-up: called_on trigger_seq, Redis hint, silence nudge ──
+
+
+@pytest.mark.asyncio
+async def test_redelivered_call_on_after_reply_does_not_pass(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    """Construction (a): stall redelivers call_on while the member is
+    still on their first turn. After the reply lands, the coalesced
+    rerun must not post a false pass."""
+    room_id, human_id, chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    await db.insert_message(pool, room_id, human_id, "pick a speaker")
+    status, _ = await db.record_decision(
+        pool, room_id, chair_id, 1, "call_on", iris_id
+    )
+    assert status == "won"
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    turns = 0
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel(
+            [
+                tool_call("reply", {"body": "Iris answering"}),
+                text_message("already said my piece"),
+            ]
+        ),
+    )
+
+    async def run_turn(
+        agent_id: UUID,
+        rid: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
+    ) -> object:
+        nonlocal turns
+        if agent_id != iris_id:
+            return None
+        turns += 1
+        if turns == 1:
+            started.set()
+            await release.wait()
+        return await brain.run(
+            agent_id, rid, called_on=called_on, called_on_seq=called_on_seq
+        )
+
+    scheduler = Scheduler(pool, run_turn=run_turn, redis_client=redis_client)
+    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=1)
+    await started.wait()
+    await scheduler.dispatch(room_id, human_id, seq=None)
+    release.set()
+    await scheduler.wait_idle()
+
+    bodies = [m.body for m in await db.list_messages(pool, room_id)]
+    assert "Iris answering" in bodies
+    assert "Iris passes." not in bodies
+    assert turns == 2
+
+
+@pytest.mark.asyncio
+async def test_say_mention_then_call_on_same_member_no_false_pass(
+    require_services: None,
+) -> None:
+    """Construction (b): Chair say `@Iris` then call_on Iris. Mention
+    fan-out plus call_on must not produce a false pass."""
+    brains: dict[UUID, Brain] = {}
+
+    async def run_turn(
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
+    ) -> object:
+        return await brains[agent_id].run(
+            agent_id,
+            room_id,
+            called_on=called_on,
+            called_on_seq=called_on_seq,
+        )
+
+    app = create_app(run_turn=run_turn)
+    async with app.router.lifespan_context(app):
+        await db.truncate_all(app.state.pool)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            room = (
+                await client.post(
+                    "/rooms",
+                    json={"name": "mention-call", "mode": "moderated"},
+                )
+            ).json()
+            human = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={"kind": "human", "name": "Ada"},
+                )
+            ).json()
+            chair = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={"kind": "agent", "name": "Chair", "role": "moderator"},
+                )
+            ).json()
+            iris = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={"kind": "agent", "name": "Iris"},
+                )
+            ).json()
+            marcus = (
+                await client.post(
+                    f"/rooms/{room['id']}/participants",
+                    json={"kind": "agent", "name": "Marcus"},
+                )
+            ).json()
+            chair_id = UUID(chair["id"])
+            iris_id = UUID(iris["id"])
+            marcus_id = UUID(marcus["id"])
+            room_id = UUID(room["id"])
+
+            async def on_call_on(
+                rid: UUID, tid: UUID, trigger_seq: int = 0
+            ) -> None:
+                await app.state.scheduler.wake_one(
+                    rid, tid, called_on=True, called_on_seq=trigger_seq or None
+                )
+
+            async def on_committed(row: object) -> None:
+                await app.state.fanout_with_stall_reset(
+                    app.state.hub, app.state.redis, row
+                )
+
+            brains[chair_id] = Brain(
+                DirectWorld(
+                    app.state.pool, app.state.redis, on_call_on=on_call_on
+                ),
+                small_model=ScriptedChatModel(),
+                big_model=ScriptedChatModel(
+                    [
+                        tool_call(
+                            "decide",
+                            {"action": "say", "body": "@Iris welcome"},
+                        ),
+                        tool_call(
+                            "decide", {"action": "call_on", "target": "Iris"}
+                        ),
+                        tool_call("decide", {"action": "silence"}),
+                    ]
+                ),
+                on_committed=on_committed,
+            )
+            brains[iris_id] = Brain(
+                DirectWorld(app.state.pool, app.state.redis),
+                small_model=ScriptedChatModel(
+                    [
+                        triage_message(
+                            actionable=True, reason="named", response_mode="me"
+                        )
+                    ]
+                ),
+                big_model=ScriptedChatModel(
+                    [
+                        tool_call("reply", {"body": "Iris here"}),
+                        text_message("already answered"),
+                    ]
+                ),
+                on_committed=on_committed,
+            )
+            brains[marcus_id] = Brain(
+                DirectWorld(app.state.pool, app.state.redis),
+                small_model=ScriptedChatModel(),
+                big_model=ScriptedChatModel([text_message("no")]),
+                on_committed=on_committed,
+            )
+
+            posted = await client.post(
+                f"/rooms/{room['id']}/messages",
+                json={"author_id": human["id"], "body": "open the table"},
+            )
+            assert posted.status_code == 200
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 4.0
+            while loop.time() < deadline:
+                stored = await db.list_messages(app.state.pool, room_id)
+                if any(m.body == "Iris here" for m in stored):
+                    await app.state.scheduler.wait_idle()
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError(
+                    f"timed out: {[m.body for m in await db.list_messages(app.state.pool, room_id)]}"
+                )
+
+            stored = await db.list_messages(app.state.pool, room_id)
+            bodies = [m.body for m in stored]
+            assert bodies.count("Iris here") == 1
+            assert "Iris passes." not in bodies
+            assert "Marcus passes." not in bodies
+            member_replies = [
+                m
+                for m in stored
+                if m.author_id in {iris_id, marcus_id}
+            ]
+            assert [m.body for m in member_replies] == ["Iris here"]
+
+
+@pytest.mark.asyncio
+async def test_in_process_wake_writes_no_redis_hint(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, _human_id, _chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_turn(
+        _agent_id: UUID,
+        _rid: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
+    ) -> None:
+        started.set()
+        await release.wait()
+
+    scheduler = Scheduler(pool, run_turn=run_turn, redis_client=redis_client)
+    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=1)
+    await started.wait()
+    assert not await redis_client.exists(hint_key(iris_id, room_id))
+    release.set()
+    await scheduler.wait_idle()
+
+
+@pytest.mark.asyncio
+async def test_coalesce_overwrite_leaves_no_stale_redis_hint(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, _human_id, _chair_id, member_ids = await _moderated_room(pool)
+    iris_id = member_ids[0]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[tuple[bool, int | None]] = []
+
+    async def run_turn(
+        _agent_id: UUID,
+        _rid: UUID,
+        *,
+        called_on: bool = False,
+        called_on_seq: int | None = None,
+    ) -> None:
+        seen.append((called_on, called_on_seq))
+        if len(seen) == 1:
+            started.set()
+            await release.wait()
+
+    scheduler = Scheduler(pool, run_turn=run_turn, redis_client=redis_client)
+    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=1)
+    await started.wait()
+    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=3)
+    assert not await redis_client.exists(hint_key(iris_id, room_id))
+    release.set()
+    await scheduler.wait_idle()
+    assert await consume_called_on(redis_client, iris_id, room_id) is None
+    assert seen[0] == (True, 1)
+    assert seen[1] == (True, 3)
+
+
+@pytest.mark.asyncio
+async def test_nudge_skips_moderator_after_silence_at_last_seq(
+    pool: asyncpg.Pool,
+) -> None:
+    room_id, human_id, chair_id, _ = await _moderated_room(pool)
+    await db.insert_message(pool, room_id, human_id, "carry on")
+    status, _ = await db.record_decision(
+        pool, room_id, chair_id, 1, "silence", None
+    )
+    assert status == "won"
+    wakes: list[tuple[UUID, bool]] = []
+
+    async def run_turn(
+        agent_id: UUID, rid: UUID, *, called_on: bool = False
+    ) -> None:
+        wakes.append((agent_id, called_on))
+
+    scheduler = Scheduler(pool, run_turn=run_turn)
+    await scheduler.dispatch(room_id, human_id, seq=None)
+    await scheduler.wait_idle()
+    assert wakes == []
+    targets = await scheduler._route_wake(room_id, human_id, None)
+    assert targets == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_called_on_pass_is_dropped(
+    pool: asyncpg.Pool, redis_client: redis.Redis
+) -> None:
+    room_id, human_id, _chair_id, member_ids = await _moderated_room(
+        pool, members=2
+    )
+    iris_id, marcus_id = member_ids
+    await db.insert_message(pool, room_id, human_id, "pick a speaker")
+    await db.insert_message(pool, room_id, marcus_id, "Iris passes.")
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel([text_message("no")]),
+    )
+    result = await brain.run(iris_id, room_id, called_on=True)
+    assert result.outcome == "skipped"
+    bodies = [m.body for m in await db.list_messages(pool, room_id)]
+    assert bodies.count("Iris passes.") == 1
+    assert await db.get_last_read(pool, iris_id, room_id) > 0
+
+
+@pytest.mark.asyncio
+async def test_say_logs_when_decision_row_blocked(
+    pool: asyncpg.Pool,
+    redis_client: redis.Redis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    room_id, human_id, chair_id, _ = await _moderated_room(pool)
+    await db.insert_message(pool, room_id, human_id, "please greet")
+    status, _ = await db.record_decision(
+        pool, room_id, chair_id, 1, "say", None
+    )
+    assert status == "won"
+    brain = Brain(
+        DirectWorld(pool, redis_client),
+        small_model=ScriptedChatModel(),
+        big_model=ScriptedChatModel(
+            [
+                tool_call("decide", {"action": "say", "body": "welcome"}),
+                tool_call("decide", {"action": "silence"}),
+            ]
+        ),
+    )
+    with caplog.at_level(logging.INFO, logger="agora.brain"):
+        result = await brain.run(chair_id, room_id)
+    assert result.outcome == "moderated_silence"
+    assert "welcome" in [m.body for m in await db.list_messages(pool, room_id)]
+    assert "decision row blocked" in caplog.text

@@ -25,6 +25,7 @@ class AgentLane:
     whose wake for room B lands while it is mid-turn for room A must
     rerun in room B (its cursor-based inbox will also cover any A
     updates that raced in, on the turn after that).
+    called_on_seq is max-merged by Daemon.handle_frame, not this lane.
 
     One caveat kept honest: with wakes for TWO other rooms racing the
     current turn, only the last one survives the coalesce. The other

@@ -113,7 +113,13 @@ class HttpWorld:
             raise StaleWrite(int(detail.get("last_seq") or 0), newer)
         resp.raise_for_status()
 
-    async def load_turn(self, agent_id: UUID, room_id: UUID) -> TurnContext:
+    async def load_turn(
+        self,
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on_seq: int | None = None,
+    ) -> TurnContext:
         self._actor = agent_id
         resp = await self._request(
             "GET",
@@ -124,6 +130,10 @@ class HttpWorld:
         data = resp.json()
         inbox = [_message(item) for item in data.get("inbox") or []]
         people = [_participant(item) for item in data.get("participants") or []]
+        raw_seq = data.get("called_on_seq")
+        hint = int(raw_seq) if raw_seq is not None else called_on_seq
+        if hint is None and data.get("called_on"):
+            hint = 1
         return TurnContext(
             agent=WorldParticipant(
                 id=agent_id,
@@ -138,7 +148,8 @@ class HttpWorld:
             seen_seq=int(data["seen_seq"]),
             agent_only_stretch=int(data.get("agent_only_stretch") or 0),
             room_mode=str(data.get("room_mode") or "open"),
-            called_on=bool(data.get("called_on")),
+            called_on=hint is not None,
+            called_on_seq=hint,
         )
 
     async def get_last_read(self, agent_id: UUID, room_id: UUID) -> int:
@@ -273,19 +284,6 @@ class HttpWorld:
         )
         self._raise_for_status(resp)
 
-    async def record_seen(self, agent_id: UUID, room_id: UUID, seq: int) -> None:
-        self._actor = agent_id
-        resp = await self._request(
-            "POST",
-            "/runtime/seen",
-            json={
-                "agent_id": str(agent_id),
-                "room_id": str(room_id),
-                "seq": seq,
-            },
-        )
-        self._raise_for_status(resp)
-
     async def record_decision(
         self,
         room_id: UUID,
@@ -316,3 +314,19 @@ class HttpWorld:
             action=str(data["action"]),
             target_id=_uuid(raw_target) if raw_target else None,
         )
+
+    async def has_authored_since(
+        self, agent_id: UUID, room_id: UUID, since_seq: int
+    ) -> bool:
+        self._actor = agent_id
+        resp = await self._request(
+            "GET",
+            "/runtime/authored-since",
+            params={
+                "agent_id": str(agent_id),
+                "room_id": str(room_id),
+                "since_seq": since_seq,
+            },
+        )
+        self._raise_for_status(resp)
+        return bool(resp.json()["authored"])

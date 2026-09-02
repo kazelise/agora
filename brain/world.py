@@ -90,6 +90,8 @@ class TurnContext:
     # Set when this wake is a moderator call_on. Default False keeps
     # ad-hoc TurnContexts valid (ordinary reactive / proactive turns).
     called_on: bool = False
+    # Trigger seq of that call_on, when known. None is an ordinary wake.
+    called_on_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +102,13 @@ class DecisionResult:
 
 
 class World(Protocol):
-    async def load_turn(self, agent_id: UUID, room_id: UUID) -> TurnContext: ...
+    async def load_turn(
+        self,
+        agent_id: UUID,
+        room_id: UUID,
+        *,
+        called_on_seq: int | None = None,
+    ) -> TurnContext: ...
 
     async def get_last_read(self, agent_id: UUID, room_id: UUID) -> int: ...
 
@@ -141,8 +149,6 @@ class World(Protocol):
         purpose: str,
     ) -> None: ...
 
-    async def record_seen(self, agent_id: UUID, room_id: UUID, seq: int) -> None: ...
-
     async def record_decision(
         self,
         room_id: UUID,
@@ -151,3 +157,7 @@ class World(Protocol):
         action: str,
         target_id: UUID | None,
     ) -> DecisionResult: ...
+
+    async def has_authored_since(
+        self, agent_id: UUID, room_id: UUID, since_seq: int
+    ) -> bool: ...

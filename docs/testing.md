@@ -1,6 +1,6 @@
 # 测试文档（Testing)
 
-本文档记录 agora 的测试体系、验证方法与真模型实测结果。所有确定性测试随仓库 GitHub Actions（`.github/workflows/test.yml`，push `main` / pull_request）跑；真模型测试（`@pytest.mark.llm`）需要真实 LLM 端点，按需运行。
+本文档记录 agora 的测试体系、验证方法与真模型实测结果。CI 只跑 mock 测试；真模型测试在本地按需跑。不变量表只和最近一次留下记录的真模型运行一样新。所有确定性测试随仓库 GitHub Actions（`.github/workflows/test.yml`，push `main` / pull_request）跑；真模型测试（`@pytest.mark.llm`）需要真实 LLM 端点，按需运行。
 
 ## 1. 测试体系总览
 
@@ -31,7 +31,7 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 
 ## 2. 用例清单
 
-### L0 确定性测试（140 项，全绿）
+### L0 确定性测试（160 项，全绿）
 
 数量按 `pytest --collect-only -q <file>` 实测。关键套件：
 
@@ -43,8 +43,9 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 | `test_pacer.py` / `test_limiter.py` | 12 | 速率限制、并发上限 |
 | `test_coalesce.py` / `test_daemon_lane.py` | 5 | AgentLane 合并 rerun 指向最新房间 |
 | `test_byoa.py` | 9 | BYOA claim/HTTP/WS 重连替换 |
-| `test_moderated.py` | 26 | moderated 路由、API、decide 工具、幂等、loop cap、BYOA decision |
-| 其余（`test_brain` 17 / `test_k8s` 18 / `test_daemon_args` 3 / `test_seen` 2 / `test_wake` 1 / `test_seq` 1） | 42 | 图节点、triage、cursor、参数解析、Job 宿主 |
+| `test_moderated.py` | 42 | moderated 路由、API、decide 工具、幂等、loop cap、BYOA decision、called-on pass、say 非终结、trigger_seq pass 门、in-process 不写 Redis hint、silence 钉 last_seq 不 nudge |
+| `test_liveness.py` | 6 | subscriber 首次订阅失败即抛 / 重连 / dispatch 隔离、lane 吞异常、done-callback、call_on wake fail-open |
+| 其余（`test_brain` 17 / `test_k8s` 18 / `test_daemon_args` 3 / `test_wake` 1 / `test_seq` 1） | 40 | 图节点、triage、参数解析、Job 宿主 |
 
 ### L2 真模型协调测试
 
@@ -52,7 +53,7 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 |---|---|---|
 | `test_counting_game_no_dup_no_gap` | 3 agent 报数 1→6 | 数字不重不漏、连续、恰好 6 条 |
 | `test_one_of_us_exactly_one_agent_reply` | "恰好一人回答" | 恰好 1 条 agent 回复 + t1 claim 归属 |
-| `test_moderated_one_call_one_answer` | moderated 房间，主持 + 3 成员，一问只该一人答 | 恰好 1 条成员消息；至少一行 `call_on`；每条成员消息的作者是某次 `call_on` 的 target（主持 `say` 不计数） |
+| `test_moderated_one_call_one_answer` | moderated 房间，主持 + 3 成员 | **机制：** 每条成员消息的作者是某次 `call_on` 的 target（主持 `say` 不计数）。**模型行为：** 成员消息 ≥ 1（Chair 再点下一个人是合法的，不是代码不变量） |
 | `test_moderated_mention_bypasses_moderator` | moderated 房间 `@Name` | 被点名成员至少 1 条消息；其他成员 0 条；该 `trigger_seq` 的 `moderator_decisions` 为零行 |
 
 ### L3 对抗角色测试（2026-08-29 新增）
@@ -91,12 +92,31 @@ export AGORA_BIG_MODEL=zai-org/GLM-5.3-Flash
 | `test_digest_open_room_omits_decisions_section` | open digest | 正文不含「决策」（不是空表） |
 | `test_digest_flattens_newline_in_moderator_name` | 主持名含 `\\n## …` | 决策标题压成一行；恰好一个 `## Action items (claims)` |
 | `test_digest_moderated_empty_decisions_is_placeholder` | moderated、零决策 | 有 `## 决策` 与 `_(no decisions)_`，无表头 |
+| `test_called_on_decline_posts_pass_and_moderator_redirects` | call_on Iris → 拒答 → `Iris passes.` | 经 scheduler 叫醒主持；新 trigger 上 call_on Marcus 成功 |
+| `test_two_member_passes_both_land` | 连续两个成员拒答 | `Iris passes.` 与 `Marcus passes.` 都落地（dup 门不误伤） |
+| `test_called_on_llm_error_leaves_last_read_for_redelivery` | 被点名 turn `llm_error` | last_read 不动；`_route_wake(seq=None)` 仍对该成员 `called_on=True` |
+| `test_loop_cap_skip_does_not_post_pass` | stretch ≥ cap 且 called_on | 早退 `skipped`，无 pass 消息 |
+| `test_stale_called_on_pass_is_dropped` | 房间已前进 | pass 静默丢弃 |
+| `test_digest_shows_pass_as_transcript_row` | pass 落地后 digest | transcript 普通行，正文 `Iris passes.` |
+| `test_say_then_call_on_in_one_turn` | 一轮里 say 再 call_on | 两行决策（N say，N+1 call_on）；目标被叫醒 |
+| `test_say_budget_second_say_errors_then_call_on` | 第二次 say | ToolMessage 错误；仍以 call_on 收束 |
+| `test_say_then_silence_ends_with_no_wake` | say 再 silence | 无成员叫醒 |
+| `test_subscriber_survives_dispatch_error` 等（`test_liveness.py`） | dispatch 抛错 / listen 断一次 / 首次 subscribe 失败 / lane 抛错 / task 异常退出 / on_call_on 抛错 | 下一条仍派发；重订阅；首次失败即抛且 ready 未 set；pending 继续；critical 日志；决策行已提交且函数返回 |
+| `test_redelivered_call_on_after_reply_does_not_pass` | 慢 turn 中 stall 补投 call_on | 成员已回复后不发 `Iris passes.` |
+| `test_say_mention_then_call_on_same_member_no_false_pass` | 一轮里 `say @Iris` 再 `call_on Iris` | 恰好一条成员回复，无 pass |
+| `test_in_process_wake_writes_no_redis_hint` | 进程内 `wake_one(called_on)` | Redis 无 `agora:called_on` 键 |
+| `test_coalesce_overwrite_leaves_no_stale_redis_hint` | 飞行中第二次点名合并 | 无陈旧 Redis hint；rerun 拿到较大的 trigger_seq |
+| `test_nudge_skips_moderator_after_silence_at_last_seq` | silence 钉在 last_seq 再 `seq=None` | `_route_wake` 返回 `[]`，零 turn |
+| `test_duplicate_called_on_pass_is_dropped` | 最新他人消息已是 `Iris passes.` | pass 被 DuplicateReply 丢弃，last_read 仍推进 |
+| `test_say_logs_when_decision_row_blocked` | 已有 say 行再落地一条 say | info 日志；消息落地 |
 
 ## 3. 真模型实测记录
 
+各次运行的「N passed in Xs」当时没有记下来；下面两节里的成绩单和 token 数是当时留下的，墙钟没有。CI 只跑 mock。两条 moderated 真模型用例（`test_moderated_one_call_one_answer`、`test_moderated_mention_bypasses_moderator`）还没对过真模型——写它们的时候中继是关的。
+
 ### 3.1 运行 #1（2026-08-29，GLM-5.3-Flash @ Modal 端点）
 
-命令：`pytest tests/test_coordination_llm.py -m llm -q` → **5 passed in 402s**
+命令：`pytest tests/test_coordination_llm.py -m llm -q`。当时套件里只有计数游戏和 one-of-us 两条 llm 用例；墙钟未记录。
 
 **报数游戏（count-game，目标 6）**：
 
@@ -122,7 +142,7 @@ claim t1 -> Jules
 
 ### 3.2 运行 #2（2026-08-29，同端点，含 3 个新对抗用例）
 
-命令同上 → **5 passed in 402s**（本轮含 adversarial 3 例）。
+命令同上。本轮含 adversarial 3 例；墙钟未记录。
 
 **dup-bait（复读怪攻击 verbatim-dup 门）**：
 
