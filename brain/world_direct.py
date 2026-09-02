@@ -224,3 +224,6 @@ class DirectWorld:
         self, agent_id: UUID, room_id: UUID, since_seq: int
     ) -> bool:
         return await db.has_authored_since(self.pool, agent_id, room_id, since_seq)
+
+    async def call_ons_since_human(self, room_id: UUID) -> int:
+        return await db.count_call_ons_since_human(self.pool, room_id)

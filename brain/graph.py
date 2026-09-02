@@ -7,7 +7,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Self, TypedDict
 from uuid import UUID, uuid4
 
 from langchain_core.messages import (
@@ -20,7 +20,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from brain import policy
 from brain.holds import clear_hold, consume_hold, record_hold
@@ -42,6 +42,13 @@ AGENT_LOOP_CAP = 4
 # cannot bound repeated says; the verbatim-dup gate also ignores
 # same-author repeats. A second say is a ToolMessage, not a post.
 MODERATOR_SAY_BUDGET = 1
+# Moderated-room analogue of AGENT_LOOP_CAP: bounds "moderator polls
+# everyone" at the decision layer, before the message-level loop cap
+# has to fire. A call_on counts when its trigger_seq is after the last
+# human message, including the decision that answers that message
+# (trigger_seq > last_human_seq - 1; floor 0 if no human has spoken).
+# Mentions (@Name) are not call_ons and do not count.
+MODERATED_CALLS_PER_HUMAN = 3
 # Messages of recent room history shown to triage on a PROACTIVE turn
 # (stall nudge: the inbox itself is empty — the agent already read
 # everything). A bounded tail, not the whole room, keeps the prompt small.
@@ -62,9 +69,12 @@ DUPLICATE_REPLY_ERROR = (
     "or stay silent."
 )
 
-DECIDE_TARGET_ERROR = (
-    "decide rejected: target must be the name of an agent member "
-    "in this room other than yourself. Retry with that name."
+DECIDE_TARGET_ERROR = "unknown or non-callable target"
+
+DECIDE_CALLS_EXHAUSTED = (
+    f"decide rejected: call_on budget exhausted this human turn "
+    f"({MODERATED_CALLS_PER_HUMAN} call_ons since the last human message). "
+    "The round is over; only silence (or a single say) remains."
 )
 
 MODERATOR_SAY_ERROR = (
@@ -99,7 +109,24 @@ def canonical_task_key(task_key: str) -> str | None:
 class TriageVerdict(BaseModel):
     actionable: bool
     reason: str
-    response_mode: Literal["me", "each", "one-of-us"]
+    response_mode: Literal["me", "each", "one-of-us"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_response_mode(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("actionable"):
+            return data
+        out = dict(data)
+        out["response_mode"] = None
+        return out
+
+    @model_validator(mode="after")
+    def _require_mode_when_actionable(self) -> Self:
+        if self.actionable and self.response_mode is None:
+            raise ValueError("response_mode is required when actionable")
+        return self
 
 
 class InboxItem(TypedDict):
@@ -180,10 +207,14 @@ def decide(
 ) -> str:
     """Return a moderation decision.
 
-    call_on: target is an agent member's name; ends the turn.
+    call_on: target is an agent member's name (never the human); ends
+    the turn. After the called-on member has answered the human, prefer
+    silence over another call_on.
     say: body is posted through the ordinary reply path and does not
-    end the turn — follow with call_on or silence. One say per turn.
-    silence: end without calling on anyone.
+    end the turn — follow with call_on or silence. At most once, and
+    only when the table needs your voice.
+    silence: end without calling on anyone. The default once the ask
+    has been answered.
     """
     return action
 
@@ -309,8 +340,16 @@ def _moderator_prompt(state: BrainState) -> str:
         "You never answer substantive questions yourself. "
         "say posts one short line and does not end the turn; "
         "then you must call_on or silence. A second say is rejected.\n"
-        "call_on the seat best able to advance the discussion; "
-        "silence when nothing is owed.\n"
+        "call_on only an agent in the roster (never the human), and "
+        "only when the ask is still unanswered or the human asked for "
+        "a discussion.\n"
+        "After the member you called on has answered the human, choose "
+        "silence — do not thank, do not summarize, do not call on "
+        "someone else unless the answer was clearly incomplete.\n"
+        "A line like \"<Name> passes.\" means that member declined: the "
+        "ask is still unanswered, so call_on another agent who can "
+        "answer it, or silence only if nobody in the roster can.\n"
+        "say at most once and only when the table needs your voice.\n"
         "Free text without a decide call is not a valid moderation turn.\n\n"
         f"Seats: {seats}\n\n"
         f"Room:\n{_format_inbox(state.get('inbox') or [])}\n"
@@ -572,6 +611,7 @@ class Brain:
             f"{_format_inbox(state.get('inbox') or [])}\n\n"
             "Reply with a single JSON object, no markdown:\n"
             '{"actionable": bool, "reason": str, "response_mode": "me"|"each"|"one-of-us"}\n'
+            "Omit response_mode when actionable is false.\n"
             "me = addressed to you; new messages from others rarely mean you should skip.\n"
             "each = everyone should respond; a peer already speaking does not "
             "complete the request for you.\n"
@@ -654,6 +694,26 @@ class Brain:
             "claim_nudged": True,
         }
 
+    def _callable_member_names(self, state: BrainState) -> list[str]:
+        me = state["agent_id"]
+        return [
+            person["name"]
+            for person in state.get("roster") or []
+            if (
+                person.get("kind") == "agent"
+                and person.get("role") == "member"
+                and person.get("id") != me
+            )
+        ]
+
+    def _decide_target_error(self, state: BrainState, name: str) -> str:
+        seats = ", ".join(self._callable_member_names(state)) or "(none)"
+        return (
+            f"{DECIDE_TARGET_ERROR} {name!r}; "
+            f"call_on accepts one of: {seats} "
+            f"(agents only — humans cannot be called on)"
+        )
+
     def _resolve_call_on_target(self, state: BrainState, name: str) -> UUID | None:
         me = state["agent_id"]
         for person in state.get("roster") or []:
@@ -683,10 +743,29 @@ class Brain:
             target_id = self._resolve_call_on_target(state, target_name)
             if target_id is None:
                 after.append(
-                    ToolMessage(content=DECIDE_TARGET_ERROR, tool_call_id=call_id)
+                    ToolMessage(
+                        content=self._decide_target_error(state, target_name),
+                        tool_call_id=call_id,
+                    )
                 )
                 logger.info(
                     "decide %s rejected target %r", state["agent_name"], target_name
+                )
+                return {
+                    "messages": after,
+                    "hop_count": hop,
+                    "pending_reply": "",
+                }
+            used = await self.world.call_ons_since_human(room_id)
+            if used >= MODERATED_CALLS_PER_HUMAN:
+                after.append(
+                    ToolMessage(content=DECIDE_CALLS_EXHAUSTED, tool_call_id=call_id)
+                )
+                logger.info(
+                    "decide %s call_on exhausted (%s >= %s)",
+                    state["agent_name"],
+                    used,
+                    MODERATED_CALLS_PER_HUMAN,
                 )
                 return {
                     "messages": after,

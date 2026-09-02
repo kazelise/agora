@@ -330,3 +330,13 @@ class HttpWorld:
         )
         self._raise_for_status(resp)
         return bool(resp.json()["authored"])
+
+    async def call_ons_since_human(self, room_id: UUID) -> int:
+        agent_id = self._actor_id()
+        resp = await self._request(
+            "GET",
+            "/runtime/call-ons-since-human",
+            params={"agent_id": str(agent_id), "room_id": str(room_id)},
+        )
+        self._raise_for_status(resp)
+        return int(resp.json()["count"])
