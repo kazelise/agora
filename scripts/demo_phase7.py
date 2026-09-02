@@ -1,4 +1,4 @@
-"""Phase 7 demo: moderated room, Chair decides, then @-mention bypass.
+"""Phase 7 demo: moderated room, Chair decides, @-mention bypass, decline→pass.
 
 Needs a real OPENAI_API_KEY / OPENAI_BASE_URL (same contract as demo_phase2)
 and AGORA_DATABASE_URL.
@@ -164,7 +164,8 @@ async def _run(app: FastAPI, client: httpx.AsyncClient) -> None:
                 "role": "moderator",
                 "persona": (
                     "简洁的中文主持人。用 decide 点名最合适的成员作答，"
-                    "自己不回答实质问题。程序说明才 say，否则 silence。"
+                    "自己不回答实质问题。正文点到座位名就优先 call_on 那个座位。"
+                    "程序说明才 say，否则 silence。"
                 ),
             },
         )
@@ -189,8 +190,22 @@ async def _run(app: FastAPI, client: httpx.AsyncClient) -> None:
             },
         )
     ).json()
+    lex = (
+        await client.post(
+            f"/rooms/{room_id}/participants",
+            json={
+                "kind": "agent",
+                "name": "Lex",
+                "persona": (
+                    "法务合规。只谈合同、隐私、监管风险。"
+                    "产品优先级、排期、实现不是你的座位——"
+                    "被点到这类问题就保持沉默，不要 reply。"
+                ),
+            },
+        )
+    ).json()
 
-    roster = {p["id"]: p for p in (human, chair, iris, marcus)}
+    roster = {p["id"]: p for p in (human, chair, iris, marcus, lex)}
 
     _say()
     _say(f"room     {room['name']}  mode={room['mode']}  {room_id}")
@@ -198,6 +213,7 @@ async def _run(app: FastAPI, client: httpx.AsyncClient) -> None:
     _say(f"moderator {chair['name']}  {chair['id']}")
     _say(f"member   {iris['name']}   {iris['id']}")
     _say(f"member   {marcus['name']} {marcus['id']}")
+    _say(f"member   {lex['name']}    {lex['id']}")
     _say()
     _say("--- Ada asks a backend question (Chair should call_on Iris) ---")
 
@@ -222,6 +238,7 @@ async def _run(app: FastAPI, client: httpx.AsyncClient) -> None:
         chair["id"]: "Chair",
         iris["id"]: "Iris",
         marcus["id"]: "Marcus",
+        lex["id"]: "Lex",
     }
 
     def _print_transcript(messages: list[dict]) -> None:
@@ -295,8 +312,121 @@ async def _run(app: FastAPI, client: httpx.AsyncClient) -> None:
     digest2 = await client.get(f"/rooms/{room_id}/digest")
     digest2.raise_for_status()
     _say()
-    _say("--- digest (final) ---")
+    _say("--- digest (after mention) ---")
     _say(digest2.text)
+
+    # Decline → pass → redirect. Persona (not a scripted model) is the
+    # only lever: Lex speaks only on legal topics; Ada asks a product
+    # question and names Lex so Chair should call_on that seat.
+    before_decline = len(after)
+    trigger_floor = after[-1]["seq"] if after else 0
+    _say()
+    _say("--- decline → pass → redirect ---")
+    _say(
+        "不变量：被点名成员沉默必须落地一条带名字的 pass 推进 seq；"
+        "主持被新 seq 叫醒后才能写新的 decide。"
+        "从「没回」推断弃权是慢 turn 下的 TOCTOU。"
+    )
+    third = await client.post(
+        f"/rooms/{room_id}/messages",
+        json={
+            "author_id": human["id"],
+            "body": "请合规官 Lex 先表态：这个功能下个迭代做还是砍掉？",
+        },
+    )
+    third.raise_for_status()
+    _say(f"message seq={third.json()['seq']}  {third.json()['body']}")
+
+    await _wait_brain(app, len(app.state.scheduler.brain_results) + 1)
+    declined = await _wait_quiet(app, client, room_id)
+
+    decisions_after = await db.list_decisions(app.state.pool, UUID(room_id))
+    id_to_name = {UUID(p["id"]): p["name"] for p in roster.values()}
+    lex_id = UUID(lex["id"])
+    pass_body = f"{lex['name']} passes."
+    pass_row = next(
+        (
+            m
+            for m in declined
+            if m["author_id"] == lex["id"]
+            and m["body"] == pass_body
+            and m["seq"] > trigger_floor
+        ),
+        None,
+    )
+    first_call = next(
+        (
+            d
+            for d in decisions_after
+            if d.action == "call_on"
+            and d.target_id == lex_id
+            and d.trigger_seq >= trigger_floor
+        ),
+        None,
+    )
+    redirect = None
+    if first_call is not None:
+        redirect = next(
+            (
+                d
+                for d in decisions_after
+                if d.action == "call_on"
+                and d.trigger_seq > first_call.trigger_seq
+                and d.target_id is not None
+                and d.target_id != lex_id
+            ),
+            None,
+        )
+    answer = None
+    if redirect is not None and pass_row is not None:
+        target = str(redirect.target_id)
+        answer = next(
+            (
+                m
+                for m in declined
+                if m["author_id"] == target
+                and m["seq"] > pass_row["seq"]
+                and not str(m["body"]).endswith(" passes.")
+            ),
+            None,
+        )
+
+    if (
+        first_call is None
+        or pass_row is None
+        or redirect is None
+        or answer is None
+    ):
+        _say(
+            "decline path was not exercised this run "
+            "(model did not decline, or Chair did not redirect) — not faked."
+        )
+        _say("--- delta ---")
+        _print_transcript(declined[before_decline:])
+    else:
+        _say()
+        _say("--- call_on (Lex) ---")
+        target = id_to_name.get(first_call.target_id, str(first_call.target_id))
+        _say(
+            f"  trigger_seq={first_call.trigger_seq}  action={first_call.action}  "
+            f"target={target}  at={first_call.created_at.isoformat(timespec='seconds')}"
+        )
+        _say("--- pass ---")
+        _print_transcript([pass_row])
+        _say("--- call_on (redirect) ---")
+        rtarget = id_to_name.get(redirect.target_id, str(redirect.target_id))
+        _say(
+            f"  trigger_seq={redirect.trigger_seq}  action={redirect.action}  "
+            f"target={rtarget}  at={redirect.created_at.isoformat(timespec='seconds')}"
+        )
+        _say("--- second member ---")
+        _print_transcript([answer])
+
+    digest3 = await client.get(f"/rooms/{room_id}/digest")
+    digest3.raise_for_status()
+    _say()
+    _say("--- digest (final) ---")
+    _say(digest3.text)
 
 
 if __name__ == "__main__":

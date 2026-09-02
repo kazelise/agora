@@ -263,7 +263,9 @@ async def test_record_decision_returns_when_on_call_on_raises(
     iris = await db.add_participant(pool, room.id, "agent", "Iris", "brief")
     await db.insert_message(pool, room.id, chair.id, "open")
 
-    async def boom_wake(_room_id: UUID, _target_id: UUID) -> None:
+    async def boom_wake(
+        _room_id: UUID, _target_id: UUID, _trigger_seq: int
+    ) -> None:
         raise RuntimeError("get_participant blip")
 
     world = DirectWorld(pool, redis_client, on_call_on=boom_wake)

@@ -26,8 +26,9 @@ from server.models import MessageRow, ParticipantRow
 
 logger = logging.getLogger("agora.world")
 
-# (room_id, target_id) or (room_id, target_id, trigger_seq).
-CallOnFn = Callable[..., Awaitable[None]]
+# (room_id, target_id, trigger_seq). One signature — a TypeError
+# inside the handler is a handler bug, not a 2-arg fallback.
+CallOnFn = Callable[[UUID, UUID, int], Awaitable[None]]
 
 
 def _participant(row: ParticipantRow) -> WorldParticipant:
@@ -209,7 +210,7 @@ class DirectWorld:
             and self.on_call_on is not None
         ):
             try:
-                await self._invoke_on_call_on(room_id, row.target_id, row.trigger_seq)
+                await self.on_call_on(room_id, row.target_id, row.trigger_seq)
             except Exception:
                 logger.warning(
                     "on_call_on wake failed room=%s target=%s — fail-open",
@@ -218,15 +219,6 @@ class DirectWorld:
                     exc_info=True,
                 )
         return result
-
-    async def _invoke_on_call_on(
-        self, room_id: UUID, target_id: UUID, trigger_seq: int
-    ) -> None:
-        assert self.on_call_on is not None
-        try:
-            await self.on_call_on(room_id, target_id, trigger_seq)
-        except TypeError:
-            await self.on_call_on(room_id, target_id)
 
     async def has_authored_since(
         self, agent_id: UUID, room_id: UUID, since_seq: int

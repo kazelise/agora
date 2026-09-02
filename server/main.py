@@ -129,13 +129,12 @@ def create_app(
             )
 
             async def on_call_on(
-                room_id: UUID, target_id: UUID, trigger_seq: int = 0
+                room_id: UUID, target_id: UUID, trigger_seq: int
             ) -> None:
                 await scheduler.wake_one(
                     room_id,
                     target_id,
-                    called_on=True,
-                    called_on_seq=trigger_seq or None,
+                    called_on_seq=trigger_seq,
                 )
 
             turn_fn.world.on_call_on = on_call_on

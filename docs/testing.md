@@ -210,6 +210,8 @@ source .env 或手动 export（见 §1）
 pytest tests/test_coordination_llm.py -m llm -q
 
 # moderated 房间现场叙事（进程内拉起应用，同样要中继）
+# 主持点名、@ 直通；模型拒答时落地 "{name} passes."，主持换 trigger 再点名
+# （模型开口则打印 not exercised，不伪造）
 uv run python scripts/demo_phase7.py
 
 # 查看某房间转录与 LLM 经济（psql）

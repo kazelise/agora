@@ -316,7 +316,7 @@ async def test_call_on_writes_row_wakes_target_skips_triage(
 
     wakes: list[tuple[UUID, UUID]] = []
 
-    async def on_call_on(rid: UUID, tid: UUID) -> None:
+    async def on_call_on(rid: UUID, tid: UUID, _trigger_seq: int) -> None:
         wakes.append((rid, tid))
 
     small = ScriptedChatModel()
@@ -442,7 +442,7 @@ async def test_invalid_target_is_tool_error_then_retry(
     )
     wakes: list[UUID] = []
 
-    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+    async def on_call_on(_rid: UUID, tid: UUID, _trigger_seq: int) -> None:
         wakes.append(tid)
 
     brain = Brain(
@@ -491,7 +491,7 @@ async def test_same_trigger_seq_is_idempotent_no_double_wake(
     await db.insert_message(pool, room_id, human_id, "pick a speaker")
     wakes: list[UUID] = []
 
-    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+    async def on_call_on(_rid: UUID, tid: UUID, _trigger_seq: int) -> None:
         wakes.append(tid)
 
     def brain() -> Brain:
@@ -952,10 +952,10 @@ async def test_dispatch_call_on_runs_target_via_real_wake(
             room_id = UUID(room["id"])
 
             async def on_call_on(
-                rid: UUID, tid: UUID, trigger_seq: int = 0
+                rid: UUID, tid: UUID, trigger_seq: int
             ) -> None:
                 await app.state.scheduler.wake_one(
-                    rid, tid, called_on=True, called_on_seq=trigger_seq or None
+                    rid, tid, called_on_seq=trigger_seq
                 )
 
             chair_small = ScriptedChatModel()
@@ -1094,10 +1094,10 @@ async def test_called_on_decline_posts_pass_and_moderator_redirects(
             room_id = UUID(room["id"])
 
             async def on_call_on(
-                rid: UUID, tid: UUID, trigger_seq: int = 0
+                rid: UUID, tid: UUID, trigger_seq: int
             ) -> None:
                 await app.state.scheduler.wake_one(
-                    rid, tid, called_on=True, called_on_seq=trigger_seq or None
+                    rid, tid, called_on_seq=trigger_seq
                 )
 
             async def on_committed(row: object) -> None:
@@ -1310,7 +1310,7 @@ async def test_say_then_call_on_in_one_turn(
     await db.insert_message(pool, room_id, human_id, "open the table")
     wakes: list[UUID] = []
 
-    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+    async def on_call_on(_rid: UUID, tid: UUID, _trigger_seq: int) -> None:
         wakes.append(tid)
 
     brain = Brain(
@@ -1345,7 +1345,7 @@ async def test_say_budget_second_say_errors_then_call_on(
     await db.insert_message(pool, room_id, human_id, "open the table")
     wakes: list[UUID] = []
 
-    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+    async def on_call_on(_rid: UUID, tid: UUID, _trigger_seq: int) -> None:
         wakes.append(tid)
 
     big = ScriptedChatModel(
@@ -1384,7 +1384,7 @@ async def test_say_then_silence_ends_with_no_wake(
     await db.insert_message(pool, room_id, human_id, "carry on")
     wakes: list[UUID] = []
 
-    async def on_call_on(_rid: UUID, tid: UUID) -> None:
+    async def on_call_on(_rid: UUID, tid: UUID, _trigger_seq: int) -> None:
         wakes.append(tid)
 
     brain = Brain(
@@ -1458,7 +1458,7 @@ async def test_redelivered_call_on_after_reply_does_not_pass(
         )
 
     scheduler = Scheduler(pool, run_turn=run_turn, redis_client=redis_client)
-    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=1)
+    await scheduler.wake_one(room_id, iris_id, called_on_seq=1)
     await started.wait()
     await scheduler.dispatch(room_id, human_id, seq=None)
     release.set()
@@ -1535,10 +1535,10 @@ async def test_say_mention_then_call_on_same_member_no_false_pass(
             room_id = UUID(room["id"])
 
             async def on_call_on(
-                rid: UUID, tid: UUID, trigger_seq: int = 0
+                rid: UUID, tid: UUID, trigger_seq: int
             ) -> None:
                 await app.state.scheduler.wake_one(
-                    rid, tid, called_on=True, called_on_seq=trigger_seq or None
+                    rid, tid, called_on_seq=trigger_seq
                 )
 
             async def on_committed(row: object) -> None:
@@ -1641,7 +1641,7 @@ async def test_in_process_wake_writes_no_redis_hint(
         await release.wait()
 
     scheduler = Scheduler(pool, run_turn=run_turn, redis_client=redis_client)
-    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=1)
+    await scheduler.wake_one(room_id, iris_id, called_on_seq=1)
     await started.wait()
     assert not await redis_client.exists(hint_key(iris_id, room_id))
     release.set()
@@ -1671,9 +1671,9 @@ async def test_coalesce_overwrite_leaves_no_stale_redis_hint(
             await release.wait()
 
     scheduler = Scheduler(pool, run_turn=run_turn, redis_client=redis_client)
-    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=1)
+    await scheduler.wake_one(room_id, iris_id, called_on_seq=1)
     await started.wait()
-    await scheduler.wake_one(room_id, iris_id, called_on=True, called_on_seq=3)
+    await scheduler.wake_one(room_id, iris_id, called_on_seq=3)
     assert not await redis_client.exists(hint_key(iris_id, room_id))
     release.set()
     await scheduler.wait_idle()
